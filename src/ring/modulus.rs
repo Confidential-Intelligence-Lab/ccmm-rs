@@ -63,6 +63,42 @@ impl Modulus {
 
         ((u128::from(a) * u128::from(b)) % q) as u64
     }
+
+    /// Computes `base^exponent mod q` by repeated squaring.
+    pub fn pow(self, base: u64, mut exponent: u64) -> u64 {
+        let mut base = self.reduce(base);
+        let mut result = 1_u64;
+
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                result = self.mul(result, base);
+            }
+
+            base = self.mul(base, base);
+            exponent >>= 1;
+        }
+
+        result
+    }
+
+    /// Computes the multiplicative inverse modulo a prime modulus.
+    ///
+    /// This uses Fermat's little theorem:
+    ///
+    /// `a^{-1} = a^{q-2} mod q`.
+    ///
+    /// The caller is responsible for ensuring that `q` is prime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a == 0 mod q`.
+    pub fn inverse_prime(self, a: u64) -> u64 {
+        let reduced = self.reduce(a);
+
+        assert!(reduced != 0, "zero has no multiplicative inverse");
+
+        self.pow(reduced, self.value - 2)
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +195,32 @@ mod tests {
         let expected = ((u128::from(a) % q + u128::from(b) % q) % q) as u64;
 
         assert_eq!(modulus.add(a, b), expected);
+    }
+
+    #[test]
+    fn modular_exponentiation_works() {
+        let modulus = Modulus::new(17);
+
+        assert_eq!(modulus.pow(3, 0), 1);
+        assert_eq!(modulus.pow(3, 1), 3);
+        assert_eq!(modulus.pow(3, 4), 13);
+        assert_eq!(modulus.pow(20, 4), 13);
+    }
+
+    #[test]
+    fn inverse_prime_works() {
+        let modulus = Modulus::new(17);
+
+        for value in 1..17 {
+            let inverse = modulus.inverse_prime(value);
+            assert_eq!(modulus.mul(value, inverse), 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zero has no multiplicative inverse")]
+    fn inverse_prime_rejects_zero() {
+        let _ = Modulus::new(17).inverse_prime(0);
     }
 
     #[test]
