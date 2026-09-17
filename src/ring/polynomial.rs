@@ -133,6 +133,43 @@ impl Polynomial {
         }
     }
 
+    /// Naive negacyclic multiplication in
+    ///
+    /// `Z_q[X] / (X^N + 1)`.
+    ///
+    /// Terms with degree `>= N` wrap with a sign change because
+    /// `X^N = -1`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the polynomials have different moduli or degrees.
+    pub fn negacyclic_mul(&self, rhs: &Self) -> Self {
+        self.assert_compatible(rhs);
+
+        let n = self.degree();
+        let mut coefficients = vec![0_u64; n];
+
+        for i in 0..n {
+            for j in 0..n {
+                let product = self.modulus.mul(self.coefficients[i], rhs.coefficients[j]);
+
+                let degree = i + j;
+
+                if degree < n {
+                    coefficients[degree] = self.modulus.add(coefficients[degree], product);
+                } else {
+                    let wrapped = degree - n;
+                    coefficients[wrapped] = self.modulus.sub(coefficients[wrapped], product);
+                }
+            }
+        }
+
+        Self {
+            modulus: self.modulus,
+            coefficients,
+        }
+    }
+
     fn assert_compatible(&self, rhs: &Self) {
         assert_eq!(self.modulus, rhs.modulus, "polynomial moduli must match");
         assert_eq!(self.degree(), rhs.degree(), "polynomial degrees must match");
@@ -232,6 +269,82 @@ mod tests {
         let rhs = Polynomial::new(q, vec![1, 2, 3]);
 
         let _ = lhs.add(&rhs);
+    }
+
+    #[test]
+    fn negacyclic_multiplication_without_wrap_matches_convolution() {
+        let q = Modulus::new(97);
+
+        let lhs = Polynomial::new(q, vec![1, 2, 0, 0]);
+        let rhs = Polynomial::new(q, vec![3, 4, 0, 0]);
+
+        assert_eq!(lhs.negacyclic_mul(&rhs).coefficients(), &[3, 10, 8, 0]);
+    }
+
+    #[test]
+    fn negacyclic_multiplication_wraps_with_sign_change() {
+        let q = Modulus::new(17);
+
+        let lhs = Polynomial::new(q, vec![0, 0, 0, 1]);
+        let rhs = Polynomial::new(q, vec![0, 1, 0, 0]);
+
+        assert_eq!(lhs.negacyclic_mul(&rhs).coefficients(), &[16, 0, 0, 0]);
+    }
+
+    #[test]
+    fn negacyclic_multiplication_handles_multiple_wraps() {
+        let q = Modulus::new(17);
+
+        let lhs = Polynomial::new(q, vec![1, 2, 3, 4]);
+        let rhs = Polynomial::new(q, vec![5, 6, 7, 8]);
+
+        assert_eq!(lhs.negacyclic_mul(&rhs).coefficients(), &[12, 15, 2, 9]);
+    }
+
+    #[test]
+    fn negacyclic_identity_holds() {
+        let q = Modulus::new(97);
+
+        let a = Polynomial::new(q, vec![11, 22, 33, 44]);
+        let one = Polynomial::new(q, vec![1, 0, 0, 0]);
+
+        assert_eq!(a.negacyclic_mul(&one), a);
+        assert_eq!(one.negacyclic_mul(&a), a);
+    }
+
+    #[test]
+    fn negacyclic_zero_annihilates() {
+        let q = Modulus::new(97);
+
+        let a = Polynomial::new(q, vec![11, 22, 33, 44]);
+        let zero = Polynomial::zero(q, 4);
+
+        assert_eq!(a.negacyclic_mul(&zero), zero);
+        assert_eq!(zero.negacyclic_mul(&a), zero);
+    }
+
+    #[test]
+    fn negacyclic_multiplication_is_commutative() {
+        let q = Modulus::new(97);
+
+        let a = Polynomial::new(q, vec![1, 8, 23, 42]);
+        let b = Polynomial::new(q, vec![5, 7, 11, 13]);
+
+        assert_eq!(a.negacyclic_mul(&b), b.negacyclic_mul(&a));
+    }
+
+    #[test]
+    fn negacyclic_multiplication_distributes_over_addition() {
+        let q = Modulus::new(97);
+
+        let a = Polynomial::new(q, vec![1, 2, 3, 4]);
+        let b = Polynomial::new(q, vec![5, 6, 7, 8]);
+        let c = Polynomial::new(q, vec![9, 10, 11, 12]);
+
+        let lhs = a.negacyclic_mul(&b.add(&c));
+        let rhs = a.negacyclic_mul(&b).add(&a.negacyclic_mul(&c));
+
+        assert_eq!(lhs, rhs);
     }
 
     #[test]
