@@ -1,37 +1,23 @@
 # ccmm-rs
 
-`ccmm-rs` is a correctness-first native Rust implementation of
-ciphertext-plaintext matrix multiplication (CPMM) and
-ciphertext-ciphertext matrix multiplication (CCMM) for RLWE/CKKS-style
-encrypted matrices.
+`ccmm-rs` is a correctness-first native Rust implementation of ciphertext-plaintext matrix multiplication (CPMM) and ciphertext-ciphertext matrix multiplication (CCMM) for RLWE/CKKS-style encrypted matrices.
 
-The implementation is based on the matrix-multiplication constructions
-introduced by Jung Hee Cheon, Minsik Kang, and Junho Lee in
-**"Fast Batch Matrix Multiplication in Ciphertexts," CRYPTO 2026**.
+The implementation is based on the matrix-multiplication constructions introduced by Jung Hee Cheon, Minsik Kang, and Junho Lee in **“Fast Batch Matrix Multiplication in Ciphertexts,” CRYPTO 2026**.
 
 > **Attribution**
 >
-> `ccmm-rs` does not propose the CPMM or CCMM algorithms.
-> Those constructions are due to Cheon, Kang, and Lee.
-> This repository provides an independent native-Rust implementation,
-> correctness infrastructure, characterization, and cross-validation
-> against the HEaaN-based reference implementation.
+> `ccmm-rs` does not propose the CPMM or CCMM algorithms. These constructions are due to Cheon, Kang, and Lee. This repository provides an independent native-Rust implementation, correctness infrastructure, characterization, and cross-validation against the HEaaN-based reference implementation.
 
-## Original paper
+## Original Paper
 
-Jung Hee Cheon, Minsik Kang, and Junho Lee,
-**"Fast Batch Matrix Multiplication in Ciphertexts,"**
-*Advances in Cryptology - CRYPTO 2026*,
-Lecture Notes in Computer Science, vol. 16801,
-pp. 558-590, Springer, 2026.
+Jung Hee Cheon, Minsik Kang, and Junho Lee, **“Fast Batch Matrix Multiplication in Ciphertexts,”** *Advances in Cryptology — CRYPTO 2026*, Lecture Notes in Computer Science, vol. 16801, pp. 558–590, Springer, 2026.
 
 - DOI: `10.1007/978-3-032-35374-0_18`
 - IACR Cryptology ePrint Archive: `2025/1957`
 
-## Implementation
+## What Is Implemented
 
-The repository contains a complete correctness-first native Rust vertical
-slice for encrypted matrix multiplication:
+The repository contains a complete correctness-first native Rust vertical slice for encrypted matrix multiplication:
 
 - dense batch and encoded matrix representations;
 - polynomial matrices over `Z_q[X] / (X^N + 1)`;
@@ -50,9 +36,9 @@ slice for encrypted matrix multiplication:
 - HEaaN cross-validation;
 - release-mode baseline characterization.
 
-## CCMM construction
+## CCMM Construction
 
-For ciphertext matrices `(B, A)` and `(D, C)`:
+For ciphertext matrices `(B, A)` and `(D, C)`, the native implementation follows the degree-2 RLWE product structure:
 
 ```text
 (B, A) x (D, C)
@@ -77,116 +63,154 @@ rescale Q -> q
         |
         v
 (B'', A'')
-where
+```
 
+with
+
+```text
 c0 = BD
 c1 = BC + AD
 c2 = AC
+```
 
 before multiplication-key relinearization.
 
-End-to-end correctness
+## End-to-End Correctness
 
 The primary native implementation gate is:
 
+```text
 Dec(CCMM(Enc(M1), Enc(M2))) ~= M1 * M2
+```
 
 For
 
+```text
 M1 = [[1, 2],
       [3, 4]]
 
 M2 = [[5, 6],
       [7, 8]]
+```
+
 the expected result is
 
+```text
 [[19, 22],
  [43, 50]]
+```
 
-The native Rust oracle reports a maximum absolute error of approximately
-1.07e-4.
+The deterministic native Rust oracle reports a maximum absolute error of approximately `1.07e-4`.
 
 Run it with:
 
+```bash
 cargo run --release --bin ccmm_oracle
-HEaaN cross-validation
+```
 
-For the same deterministic workload:
+A successful run terminates with:
 
-Native Rust max absolute error : ~1.07e-4
-HEaaN max absolute error       : ~2.74e-5
-Rust/HEaaN max disagreement    : ~1.07e-4
-Cross-validation tolerance     :  1.00e-3
+```text
+RUST_CCMM_STATUS=PASS
+```
 
-CCMM_CROSS_VALIDATION=PASS
+## HEaaN Cross-Validation
 
-HEaaN is used only as an external validation oracle and is not part of
-the native Rust execution path.
+The native implementation has also been cross-validated against the HEaaN-based implementation of the original construction using the same deterministic matrix workload.
 
-Baseline characterization
+| Metric | Result |
+| --- | ---: |
+| Native Rust max absolute error | ~`1.07e-4` |
+| HEaaN max absolute error | ~`2.74e-5` |
+| Rust/HEaaN max disagreement | ~`1.07e-4` |
+| Cross-validation tolerance | `1.00e-3` |
+| Cross-validation status | `PASS` |
 
-Current correctness-oriented parameters:
+HEaaN is used only as an external validation oracle and is **not part of the native Rust execution path**.
 
-Ring degree       N = 8
-High modulus      Q = 140739635773439
-Low modulus       q = 2147483647
-Rescale prime     p = 65537
-Initial scale     Delta = 65537
-Matrix dimension       = 2 x 2
-Campaign seeds         = 32
+## Baseline Characterization
 
-Release-mode baseline:
+The current correctness-oriented configuration is:
 
-Secret-key generation mean       0.759 us
-Evaluation-key generation mean   7.620 us
-Left encryption mean             8.066 us
-Right encryption mean            7.359 us
+| Parameter | Value |
+| --- | ---: |
+| Ring degree `N` | `8` |
+| High modulus `Q` | `140739635773439` |
+| Low modulus `q` | `2147483647` |
+| Rescale prime `p` | `65537` |
+| Initial scale `Delta` | `65537` |
+| Matrix dimensions | `2 x 2` |
+| Characterization seeds | `32` |
 
-CCMM minimum                     29.125 us
-CCMM mean                        57.137 us
-CCMM maximum                    102.166 us
+The release-mode characterization measures:
 
-Decryption mean                   4.888 us
+- secret-key generation;
+- evaluation-key generation;
+- left and right matrix encryption;
+- native CCMM;
+- decryption and decoding;
+- maximum absolute numerical error;
+- mean absolute numerical error.
 
-Maximum absolute error            3.51e-4
-Mean absolute error               8.56e-5
+Run the current characterization with:
 
-These numbers characterize the current correctness-first implementation
-and are not intended as performance comparisons against implementations
-using different parameters, packing schemes, or arithmetic backends.
+```bash
+cargo run --release --bin ccmm_bench
+```
 
-Reproducibility
+A successful campaign terminates with:
 
-Quality gate:
+```text
+CCMM_BENCH_STATUS=PASS
+```
 
-cargo fmt --all
+The benchmark is intended to characterize the current correctness-first implementation. Its timings are **not performance comparisons** against implementations using different cryptographic parameters, packing schemes, ring dimensions, or arithmetic backends.
+
+## Reproducibility
+
+Run the complete quality gate with:
+
+```bash
+cargo fmt --all -- --check
 cargo test --all
 cargo clippy --all-targets --all-features -- -D warnings
+```
 
-Native oracle:
+Run the deterministic native oracle with:
 
+```bash
 cargo run --release --bin ccmm_oracle
+```
 
-Baseline characterization:
+Run the baseline characterization with:
 
+```bash
 cargo run --release --bin ccmm_bench
-Current scope
+```
 
-ccmm-rs is currently a research and correctness implementation.
+The `v0.1.0` correctness baseline contains **101 passing Rust tests with zero Clippy warnings**.
+
+## Current Scope and Limitations
+
+`ccmm-rs` is currently a research and correctness implementation. It deliberately prioritizes transparent semantics and testability over production-scale performance.
 
 Current limitations include:
 
-deliberately small ring degree for transparent correctness testing;
-correctness-oriented polynomial multiplication;
-reference NTT rather than a production-optimized NTT backend;
-a two-level modulus chain;
-coefficient encoding rather than production SIMD/complex-slot packing;
-no third-party security audit;
-baseline timings are not production-performance claims.
-Citation
+- a deliberately small ring degree for transparent correctness testing;
+- correctness-oriented polynomial multiplication;
+- a reference NTT rather than a production-optimized NTT backend;
+- a two-level modulus chain;
+- coefficient-oriented CKKS-style encoding rather than production SIMD/complex-slot packing;
+- no third-party security audit;
+- baseline timings that should not be interpreted as production-performance claims.
 
-Please cite the original work:
+These constraints make the current release suitable as a **correctness baseline** for subsequent optimization and extension.
 
+## Citation
+
+If you use the CCMM construction, please cite the original work:
+
+```bibtex
 @inproceedings{CheonKangLee2026FastBatchMM,
   author    = {Jung Hee Cheon and Minsik Kang and Junho Lee},
   title     = {Fast Batch Matrix Multiplication in Ciphertexts},
@@ -198,9 +222,11 @@ Please cite the original work:
   year      = {2026},
   doi       = {10.1007/978-3-032-35374-0_18}
 }
+```
 
-Preprint:
+The corresponding preprint is:
 
+```bibtex
 @article{CheonKangLee2025ePrint,
   author  = {Jung Hee Cheon and Minsik Kang and Junho Lee},
   title   = {Fast Batch Matrix Multiplication in Ciphertexts},
@@ -209,10 +235,10 @@ Preprint:
   pages   = {1957},
   year    = {2025}
 }
+```
 
-For use of the ccmm-rs software artifact itself, citation metadata is
-provided in CITATION.cff.
+For use of the `ccmm-rs` software artifact itself, citation metadata is provided in [`CITATION.cff`](CITATION.cff).
 
-License
+## License
 
-MIT. See LICENSE.
+MIT. See [`LICENSE`](LICENSE).
