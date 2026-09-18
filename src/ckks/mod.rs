@@ -1,12 +1,18 @@
 mod chain;
+mod embedding;
 mod rns_ciphertext;
 mod rns_multiply;
 mod rns_rescale;
+mod slot_encoder;
+mod slot_layout;
 
 pub use chain::CkksChainState;
+pub use embedding::CkksCanonicalEmbedding;
 pub use rns_ciphertext::RnsCkksCiphertext;
 pub use rns_multiply::{evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks};
 pub use rns_rescale::rescale_rns_ckks_to_next;
+pub use slot_encoder::CkksSlotEncoder;
+pub use slot_layout::CkksSlotLayout;
 
 use rand::{CryptoRng, RngCore};
 

@@ -131,7 +131,9 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    use crate::ckks::CkksChainState;
+    use num_complex::Complex64;
+
+    use crate::ckks::{CkksCanonicalEmbedding, CkksChainState, CkksSlotEncoder};
     use crate::grafting::{RnsGadgetLayout, RnsMultiplicationKey, RnsRlweCiphertext};
     use crate::ring::{Modulus, ModulusBasis, ModulusChain, Polynomial};
     use crate::rlwe::RlweCiphertext;
@@ -384,6 +386,112 @@ mod tests {
             .into_iter()
             .map(|value| centered(value, modulus) as f64 / ciphertext.scale())
             .collect()
+    }
+
+    fn encrypt_rns_slots(
+        chain: &ModulusChain,
+        level: usize,
+        slots: &[Complex64],
+        scale: f64,
+        secret: &[i8],
+        seed: u64,
+    ) -> RnsCkksCiphertext {
+        use crate::rlwe::{encrypt_raw_with_rng, RlweParameters, SecretKey};
+
+        let basis = chain.level(level);
+
+        let degree = slots.len() * 2;
+
+        /*
+         * Use the canonical slot encoder to perform the inverse
+         * embedding and quantization. The temporary modulus only
+         * provides a canonical container for the quantized signed
+         * coefficients; the resulting centered integers are then
+         * projected into every active RNS limb.
+         *
+         * The selected validation vectors are intentionally small,
+         * so no temporary-modulus wrap occurs.
+         */
+        let temporary_modulus = Modulus::new(2_147_483_647);
+
+        let encoder = CkksSlotEncoder::new(degree, temporary_modulus, scale);
+
+        let encoded = encoder.encode_slots(slots);
+
+        let signed_coefficients: Vec<i128> = encoded
+            .coefficients()
+            .iter()
+            .map(|&value| {
+                let value = i128::from(value);
+
+                let modulus = i128::from(temporary_modulus.value());
+
+                if value > modulus / 2 {
+                    value - modulus
+                } else {
+                    value
+                }
+            })
+            .collect();
+
+        let limbs = basis
+            .moduli()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, modulus)| {
+                let secret_polynomial = Polynomial::new(
+                    modulus,
+                    secret
+                        .iter()
+                        .map(|&value| match value {
+                            -1 => modulus.value() - 1,
+                            0 => 0,
+                            1 => 1,
+                            _ => {
+                                panic!("secret must be ternary")
+                            }
+                        })
+                        .collect(),
+                );
+
+                let secret_key = SecretKey::from_polynomial(secret_polynomial);
+
+                let q = i128::from(modulus.value());
+
+                let message = Polynomial::new(
+                    modulus,
+                    signed_coefficients
+                        .iter()
+                        .map(|&value| ((value % q + q) % q) as u64)
+                        .collect(),
+                );
+
+                let params = RlweParameters::new(degree, modulus, 2, 0);
+
+                let mut rng = ChaCha20Rng::seed_from_u64(seed ^ (index as u64 * 0x9E37));
+
+                encrypt_raw_with_rng(params, &secret_key, &message, &mut rng)
+            })
+            .collect();
+
+        RnsCkksCiphertext::new(
+            RnsRlweCiphertext::from_limbs(limbs),
+            CkksChainState::new(chain, level, scale),
+            chain,
+        )
+    }
+
+    fn decrypt_decode_rns_slots(ciphertext: &RnsCkksCiphertext, secret: &[i8]) -> Vec<Complex64> {
+        let coefficients = decrypt_decode_rns(ciphertext, secret);
+
+        CkksCanonicalEmbedding::new(coefficients.len()).coefficients_to_slots(&coefficients)
+    }
+
+    fn reference_slot_product(lhs: &[Complex64], rhs: &[Complex64]) -> Vec<Complex64> {
+        assert_eq!(lhs.len(), rhs.len(),);
+
+        lhs.iter().zip(rhs).map(|(&lhs, &rhs)| lhs * rhs).collect()
     }
 
     fn reference_negacyclic_product(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
@@ -952,5 +1060,242 @@ mod tests {
         let key = multiplication_key_for_level(&chain, level, degree, &secret, 0xEFFF);
 
         let _ = multiply_relinearize_rescale_rns_ckks(&lhs, &rhs, &key, &chain);
+    }
+
+    #[test]
+    fn encrypted_ckks_simd_multiplication_matches_slotwise_reference() {
+        let chain = chain();
+
+        let degree = 8;
+
+        let scale = 65_537.0;
+
+        let secret = ternary(degree);
+
+        let lhs_slots = [
+            Complex64::new(0.25, 0.125),
+            Complex64::new(-0.5, 0.25),
+            Complex64::new(0.75, -0.125),
+            Complex64::new(0.125, 0.5),
+        ];
+
+        let rhs_slots = [
+            Complex64::new(-0.25, 0.5),
+            Complex64::new(0.25, -0.125),
+            Complex64::new(0.5, 0.25),
+            Complex64::new(-0.125, 0.25),
+        ];
+
+        let lhs = encrypt_rns_slots(&chain, 0, &lhs_slots, scale, &secret, 0xF100);
+
+        let rhs = encrypt_rns_slots(&chain, 0, &rhs_slots, scale, &secret, 0xF101);
+
+        /*
+         * First verify that canonical slot semantics survive
+         * encode -> encrypt -> decrypt -> decode before testing
+         * homomorphic multiplication.
+         */
+        let lhs_roundtrip = decrypt_decode_rns_slots(&lhs, &secret);
+
+        let rhs_roundtrip = decrypt_decode_rns_slots(&rhs, &secret);
+
+        let input_tolerance = degree as f64 / (2.0 * scale) + 1.0e-10;
+
+        for (index, (&actual, &expected)) in lhs_roundtrip.iter().zip(&lhs_slots).enumerate() {
+            assert!(
+                (actual - expected).norm() <= input_tolerance,
+                "lhs slot {index}: \
+                 actual={actual:?}, \
+                 expected={expected:?}"
+            );
+        }
+
+        for (index, (&actual, &expected)) in rhs_roundtrip.iter().zip(&rhs_slots).enumerate() {
+            assert!(
+                (actual - expected).norm() <= input_tolerance,
+                "rhs slot {index}: \
+                 actual={actual:?}, \
+                 expected={expected:?}"
+            );
+        }
+
+        let layout = RnsGadgetLayout::new(chain.level(0).clone(), vec![1, 2]);
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0xF102);
+
+        let multiplication_key =
+            RnsMultiplicationKey::generate_with_rng(degree, 2, 0, &secret, layout, &mut rng);
+
+        let result = multiply_relinearize_rescale_rns_ckks(&lhs, &rhs, &multiplication_key, &chain);
+
+        assert_eq!(result.level(), 1);
+
+        assert_eq!(result.basis(), chain.level(1));
+
+        assert!(
+            (result.scale() - scale).abs() < 1.0e-9,
+            "unexpected SIMD output scale: {}",
+            result.scale()
+        );
+
+        let actual = decrypt_decode_rns_slots(&result, &secret);
+
+        let expected = reference_slot_product(&lhs_slots, &rhs_slots);
+
+        /*
+         * This bound includes:
+         *
+         * - input canonical-embedding quantization;
+         * - polynomial multiplication of quantized inputs;
+         * - nearest CKKS rescaling.
+         *
+         * It remains intentionally conservative for the small
+         * correctness parameters used here.
+         */
+        let tolerance = 0.001;
+
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let error = (actual - expected).norm();
+
+            assert!(
+                error <= tolerance,
+                "SIMD slot {index}: \
+                 actual={actual:?}, \
+                 expected={expected:?}, \
+                 error={error}, \
+                 tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_ckks_simd_two_depths_match_slotwise_reference() {
+        let chain = chain();
+
+        let degree = 8;
+
+        let secret = ternary(degree);
+
+        /*
+         * Keep the post-rescale accumulator scale stable:
+         *
+         * first multiplication:
+         *
+         *     65537^2 / 65537 = 65537
+         *
+         * second multiplication:
+         *
+         *     65537 * 40961 / 40961 = 65537
+         */
+        let level0_scale = 65_537.0;
+
+        let level1_operand_scale = 40_961.0;
+
+        let lhs_slots = [
+            Complex64::new(0.25, 0.125),
+            Complex64::new(-0.5, 0.25),
+            Complex64::new(0.75, -0.125),
+            Complex64::new(0.125, 0.5),
+        ];
+
+        let rhs_slots = [
+            Complex64::new(-0.25, 0.5),
+            Complex64::new(0.25, -0.125),
+            Complex64::new(0.5, 0.25),
+            Complex64::new(-0.125, 0.25),
+        ];
+
+        let third_slots = [
+            Complex64::new(0.5, -0.25),
+            Complex64::new(-0.25, 0.5),
+            Complex64::new(0.125, 0.25),
+            Complex64::new(0.25, -0.125),
+        ];
+
+        let lhs = encrypt_rns_slots(&chain, 0, &lhs_slots, level0_scale, &secret, 0xF200);
+
+        let rhs = encrypt_rns_slots(&chain, 0, &rhs_slots, level0_scale, &secret, 0xF201);
+
+        let level0_layout = RnsGadgetLayout::new(chain.level(0).clone(), vec![1, 2]);
+
+        let mut level0_rng = ChaCha20Rng::seed_from_u64(0xF202);
+
+        let level0_key = RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &secret,
+            level0_layout,
+            &mut level0_rng,
+        );
+
+        let level1 = multiply_relinearize_rescale_rns_ckks(&lhs, &rhs, &level0_key, &chain);
+
+        assert_eq!(level1.level(), 1);
+
+        assert!((level1.scale() - 65_537.0).abs() < 1.0e-9);
+
+        let third = encrypt_rns_slots(
+            &chain,
+            1,
+            &third_slots,
+            level1_operand_scale,
+            &secret,
+            0xF203,
+        );
+
+        let level1_layout = RnsGadgetLayout::new(chain.level(1).clone(), vec![1, 1]);
+
+        let mut level1_rng = ChaCha20Rng::seed_from_u64(0xF204);
+
+        let level1_key = RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &secret,
+            level1_layout,
+            &mut level1_rng,
+        );
+
+        let level2 = multiply_relinearize_rescale_rns_ckks(&level1, &third, &level1_key, &chain);
+
+        assert_eq!(level2.level(), 2);
+
+        assert_eq!(level2.basis(), chain.level(2));
+
+        assert!(
+            (level2.scale() - 65_537.0).abs() < 1.0e-9,
+            "unexpected final SIMD scale: {}",
+            level2.scale()
+        );
+
+        let actual = decrypt_decode_rns_slots(&level2, &secret);
+
+        let expected_level1 = reference_slot_product(&lhs_slots, &rhs_slots);
+
+        let expected = reference_slot_product(&expected_level1, &third_slots);
+
+        /*
+         * Conservative depth-2 tolerance including:
+         *
+         * - first canonical-embedding quantization;
+         * - first encrypted multiply/rescale;
+         * - level-1 operand quantization;
+         * - second multiply/rescale.
+         */
+        let tolerance = 0.003;
+
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let error = (actual - expected).norm();
+
+            assert!(
+                error <= tolerance,
+                "depth-2 SIMD slot {index}: \
+                 actual={actual:?}, \
+                 expected={expected:?}, \
+                 error={error}, \
+                 tolerance={tolerance}"
+            );
+        }
     }
 }
