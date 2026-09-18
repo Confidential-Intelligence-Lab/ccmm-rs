@@ -1,3 +1,5 @@
+pub use gadget::{GadgetBlock, GadgetLayout};
+pub mod gadget;
 pub use pow2_rs::{inv_rs_power_of_two, rs_power_of_two, Pow2RnsPolynomial};
 pub mod pow2_rs;
 pub use helper_prime::HelperPrimeNttPlan;
