@@ -1,7 +1,12 @@
 mod automorphism;
 mod chain;
 mod embedding;
+mod evaluation_keys;
+mod evaluator;
 mod galois_key;
+mod hybrid_ciphertext;
+mod hybrid_multiply;
+mod key_accounting;
 mod rns_automorphism;
 mod rns_ciphertext;
 mod rns_galois_key;
@@ -17,8 +22,21 @@ pub use automorphism::{
 };
 pub use chain::CkksChainState;
 pub use embedding::CkksCanonicalEmbedding;
+pub use evaluation_keys::{
+    conjugate_with_evaluation_keys, multiply_with_evaluation_keys,
+    rotate_left_with_evaluation_keys, rotate_right_with_evaluation_keys, RnsCkksEvaluationKeys,
+    RnsCkksHybridLevelKeys, RnsCkksLevelKeys, RnsCkksMultiplicationBackend,
+    RnsCkksMultiplicationPolicy,
+};
+pub use evaluator::RnsCkksEvaluator;
 pub use galois_key::{
     apply_galois_automorphism, conjugate_slots, rotate_left, rotate_right, GaloisKey,
+};
+pub use hybrid_ciphertext::HybridCkksCiphertext;
+pub use hybrid_multiply::{multiply_transition_relinearize_hybrid_ckks, HybridCkksMultiplyConfig};
+pub use key_accounting::{
+    evaluation_key_storage, prepared_hybrid_cache_bytes, LogicalPayloadBytes,
+    RnsCkksEvaluationKeyStorage, RnsCkksLevelKeyStorage,
 };
 pub use rns_automorphism::apply_rns_automorphism;
 pub use rns_ciphertext::RnsCkksCiphertext;

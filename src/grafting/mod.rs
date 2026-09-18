@@ -1,8 +1,9 @@
 pub use hybrid_key_switch::{
-    decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_relinearize,
-    hybrid_relinearize_helper_prime, hybrid_relinearize_prepared, HybridEvaluationKeyEntry,
-    HybridMultiplicationKey, HybridQuadraticCiphertext, PreparedHybridEvaluationKeyEntry,
-    PreparedHybridMultiplicationKey,
+    decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_multiply_relinearize_with_backend,
+    hybrid_relinearize, hybrid_relinearize_helper_prime, hybrid_relinearize_prepared,
+    hybrid_relinearize_with_backend, hybrid_tensor, HybridEvaluationKeyEntry,
+    HybridMultiplicationKey, HybridQuadraticCiphertext, HybridRelinearizationBackend,
+    PreparedHybridEvaluationKeyEntry, PreparedHybridMultiplicationKey,
 };
 pub mod hybrid_key_switch;
 pub use mixed_gadget::{MixedGadgetDecomposition, MixedGadgetLayout};

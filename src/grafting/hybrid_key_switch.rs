@@ -233,6 +233,84 @@ impl HybridQuadraticCiphertext {
     }
 }
 
+/// Multiplies two hybrid RLWE ciphertexts into a degree-two ciphertext.
+///
+/// The same RLWE tensor-product identity is evaluated independently over
+/// every odd-prime RNS limb and over the power-of-two sprout:
+///
+/// c0 = b0 * b1
+/// c1 = b0 * a1 + a0 * b1
+/// c2 = a0 * a1
+pub fn hybrid_tensor(
+    lhs: &HybridRlweCiphertext,
+    rhs: &HybridRlweCiphertext,
+) -> HybridQuadraticCiphertext {
+    assert_eq!(
+        lhs.ordinary().basis(),
+        rhs.ordinary().basis(),
+        "hybrid tensor ordinary bases must match"
+    );
+    assert_eq!(
+        lhs.sprout().bits(),
+        rhs.sprout().bits(),
+        "hybrid tensor sprout sizes must match"
+    );
+    assert_eq!(
+        lhs.degree(),
+        rhs.degree(),
+        "hybrid tensor degrees must match"
+    );
+
+    let basis = lhs.ordinary().basis().clone();
+
+    let make_ordinary_component = |component: usize| -> RnsPolynomial {
+        let residues = (0..basis.len())
+            .map(|limb_index| {
+                let lhs_limb = lhs.ordinary().limb(limb_index);
+                let rhs_limb = rhs.ordinary().limb(limb_index);
+
+                match component {
+                    0 => lhs_limb.b().negacyclic_mul(rhs_limb.b()),
+
+                    1 => lhs_limb
+                        .b()
+                        .negacyclic_mul(rhs_limb.a())
+                        .add(&lhs_limb.a().negacyclic_mul(rhs_limb.b())),
+
+                    2 => lhs_limb.a().negacyclic_mul(rhs_limb.a()),
+
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+
+        RnsPolynomial::from_residues(residues)
+    };
+
+    let lhs_sprout = lhs.sprout();
+    let rhs_sprout = rhs.sprout();
+
+    let c0 = Pow2RnsPolynomial::from_parts(
+        make_ordinary_component(0),
+        lhs_sprout.b().negacyclic_mul(rhs_sprout.b()),
+    );
+
+    let c1 = Pow2RnsPolynomial::from_parts(
+        make_ordinary_component(1),
+        lhs_sprout
+            .b()
+            .negacyclic_mul(rhs_sprout.a())
+            .add(&lhs_sprout.a().negacyclic_mul(rhs_sprout.b())),
+    );
+
+    let c2 = Pow2RnsPolynomial::from_parts(
+        make_ordinary_component(2),
+        lhs_sprout.a().negacyclic_mul(rhs_sprout.a()),
+    );
+
+    HybridQuadraticCiphertext::new(c0, c1, c2)
+}
+
 /// Relinearizes a mixed hybrid degree-two ciphertext.
 pub fn hybrid_relinearize(
     product: &HybridQuadraticCiphertext,
@@ -539,6 +617,68 @@ pub fn hybrid_relinearize_prepared(
     sprout_a = sprout_a.add(&helper_plan.negacyclic_mul_prepared(&sprout_digit, entry.a()));
 
     HybridRlweCiphertext::new(ordinary, Pow2RlweCiphertext::new(sprout_b, sprout_a))
+}
+
+/// Concrete backend used for hybrid relinearization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridRelinearizationBackend {
+    Direct,
+    HelperPrime,
+    Prepared,
+}
+
+/// Backend-specific material for hybrid relinearization.
+///
+/// The base hybrid multiplication key is always required. Helper-prime
+/// execution additionally requires a compatible helper plan, while the
+/// prepared backend requires both the helper plan and cached key operands.
+pub fn hybrid_relinearize_with_backend(
+    product: &HybridQuadraticCiphertext,
+    key: &HybridMultiplicationKey,
+    backend: HybridRelinearizationBackend,
+    helper_plan: Option<&HelperPrimeNttPlan>,
+    prepared_key: Option<&PreparedHybridMultiplicationKey>,
+) -> HybridRlweCiphertext {
+    match backend {
+        HybridRelinearizationBackend::Direct => hybrid_relinearize(product, key),
+
+        HybridRelinearizationBackend::HelperPrime => {
+            let helper_plan =
+                helper_plan.expect("helper-prime hybrid backend requires a helper-prime plan");
+
+            hybrid_relinearize_helper_prime(product, key, helper_plan)
+        }
+
+        HybridRelinearizationBackend::Prepared => {
+            let helper_plan =
+                helper_plan.expect("prepared hybrid backend requires a helper-prime plan");
+
+            let prepared_key = prepared_key
+                .expect("prepared hybrid backend requires a prepared multiplication key");
+
+            assert_eq!(
+                prepared_key.key(),
+                key,
+                "prepared hybrid multiplication key must correspond to selected hybrid key"
+            );
+
+            hybrid_relinearize_prepared(product, prepared_key, helper_plan)
+        }
+    }
+}
+
+/// Multiplies and relinearizes two native hybrid RLWE ciphertexts.
+pub fn hybrid_multiply_relinearize_with_backend(
+    lhs: &HybridRlweCiphertext,
+    rhs: &HybridRlweCiphertext,
+    key: &HybridMultiplicationKey,
+    backend: HybridRelinearizationBackend,
+    helper_plan: Option<&HelperPrimeNttPlan>,
+    prepared_key: Option<&PreparedHybridMultiplicationKey>,
+) -> HybridRlweCiphertext {
+    let product = hybrid_tensor(lhs, rhs);
+
+    hybrid_relinearize_with_backend(&product, key, backend, helper_plan, prepared_key)
 }
 
 /// Raw hybrid RLWE decryption.
@@ -1080,5 +1220,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn backend_dispatch_matches_all_hybrid_paths() {
+        let bits = 4;
+        let degree = 8;
+
+        let layout = MixedGadgetLayout::new(basis(), vec![1, 2], bits);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xCD00);
+
+        let key = HybridMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &ternary(),
+            layout,
+            &mut key_rng,
+        );
+
+        let helper_plan =
+            HelperPrimeNttPlan::new(bits, degree, crate::ring::Modulus::new(2_013_265_921));
+
+        let prepared = PreparedHybridMultiplicationKey::prepare(&key, &helper_plan);
+
+        let product = quadratic(bits);
+
+        let direct = hybrid_relinearize_with_backend(
+            &product,
+            &key,
+            HybridRelinearizationBackend::Direct,
+            None,
+            None,
+        );
+
+        let helper = hybrid_relinearize_with_backend(
+            &product,
+            &key,
+            HybridRelinearizationBackend::HelperPrime,
+            Some(&helper_plan),
+            None,
+        );
+
+        let prepared_output = hybrid_relinearize_with_backend(
+            &product,
+            &key,
+            HybridRelinearizationBackend::Prepared,
+            Some(&helper_plan),
+            Some(&prepared),
+        );
+
+        assert_eq!(
+            helper, direct,
+            "helper-prime dispatch must match direct hybrid relinearization"
+        );
+
+        assert_eq!(
+            prepared_output, direct,
+            "prepared dispatch must match direct hybrid relinearization"
+        );
     }
 }
