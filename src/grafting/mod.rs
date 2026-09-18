@@ -1,3 +1,5 @@
+pub use key_switch::{relinearize_scheduled, GadgetDigitSchedule};
+pub mod key_switch;
 pub use gadget::{GadgetBlock, GadgetLayout};
 pub mod gadget;
 pub use pow2_rs::{inv_rs_power_of_two, rs_power_of_two, Pow2RnsPolynomial};
