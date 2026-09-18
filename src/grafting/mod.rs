@@ -25,7 +25,7 @@ pub use prime_resurrection::PrimeSproutKeySwitchPlan;
 pub mod prime_resurrection;
 pub use rns_key_switch::{
     decrypt_rns_quadratic_raw, decrypt_rns_raw, rns_relinearize, ternary_secret_coefficients,
-    RnsMultiplicationKey, RnsQuadraticCiphertext, RnsRlweCiphertext,
+    RnsKeySwitchKey, RnsMultiplicationKey, RnsQuadraticCiphertext, RnsRlweCiphertext,
 };
 pub mod rns_key_switch;
 pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};

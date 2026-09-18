@@ -40,6 +40,7 @@ use num_complex::Complex64;
 pub struct CkksCanonicalEmbedding {
     degree: usize,
     roots: Vec<Complex64>,
+    slot_root_indices: Vec<usize>,
 }
 
 impl CkksCanonicalEmbedding {
@@ -58,7 +59,31 @@ impl CkksCanonicalEmbedding {
             })
             .collect();
 
-        Self { degree, roots }
+        /*
+         * Logical CKKS slots use the Galois-compatible orbit
+         *
+         *     1, 5, 5^2, ..., 5^(N/2-1)  (mod 2N).
+         *
+         * Each exponent is an odd 2N-th root exponent. Since the full
+         * canonical root array stores exponent 2j+1 at index j, the
+         * corresponding root index is (exponent - 1) / 2.
+         *
+         * This ordering makes sigma_5 act cyclically on logical slots.
+         */
+        let two_n = 2 * degree;
+        let mut exponent = 1_usize;
+        let mut slot_root_indices = Vec::with_capacity(degree / 2);
+
+        for _ in 0..degree / 2 {
+            slot_root_indices.push((exponent - 1) / 2);
+            exponent = (exponent * 5) % two_n;
+        }
+
+        Self {
+            degree,
+            roots,
+            slot_root_indices,
+        }
     }
 
     pub fn degree(&self) -> usize {
@@ -67,6 +92,14 @@ impl CkksCanonicalEmbedding {
 
     pub fn slot_count(&self) -> usize {
         self.degree / 2
+    }
+
+    /// Full canonical-root indices used by the logical CKKS slots.
+    ///
+    /// Logical slot `j` corresponds to root exponent
+    /// `5^j mod 2N`.
+    pub fn slot_root_indices(&self) -> &[usize] {
+        &self.slot_root_indices
     }
 
     /// Ordered odd 2N-th roots used by the complete canonical embedding.
@@ -116,7 +149,12 @@ impl CkksCanonicalEmbedding {
     /// Maps real polynomial coefficients to the `N/2` independent CKKS
     /// slots according to this module's deterministic slot ordering.
     pub fn coefficients_to_slots(&self, coefficients: &[f64]) -> Vec<Complex64> {
-        self.evaluate_all(coefficients)[..self.slot_count()].to_vec()
+        let evaluations = self.evaluate_all(coefficients);
+
+        self.slot_root_indices
+            .iter()
+            .map(|&root_index| evaluations[root_index])
+            .collect()
     }
 
     /// Expands `N/2` slots into the full conjugate-symmetric canonical
@@ -137,11 +175,10 @@ impl CkksCanonicalEmbedding {
 
         let mut evaluations = vec![Complex64::new(0.0, 0.0); self.degree];
 
-        for (index, &slot) in slots.iter().enumerate() {
-            let conjugate_index = self.degree - 1 - index;
+        for (&root_index, &slot) in self.slot_root_indices.iter().zip(slots) {
+            let conjugate_index = self.degree - 1 - root_index;
 
-            evaluations[index] = slot;
-
+            evaluations[root_index] = slot;
             evaluations[conjugate_index] = slot.conj();
         }
 
@@ -276,7 +313,38 @@ mod tests {
     }
 
     #[test]
-    fn slot_expansion_has_exact_conjugate_layout() {
+    fn logical_slot_roots_follow_power_of_five_orbit() {
+        let embedding = CkksCanonicalEmbedding::new(8);
+
+        assert_eq!(embedding.slot_root_indices(), &[0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn logical_slot_root_orbit_has_full_capacity() {
+        for degree in [2_usize, 4, 8, 16, 32] {
+            let embedding = CkksCanonicalEmbedding::new(degree);
+
+            let mut indices = embedding.slot_root_indices().to_vec();
+
+            indices.sort_unstable();
+            indices.dedup();
+
+            assert_eq!(indices.len(), degree / 2, "degree={degree}");
+
+            for &index in embedding.slot_root_indices() {
+                let conjugate_index = degree - 1 - index;
+
+                assert!(
+                    !embedding.slot_root_indices().contains(&conjugate_index,),
+                    "slot orbit contains both members of a conjugate pair: \
+                     degree={degree}, index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slot_expansion_has_galois_compatible_conjugate_layout() {
         let embedding = CkksCanonicalEmbedding::new(8);
 
         let slots = [
@@ -288,10 +356,12 @@ mod tests {
 
         let expanded = embedding.expand_slots(&slots);
 
-        for (index, &slot) in slots.iter().enumerate() {
-            assert_eq!(expanded[index], slot);
+        for (&root_index, &slot) in embedding.slot_root_indices().iter().zip(&slots) {
+            let conjugate_index = embedding.degree() - 1 - root_index;
 
-            assert_eq!(expanded[7 - index], slot.conj());
+            assert_eq!(expanded[root_index], slot);
+
+            assert_eq!(expanded[conjugate_index], slot.conj());
         }
     }
 

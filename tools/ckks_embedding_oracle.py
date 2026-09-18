@@ -17,13 +17,29 @@ def roots(degree):
     ]
 
 
+def slot_root_indices(degree):
+    two_n = 2 * degree
+    exponent = 1
+    indices = []
+
+    for _ in range(degree // 2):
+        indices.append((exponent - 1) // 2)
+        exponent = (exponent * 5) % two_n
+
+    return indices
+
+
 def expand_slots(slots):
     degree = 2 * len(slots)
     values = [0j] * degree
 
-    for index, slot in enumerate(slots):
-        values[index] = slot
-        values[degree - 1 - index] = slot.conjugate()
+    for root_index, slot in zip(
+        slot_root_indices(degree),
+        slots,
+    ):
+        conjugate_index = degree - 1 - root_index
+        values[root_index] = slot
+        values[conjugate_index] = slot.conjugate()
 
     return values
 
@@ -58,8 +74,8 @@ def coefficients_to_slots(coefficients):
 
     out = []
 
-    for j in range(degree // 2):
-        root = xi[j]
+    for root_index in slot_root_indices(degree):
+        root = xi[root_index]
         value = 0j
 
         for coefficient in reversed(coefficients):

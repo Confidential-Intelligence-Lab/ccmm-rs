@@ -1,14 +1,31 @@
+mod automorphism;
 mod chain;
 mod embedding;
+mod galois_key;
+mod rns_automorphism;
 mod rns_ciphertext;
+mod rns_galois_key;
 mod rns_multiply;
 mod rns_rescale;
 mod slot_encoder;
 mod slot_layout;
 
+pub use automorphism::{
+    apply_automorphism, canonical_slot_automorphism, conjugation_exponent,
+    inverse_automorphism_exponent, rotation_exponent_left, rotation_exponent_right,
+    CkksSlotAutomorphism,
+};
 pub use chain::CkksChainState;
 pub use embedding::CkksCanonicalEmbedding;
+pub use galois_key::{
+    apply_galois_automorphism, conjugate_slots, rotate_left, rotate_right, GaloisKey,
+};
+pub use rns_automorphism::apply_rns_automorphism;
 pub use rns_ciphertext::RnsCkksCiphertext;
+pub use rns_galois_key::{
+    apply_rns_ckks_galois_automorphism, apply_rns_galois_automorphism, conjugate_rns_ckks,
+    rotate_left_rns_ckks, rotate_right_rns_ckks, RnsGaloisKey,
+};
 pub use rns_multiply::{evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks};
 pub use rns_rescale::rescale_rns_ckks_to_next;
 pub use slot_encoder::CkksSlotEncoder;

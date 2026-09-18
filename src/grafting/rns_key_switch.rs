@@ -52,6 +52,102 @@ impl RnsRlweCiphertext {
     }
 }
 
+/// Generic RNS evaluation key for switching one logical ternary secret
+/// to another.
+///
+/// For gadget block `i`, the corresponding entry encrypts
+///
+/// `E_i * s_source`
+///
+/// under `s_target`, where `E_i` is the CRT idempotent associated with
+/// the block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RnsKeySwitchKey {
+    layout: RnsGadgetLayout,
+    entries: Vec<RnsRlweCiphertext>,
+}
+
+impl RnsKeySwitchKey {
+    pub fn generate_with_rng<R>(
+        degree: usize,
+        plaintext_modulus: u64,
+        noise_bound: i64,
+        source_secret_coefficients: &[i8],
+        target_secret_coefficients: &[i8],
+        layout: RnsGadgetLayout,
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            source_secret_coefficients.len(),
+            degree,
+            "source secret coefficient count must match RLWE degree"
+        );
+
+        assert_eq!(
+            target_secret_coefficients.len(),
+            degree,
+            "target secret coefficient count must match RLWE degree"
+        );
+
+        assert!(
+            source_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS source secret coefficients must be ternary"
+        );
+
+        assert!(
+            target_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS target secret coefficients must be ternary"
+        );
+
+        let basis = layout.full_basis().clone();
+
+        let mut entries = Vec::with_capacity(layout.block_count());
+
+        for block_index in 0..layout.block_count() {
+            let idempotent = layout.crt_idempotent(block_index);
+
+            let mut limbs = Vec::with_capacity(basis.len());
+
+            for &modulus in basis.moduli() {
+                let params = RlweParameters::new(degree, modulus, plaintext_modulus, noise_bound);
+
+                let source = project_secret(modulus, source_secret_coefficients);
+
+                let target = project_secret(modulus, target_secret_coefficients);
+
+                let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                let message = source.polynomial().scalar_mul(factor);
+
+                limbs.push(encrypt_raw_with_rng(params, &target, &message, rng));
+            }
+
+            entries.push(RnsRlweCiphertext::from_limbs(limbs));
+        }
+
+        Self { layout, entries }
+    }
+
+    pub fn layout(&self) -> &RnsGadgetLayout {
+        &self.layout
+    }
+
+    pub fn entries(&self) -> &[RnsRlweCiphertext] {
+        &self.entries
+    }
+
+    pub fn entry(&self, index: usize) -> &RnsRlweCiphertext {
+        &self.entries[index]
+    }
+}
+
 /// One evaluation-key ciphertext for every gadget block and RNS limb.
 ///
 /// Block `i` encrypts
@@ -345,6 +441,69 @@ pub fn rns_relinearize(
     RnsRlweCiphertext::from_limbs(output_limbs)
 }
 
+/// Switches an RNS RLWE ciphertext from the source secret encoded by
+/// `key_switch_key` to its target secret.
+///
+/// The input is interpreted limbwise as
+///
+/// `b + a * s_source`.
+///
+/// The returned ciphertext decrypts under `s_target` to the same
+/// RNS plaintext, up to evaluation-key noise.
+pub fn rns_key_switch(
+    ciphertext: &RnsRlweCiphertext,
+    key_switch_key: &RnsKeySwitchKey,
+) -> RnsRlweCiphertext {
+    let layout = key_switch_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match key-switch layout"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decomposition = layout.decompose(&a);
+
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+
+        let mut b = ciphertext.limb(limb_index).b().clone();
+
+        let mut a_out = Polynomial::zero(modulus, ciphertext.degree());
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let evaluation_key = key_switch_key.entry(block_index).limb(limb_index);
+
+            b = b.add(&digit.negacyclic_mul(evaluation_key.b()));
+
+            a_out = a_out.add(&digit.negacyclic_mul(evaluation_key.a()));
+        }
+
+        output_limbs.push(RlweCiphertext::new(b, a_out));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
 /// Raw RNS decryption using one logical ternary secret.
 pub fn decrypt_rns_raw(
     ciphertext: &RnsRlweCiphertext,
@@ -592,6 +751,94 @@ mod tests {
                     "RNS relinearization mismatch for seed {seed}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn generic_rns_key_switch_preserves_raw_decryption_without_noise() {
+        let basis = basis();
+
+        let degree = 8;
+
+        let source_secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let target_secret = [1, 0, -1, 0, 1, 1, 0, -1];
+
+        let message = [3_u128, 1, 4, 1, 5, 9, 2, 6];
+
+        let mut limbs = Vec::new();
+
+        for (limb_index, &modulus) in basis.moduli().iter().enumerate() {
+            let params = RlweParameters::new(degree, modulus, 2, 0);
+
+            let source = project_secret(modulus, &source_secret);
+
+            let plaintext = Polynomial::new(
+                modulus,
+                message
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let mut rng = ChaCha20Rng::seed_from_u64(0xA100 ^ limb_index as u64);
+
+            limbs.push(encrypt_raw_with_rng(params, &source, &plaintext, &mut rng));
+        }
+
+        let ciphertext = RnsRlweCiphertext::from_limbs(limbs);
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xA200);
+
+        let key = RnsKeySwitchKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &source_secret,
+            &target_secret,
+            layout,
+            &mut key_rng,
+        );
+
+        let before = decrypt_rns_raw(&ciphertext, &source_secret);
+
+        let switched = rns_key_switch(&ciphertext, &key);
+
+        let after = decrypt_rns_raw(&switched, &target_secret);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn generic_rns_key_switch_preserves_basis() {
+        let basis = basis();
+
+        let degree = 8;
+
+        let source_secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let target_secret = [1, 0, -1, 0, 1, 1, 0, -1];
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xA300);
+
+        let key = RnsKeySwitchKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &source_secret,
+            &target_secret,
+            layout,
+            &mut key_rng,
+        );
+
+        assert_eq!(key.layout().full_basis(), &basis);
+
+        for entry in key.entries() {
+            assert_eq!(entry.basis(), &basis);
         }
     }
 }
