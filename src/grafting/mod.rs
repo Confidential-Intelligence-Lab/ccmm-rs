@@ -1,3 +1,6 @@
+pub use transition::{ResurrectionPool, SproutTransition};
+pub mod transition;
+
 use crate::ring::{Modulus, ModulusBasis, RnsPolynomial};
 
 /// Separately managed factor of a Grafting ciphertext modulus.
