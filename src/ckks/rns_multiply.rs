@@ -2413,4 +2413,351 @@ mod tests {
 
         println!("R3_1B3_BOUNDED_GAUSSIAN_CKKS_SWEEP=PASS");
     }
+
+    #[test]
+    fn research_4096_bounded_gaussian_radix_statistical_characterization() {
+        use std::time::Instant;
+
+        use crate::ckks::research_profile_4096;
+        use crate::grafting::{
+            bounded_rns_relinearize_with_ntt, decrypt_rns_raw_with_ntt,
+            encrypt_rns_raw_with_distribution_ntt_rng, rns_tensor_with_ntt, BoundedGadgetLayout,
+            BoundedRnsKeygenConfig, BoundedRnsMultiplicationKey,
+        };
+        use crate::rlwe::ErrorDistribution;
+
+        #[derive(Debug, Clone, Copy)]
+        struct TrialResult {
+            keygen_us: f64,
+            relinearize_us: f64,
+            max_slot_error: f64,
+            mean_slot_error: f64,
+            rms_slot_error: f64,
+        }
+
+        fn min(values: &[f64]) -> f64 {
+            values.iter().copied().fold(f64::INFINITY, f64::min)
+        }
+
+        fn max(values: &[f64]) -> f64 {
+            values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        }
+
+        fn mean(values: &[f64]) -> f64 {
+            values.iter().sum::<f64>() / values.len() as f64
+        }
+
+        fn median(values: &[f64]) -> f64 {
+            let mut values = values.to_vec();
+            values.sort_by(f64::total_cmp);
+
+            let middle = values.len() / 2;
+
+            if values.len() % 2 == 0 {
+                (values[middle - 1] + values[middle]) / 2.0
+            } else {
+                values[middle]
+            }
+        }
+
+        let profile = research_profile_4096();
+        let chain = profile.modulus_chain();
+        let degree = profile.degree();
+
+        /*
+         * research-4096 uses Delta = 2^35.
+         *
+         * R3.1b.3 uses the same value. Keep the statistical campaign
+         * identical except for randomized encryption/key seeds.
+         */
+        let scale = 34_359_738_368.0_f64;
+
+        let basis = chain.top().clone();
+        let top_plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let embedding = CkksCanonicalEmbedding::new(degree);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let slot_count = degree / 2;
+
+        let lhs_slots: Vec<Complex64> = (0..slot_count)
+            .map(|index| {
+                let x = index as f64;
+                Complex64::new(0.10 + 0.00002 * x, -0.08 + 0.00001 * x)
+            })
+            .collect();
+
+        let rhs_slots: Vec<Complex64> = (0..slot_count)
+            .map(|index| {
+                let x = index as f64;
+                Complex64::new(-0.15 + 0.000015 * x, 0.12 - 0.000008 * x)
+            })
+            .collect();
+
+        let encode_rns = |slots: &[Complex64]| {
+            let coefficients = embedding.slots_to_coefficients(slots);
+
+            let residues = basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    let q = i128::from(modulus.value());
+
+                    Polynomial::new(
+                        modulus,
+                        coefficients
+                            .iter()
+                            .map(|&value| {
+                                let signed = (value * scale).round() as i128;
+                                signed.rem_euclid(q) as u64
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            RnsPolynomial::from_residues(residues)
+        };
+
+        let lhs_plaintext = encode_rns(&lhs_slots);
+        let rhs_plaintext = encode_rns(&rhs_slots);
+
+        let expected = reference_slot_product(&lhs_slots, &rhs_slots);
+
+        let tolerance = 1.0e-3_f64;
+        let trial_count = 10_usize;
+        let base_logs = [8_u32, 12, 16, 20];
+
+        println!("R3_1B4_PROFILE={}", profile.name());
+        println!("R3_1B4_RING_DEGREE={degree}");
+        println!("R3_1B4_SLOT_COUNT={slot_count}");
+        println!("R3_1B4_TRIALS={trial_count}");
+        println!("R3_1B4_INPUT_SCALE={scale:.17e}");
+        println!("R3_1B4_TOLERANCE={tolerance:.12e}");
+
+        for base_log in base_logs {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+            let mut results = Vec::with_capacity(trial_count);
+            let mut pass_count = 0_usize;
+
+            for trial in 0..trial_count {
+                let trial_u64 = u64::try_from(trial).expect("trial index must fit u64");
+
+                let mut lhs_rng = ChaCha20Rng::seed_from_u64(
+                    0x31B4_0000 ^ (trial_u64 << 8) ^ u64::from(base_log),
+                );
+
+                let mut rhs_rng = ChaCha20Rng::seed_from_u64(
+                    0x31B4_1000 ^ (trial_u64 << 8) ^ u64::from(base_log),
+                );
+
+                let lhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+                    &lhs_plaintext,
+                    2,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    &secret,
+                    &top_plan,
+                    &mut lhs_rng,
+                );
+
+                let rhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+                    &rhs_plaintext,
+                    2,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    &secret,
+                    &top_plan,
+                    &mut rhs_rng,
+                );
+
+                let lhs =
+                    RnsCkksCiphertext::new(lhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+                let rhs =
+                    RnsCkksCiphertext::new(rhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+                let quadratic = rns_tensor_with_ntt(lhs.rlwe(), rhs.rlwe(), &top_plan);
+
+                let mut key_rng = ChaCha20Rng::seed_from_u64(
+                    0x31B4_2000 ^ (trial_u64 << 8) ^ u64::from(base_log),
+                );
+
+                let keygen_start = Instant::now();
+
+                let multiplication_key =
+                    BoundedRnsMultiplicationKey::generate_with_distribution_ntt_rng(
+                        BoundedRnsKeygenConfig {
+                            plaintext_modulus: 2,
+                            layout: layout.clone(),
+                            plan: &top_plan,
+                        },
+                        &secret,
+                        ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                        &mut key_rng,
+                    );
+
+                let keygen_us = keygen_start.elapsed().as_secs_f64() * 1.0e6;
+
+                let relinearize_start = Instant::now();
+
+                let relinearized =
+                    bounded_rns_relinearize_with_ntt(&quadratic, &multiplication_key, &top_plan);
+
+                let relinearize_us = relinearize_start.elapsed().as_secs_f64() * 1.0e6;
+
+                let product_state = lhs.state().after_multiply(rhs.state(), &chain);
+
+                let product = RnsCkksCiphertext::new(relinearized, product_state, &chain);
+
+                let rescaled = rescale_rns_ckks_to_next(&product, &chain);
+
+                let result_plan =
+                    RnsNttPlan::new(rescaled.rlwe().basis().moduli().to_vec(), degree);
+
+                let decrypted = decrypt_rns_raw_with_ntt(rescaled.rlwe(), &secret, &result_plan);
+
+                let modulus = decrypted.composite_modulus();
+                let output_scale = rescaled.scale();
+
+                let decoded_coefficients: Vec<f64> = decrypted
+                    .reconstruct_coefficients()
+                    .into_iter()
+                    .map(|value| centered(value, modulus) as f64 / output_scale)
+                    .collect();
+
+                let observed = embedding.coefficients_to_slots(&decoded_coefficients);
+
+                let mut max_slot_error = 0.0_f64;
+                let mut sum_error = 0.0_f64;
+                let mut sum_squared_error = 0.0_f64;
+
+                for (&actual, &reference) in observed.iter().zip(&expected) {
+                    let error = (actual - reference).norm();
+
+                    max_slot_error = max_slot_error.max(error);
+
+                    sum_error += error;
+                    sum_squared_error += error * error;
+                }
+
+                let mean_slot_error = sum_error / observed.len() as f64;
+
+                let rms_slot_error = (sum_squared_error / observed.len() as f64).sqrt();
+
+                let passed = max_slot_error <= tolerance;
+
+                if passed {
+                    pass_count += 1;
+                }
+
+                println!(
+                    "R3_1B4_TRIAL={} \
+                     BASE_LOG={} \
+                     BASE={} \
+                     DIGITS={} \
+                     KEYGEN_US={:.3} \
+                     RELINEARIZE_US={:.3} \
+                     MAX_SLOT_ERROR={:.12e} \
+                     MEAN_SLOT_ERROR={:.12e} \
+                     RMS_SLOT_ERROR={:.12e} \
+                     STATUS={}",
+                    trial,
+                    base_log,
+                    layout.base(),
+                    layout.digit_count(),
+                    keygen_us,
+                    relinearize_us,
+                    max_slot_error,
+                    mean_slot_error,
+                    rms_slot_error,
+                    if passed { "PASS" } else { "FAIL" },
+                );
+
+                results.push(TrialResult {
+                    keygen_us,
+                    relinearize_us,
+                    max_slot_error,
+                    mean_slot_error,
+                    rms_slot_error,
+                });
+            }
+
+            let keygen: Vec<f64> = results.iter().map(|r| r.keygen_us).collect();
+
+            let relinearize: Vec<f64> = results.iter().map(|r| r.relinearize_us).collect();
+
+            let max_slot_error: Vec<f64> = results.iter().map(|r| r.max_slot_error).collect();
+
+            let mean_slot_error: Vec<f64> = results.iter().map(|r| r.mean_slot_error).collect();
+
+            let rms_slot_error: Vec<f64> = results.iter().map(|r| r.rms_slot_error).collect();
+
+            println!(
+                "R3_1B4_SUMMARY_BASE_LOG={} \
+                 BASE={} \
+                 DIGITS={} \
+                 PASS_COUNT={} \
+                 TRIALS={} \
+                 KEYGEN_US_MIN={:.3} \
+                 KEYGEN_US_MEAN={:.3} \
+                 KEYGEN_US_MEDIAN={:.3} \
+                 KEYGEN_US_MAX={:.3} \
+                 RELINEARIZE_US_MIN={:.3} \
+                 RELINEARIZE_US_MEAN={:.3} \
+                 RELINEARIZE_US_MEDIAN={:.3} \
+                 RELINEARIZE_US_MAX={:.3} \
+                 MAX_SLOT_ERROR_MIN={:.12e} \
+                 MAX_SLOT_ERROR_MEAN={:.12e} \
+                 MAX_SLOT_ERROR_MEDIAN={:.12e} \
+                 MAX_SLOT_ERROR_MAX={:.12e} \
+                 MEAN_SLOT_ERROR_MIN={:.12e} \
+                 MEAN_SLOT_ERROR_MEAN={:.12e} \
+                 MEAN_SLOT_ERROR_MEDIAN={:.12e} \
+                 MEAN_SLOT_ERROR_MAX={:.12e} \
+                 RMS_SLOT_ERROR_MIN={:.12e} \
+                 RMS_SLOT_ERROR_MEAN={:.12e} \
+                 RMS_SLOT_ERROR_MEDIAN={:.12e} \
+                 RMS_SLOT_ERROR_MAX={:.12e}",
+                base_log,
+                layout.base(),
+                layout.digit_count(),
+                pass_count,
+                trial_count,
+                min(&keygen),
+                mean(&keygen),
+                median(&keygen),
+                max(&keygen),
+                min(&relinearize),
+                mean(&relinearize),
+                median(&relinearize),
+                max(&relinearize),
+                min(&max_slot_error),
+                mean(&max_slot_error),
+                median(&max_slot_error),
+                max(&max_slot_error),
+                min(&mean_slot_error),
+                mean(&mean_slot_error),
+                median(&mean_slot_error),
+                max(&mean_slot_error),
+                min(&rms_slot_error),
+                mean(&rms_slot_error),
+                median(&rms_slot_error),
+                max(&rms_slot_error),
+            );
+
+            assert_eq!(
+                pass_count, trial_count,
+                "bounded Gaussian CKKS statistical campaign failed for base_log={base_log}"
+            );
+        }
+
+        println!("R3_1B4_STATISTICAL_CHARACTERIZATION=PASS");
+    }
 }
