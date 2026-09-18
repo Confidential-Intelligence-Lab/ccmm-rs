@@ -95,7 +95,8 @@ pub fn multiply_transition_relinearize_hybrid_ckks(
 
     let product_state = lhs.state().after_multiply(rhs.state(), chain);
 
-    let next_state = product_state.after_rescale(chain);
+    let next_state =
+        product_state.after_grafted_rescale(chain, lhs.sprout_bits(), config.target_sprout_bits);
 
     HybridCkksCiphertext::new(inner, next_state)
 }
@@ -334,6 +335,65 @@ mod tests {
         );
     }
 
+    fn assert_grafted_scale_transition(
+        source_bits: u32,
+        target_bits: u32,
+        expected_pow2_factor: f64,
+        seed: u64,
+    ) {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs_scale = 256.0;
+        let rhs_scale = 512.0;
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, source_bits, lhs_scale, &secret, seed);
+        let rhs = hybrid_encrypt_zero(&chain, 0, source_bits, rhs_scale, &secret, seed ^ 1);
+
+        let key = target_key(&chain, 1, target_bits, &secret, seed ^ 2);
+
+        let result = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: target_bits,
+                key: &key,
+                backend: HybridRelinearizationBackend::Direct,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
+
+        let nutrient = chain.level(0).modulus(chain.level(0).len() - 1).value() as f64;
+        let expected = lhs_scale * rhs_scale / nutrient * expected_pow2_factor;
+
+        assert!(
+            (result.scale() - expected).abs() < 1.0e-12,
+            "source_bits={source_bits}, target_bits={target_bits}, actual={}, expected={expected}",
+            result.scale(),
+        );
+
+        assert_eq!(result.level(), 1);
+        assert_eq!(result.sprout_bits(), target_bits);
+        assert_eq!(result.ordinary_basis(), chain.level(1));
+    }
+
+    #[test]
+    fn hybrid_ckks_scale_tracks_shrinking_sprout_8_to_6() {
+        assert_grafted_scale_transition(8, 6, 0.25, 0xCE30);
+    }
+
+    #[test]
+    fn hybrid_ckks_scale_tracks_growing_sprout_6_to_8() {
+        assert_grafted_scale_transition(6, 8, 4.0, 0xCE40);
+    }
+
+    #[test]
+    fn hybrid_ckks_scale_tracks_shrinking_sprout_8_to_4() {
+        assert_grafted_scale_transition(8, 4, 1.0 / 16.0, 0xCE50);
+    }
+
     #[test]
     fn hybrid_ckks_direct_path_preserves_transitioned_quadratic_semantics() {
         let chain = chain();
@@ -374,5 +434,173 @@ mod tests {
         let expected = decrypt_hybrid_quadratic_raw(&transitioned, &secret);
 
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid CKKS multiplication requires matching sprout sizes")]
+    fn hybrid_ckks_rejects_mismatched_sprout_widths() {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF00);
+
+        let rhs = hybrid_encrypt_zero(&chain, 0, 6, 65_537.0, &secret, 0xCF01);
+
+        let key = target_key(&chain, 1, 8, &secret, 0xCF02);
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::Direct,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid multiplication key must use target Grafting sprout size")]
+    fn hybrid_ckks_rejects_wrong_target_sprout_key() {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF10);
+
+        let rhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF11);
+
+        /*
+         * Transition requests an 8-bit target sprout but the key
+         * was generated for a 6-bit target sprout.
+         */
+        let key = target_key(&chain, 1, 6, &secret, 0xCF12);
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::Direct,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "helper-prime hybrid backend requires a helper-prime plan")]
+    fn hybrid_ckks_helper_backend_requires_helper_plan() {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF20);
+
+        let rhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF21);
+
+        let key = target_key(&chain, 1, 8, &secret, 0xCF22);
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::HelperPrime,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "prepared hybrid backend requires a prepared multiplication key")]
+    fn hybrid_ckks_prepared_backend_requires_prepared_key() {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF30);
+
+        let rhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF31);
+
+        let key = target_key(&chain, 1, 8, &secret, 0xCF32);
+
+        let helper = HelperPrimeNttPlan::new(8, secret.len(), Modulus::new(HELPER_PRIME));
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::Prepared,
+                helper_plan: Some(&helper),
+                prepared_key: None,
+            },
+            &chain,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid CKKS multiplication requires matching levels")]
+    fn hybrid_ckks_rejects_mismatched_levels() {
+        let chain = chain();
+        let secret = secret();
+
+        let lhs = hybrid_encrypt_zero(&chain, 0, 8, 65_537.0, &secret, 0xCF40);
+
+        let rhs = hybrid_encrypt_zero(&chain, 1, 8, 65_537.0, &secret, 0xCF41);
+
+        let key = target_key(&chain, 1, 8, &secret, 0xCF42);
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::Direct,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid CKKS multiplication requires a remaining CKKS level")]
+    fn hybrid_ckks_rejects_multiplication_at_terminal_level() {
+        let chain = chain();
+        let secret = secret();
+
+        let terminal = chain.max_level();
+
+        let lhs = hybrid_encrypt_zero(&chain, terminal, 8, 65_537.0, &secret, 0xCF50);
+
+        let rhs = hybrid_encrypt_zero(&chain, terminal, 8, 65_537.0, &secret, 0xCF51);
+
+        /*
+         * This key should never actually be consumed because
+         * terminal-level rejection occurs first.
+         */
+        let key = target_key(&chain, terminal, 8, &secret, 0xCF52);
+
+        let _ = multiply_transition_relinearize_hybrid_ckks(
+            &lhs,
+            &rhs,
+            HybridCkksMultiplyConfig {
+                target_sprout_bits: 8,
+                key: &key,
+                backend: HybridRelinearizationBackend::Direct,
+                helper_plan: None,
+                prepared_key: None,
+            },
+            &chain,
+        );
     }
 }

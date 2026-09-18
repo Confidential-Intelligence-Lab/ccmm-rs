@@ -70,6 +70,26 @@ impl CkksChainState {
         Self::new(chain, self.level + 1, self.scale / divisor.value() as f64)
     }
 
+    /// Advances one CKKS level while accounting for a Grafting sprout-width
+    /// transition.
+    ///
+    /// Besides division by the trailing odd CKKS modulus, changing the
+    /// sprout width rescales the represented value by
+    /// `2^(target_sprout_bits - source_sprout_bits)`.
+    pub fn after_grafted_rescale(
+        &self,
+        chain: &ModulusChain,
+        source_sprout_bits: u32,
+        target_sprout_bits: u32,
+    ) -> Self {
+        let ordinary = self.after_rescale(chain);
+
+        let exponent = i64::from(target_sprout_bits) - i64::from(source_sprout_bits);
+        let sprout_factor = 2.0_f64.powf(exponent as f64);
+
+        Self::new(chain, ordinary.level(), ordinary.scale() * sprout_factor)
+    }
+
     pub fn after_multiply(&self, rhs: &Self, chain: &ModulusChain) -> Self {
         self.assert_matches_chain(chain);
         rhs.assert_matches_chain(chain);

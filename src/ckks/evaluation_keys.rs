@@ -862,4 +862,147 @@ mod tests {
 
         policy.assert_backend_available(&state);
     }
+
+    #[test]
+    #[should_panic(expected = "evaluation keys already exist for this CKKS level")]
+    fn duplicate_level_registration_is_rejected() {
+        let chain = chain();
+
+        let mut keys = RnsCkksEvaluationKeys::new();
+
+        keys.insert_level(RnsCkksLevelKeys::new(0, chain.level(0).clone()));
+
+        keys.insert_level(RnsCkksLevelKeys::new(0, chain.level(0).clone()));
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS Galois key exponent already exists at this level")]
+    fn duplicate_galois_exponent_is_rejected() {
+        let chain = chain();
+        let secret = secret();
+
+        let exponent = crate::ckks::rotation_exponent_left(secret.len(), 1);
+
+        let mut level = RnsCkksLevelKeys::new(0, chain.level(0).clone());
+
+        level.insert_galois_key(galois_key(&chain, 0, &secret, exponent, 0xD000));
+
+        level.insert_galois_key(galois_key(&chain, 0, &secret, exponent, 0xD001));
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS multiplication key basis must match level-key basis")]
+    fn multiplication_key_with_wrong_basis_is_rejected() {
+        let chain = chain();
+        let secret = secret();
+
+        let wrong = multiplication_key(&chain, 1, &secret, 0xD010);
+
+        let mut level = RnsCkksLevelKeys::new(0, chain.level(0).clone());
+
+        level.set_multiplication_key(wrong);
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS Galois key basis must match level-key basis")]
+    fn galois_key_with_wrong_basis_is_rejected() {
+        let chain = chain();
+        let secret = secret();
+
+        let exponent = crate::ckks::rotation_exponent_left(secret.len(), 1);
+
+        let wrong = galois_key(&chain, 1, &secret, exponent, 0xD020);
+
+        let mut level = RnsCkksLevelKeys::new(0, chain.level(0).clone());
+
+        level.insert_galois_key(wrong);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "hybrid multiplication-key ordinary basis must match CKKS level basis"
+    )]
+    fn hybrid_key_with_wrong_basis_is_rejected() {
+        let chain = chain();
+        let secret = secret();
+
+        let key = hybrid_key(&chain, 1, &secret, 0xD030);
+
+        let _ = RnsCkksHybridLevelKeys::new(0, chain.level(0).clone(), key);
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid evaluation keys already exist for this CKKS level")]
+    fn duplicate_hybrid_level_registration_is_rejected() {
+        let chain = chain();
+        let secret = secret();
+
+        let mut policy = RnsCkksMultiplicationPolicy::new();
+
+        policy.insert_hybrid_level(RnsCkksHybridLevelKeys::new(
+            0,
+            chain.level(0).clone(),
+            hybrid_key(&chain, 0, &secret, 0xD040),
+        ));
+
+        policy.insert_hybrid_level(RnsCkksHybridLevelKeys::new(
+            0,
+            chain.level(0).clone(),
+            hybrid_key(&chain, 0, &secret, 0xD041),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "multiplication key is missing for active CKKS level")]
+    fn automatic_multiply_rejects_level_without_multiplication_key() {
+        let chain = chain();
+
+        let lhs = zero_ciphertext(&chain, 0, 8, 256.0);
+
+        let rhs = zero_ciphertext(&chain, 0, 8, 256.0);
+
+        let mut keys = RnsCkksEvaluationKeys::new();
+
+        keys.insert_level(RnsCkksLevelKeys::new(0, chain.level(0).clone()));
+
+        let _ = multiply_with_evaluation_keys(&lhs, &rhs, &keys, &chain);
+    }
+
+    #[test]
+    #[should_panic(expected = "Galois key is missing for requested exponent at active CKKS level")]
+    fn automatic_rotation_rejects_unregistered_exponent() {
+        let chain = chain();
+        let secret = secret();
+
+        let ciphertext = zero_ciphertext(&chain, 0, 8, 65_537.0);
+
+        let registered = crate::ckks::rotation_exponent_left(secret.len(), 1);
+
+        let mut level = RnsCkksLevelKeys::new(0, chain.level(0).clone());
+
+        level.insert_galois_key(galois_key(&chain, 0, &secret, registered, 0xD050));
+
+        let mut keys = RnsCkksEvaluationKeys::new();
+
+        keys.insert_level(level);
+
+        /*
+         * Request a different exponent than the one registered above.
+         */
+        let _ = rotate_left_with_evaluation_keys(&ciphertext, 2, &keys, &chain);
+    }
+
+    #[test]
+    #[should_panic(expected = "evaluation-key basis must match CKKS ciphertext basis")]
+    fn state_level_with_wrong_basis_is_rejected_by_lookup() {
+        let chain = chain();
+
+        let mut keys = RnsCkksEvaluationKeys::new();
+
+        keys.insert_level(RnsCkksLevelKeys::new(0, chain.level(1).clone()));
+
+        let state = CkksChainState::top(&chain, 65_537.0);
+
+        let _ = keys.for_state(&state);
+    }
 }
