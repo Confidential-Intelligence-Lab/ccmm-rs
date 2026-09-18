@@ -1,3 +1,8 @@
+pub use rns_key_switch::{
+    decrypt_rns_quadratic_raw, decrypt_rns_raw, rns_relinearize, ternary_secret_coefficients,
+    RnsMultiplicationKey, RnsQuadraticCiphertext, RnsRlweCiphertext,
+};
+pub mod rns_key_switch;
 pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};
 pub mod rns_gadget;
 pub use key_switch::{relinearize_scheduled, GadgetDigitSchedule};
