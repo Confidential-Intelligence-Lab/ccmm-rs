@@ -1,3 +1,5 @@
+pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};
+pub mod rns_gadget;
 pub use key_switch::{relinearize_scheduled, GadgetDigitSchedule};
 pub mod key_switch;
 pub use gadget::{GadgetBlock, GadgetLayout};
