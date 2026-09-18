@@ -12,3 +12,6 @@ pub use polynomial::Polynomial;
 pub use ntt_params::{find_negacyclic_root, make_ntt_plan};
 
 pub use ntt_polynomial::NttPolynomial;
+
+pub mod rns;
+pub use rns::RnsPolynomial;
