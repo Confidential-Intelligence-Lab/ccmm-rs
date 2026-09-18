@@ -1,3 +1,13 @@
+mod chain;
+mod rns_ciphertext;
+mod rns_multiply;
+mod rns_rescale;
+
+pub use chain::CkksChainState;
+pub use rns_ciphertext::RnsCkksCiphertext;
+pub use rns_multiply::multiply_relinearize_rescale_rns_ckks;
+pub use rns_rescale::rescale_rns_ckks_to_next;
+
 use rand::{CryptoRng, RngCore};
 
 use crate::eval::{relinearize, MultiplicationKey};

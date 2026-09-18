@@ -185,6 +185,62 @@ pub struct RnsQuadraticCiphertext {
 }
 
 impl RnsQuadraticCiphertext {
+    pub fn from_rns_polynomials(c0: RnsPolynomial, c1: RnsPolynomial, c2: RnsPolynomial) -> Self {
+        assert_eq!(
+            c0.basis(),
+            c1.basis(),
+            "RNS quadratic c0/c1 bases must match"
+        );
+
+        assert_eq!(
+            c0.basis(),
+            c2.basis(),
+            "RNS quadratic c0/c2 bases must match"
+        );
+
+        assert_eq!(
+            c0.degree(),
+            c1.degree(),
+            "RNS quadratic c0/c1 degrees must match"
+        );
+
+        assert_eq!(
+            c0.degree(),
+            c2.degree(),
+            "RNS quadratic c0/c2 degrees must match"
+        );
+
+        Self { c0, c1, c2 }
+    }
+
+    pub fn from_components(c0: RnsPolynomial, c1: RnsPolynomial, c2: RnsPolynomial) -> Self {
+        assert_eq!(
+            c0.basis(),
+            c1.basis(),
+            "quadratic RNS c0/c1 bases must match"
+        );
+
+        assert_eq!(
+            c0.basis(),
+            c2.basis(),
+            "quadratic RNS c0/c2 bases must match"
+        );
+
+        assert_eq!(
+            c0.degree(),
+            c1.degree(),
+            "quadratic RNS c0/c1 degrees must match"
+        );
+
+        assert_eq!(
+            c0.degree(),
+            c2.degree(),
+            "quadratic RNS c0/c2 degrees must match"
+        );
+
+        Self { c0, c1, c2 }
+    }
+
     pub fn from_coefficient_ciphertext(
         product: &RlweQuadraticCiphertext,
         basis: &ModulusBasis,
