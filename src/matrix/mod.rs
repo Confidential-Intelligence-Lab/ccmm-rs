@@ -8,3 +8,6 @@ pub use encoded::EncodedMatrix;
 
 pub mod polynomial;
 pub use polynomial::PolynomialMatrix;
+
+pub mod rns_ckks_ciphertext;
+pub use rns_ckks_ciphertext::RnsCkksCiphertextMatrix;

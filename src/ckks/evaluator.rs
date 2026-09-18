@@ -1,9 +1,11 @@
-use crate::ring::ModulusChain;
+use crate::grafting::RnsRlweCiphertext;
+use crate::ring::{ModulusChain, RnsNttPlan};
+use crate::rlwe::RlweCiphertext;
 
 use super::{
-    conjugate_with_evaluation_keys, multiply_with_evaluation_keys,
-    rotate_left_with_evaluation_keys, rotate_right_with_evaluation_keys, RnsCkksCiphertext,
-    RnsCkksEvaluationKeys,
+    conjugate_with_evaluation_keys, multiply_relinearize_rescale_rns_ckks_with_ntt,
+    multiply_with_evaluation_keys, rotate_left_with_evaluation_keys,
+    rotate_right_with_evaluation_keys, RnsCkksCiphertext, RnsCkksEvaluationKeys,
 };
 
 /// High-level evaluator for leveled RNS CKKS operations.
@@ -30,8 +32,82 @@ impl<'a> RnsCkksEvaluator<'a> {
         self.keys
     }
 
+    pub fn add(&self, lhs: &RnsCkksCiphertext, rhs: &RnsCkksCiphertext) -> RnsCkksCiphertext {
+        lhs.assert_matches_chain(self.chain);
+        rhs.assert_matches_chain(self.chain);
+
+        assert_eq!(
+            lhs.level(),
+            rhs.level(),
+            "RNS CKKS addition requires matching levels"
+        );
+        assert_eq!(
+            lhs.basis(),
+            rhs.basis(),
+            "RNS CKKS addition requires matching bases"
+        );
+        assert_eq!(
+            lhs.scale(),
+            rhs.scale(),
+            "RNS CKKS addition requires matching scales"
+        );
+
+        let limbs = lhs
+            .rlwe()
+            .limbs()
+            .iter()
+            .zip(rhs.rlwe().limbs())
+            .map(|(lhs_limb, rhs_limb)| {
+                RlweCiphertext::new(
+                    lhs_limb.b().add(rhs_limb.b()),
+                    lhs_limb.a().add(rhs_limb.a()),
+                )
+            })
+            .collect();
+
+        RnsCkksCiphertext::new(
+            RnsRlweCiphertext::from_limbs(limbs),
+            lhs.state().clone(),
+            self.chain,
+        )
+    }
+
     pub fn multiply(&self, lhs: &RnsCkksCiphertext, rhs: &RnsCkksCiphertext) -> RnsCkksCiphertext {
         multiply_with_evaluation_keys(lhs, rhs, self.keys, self.chain)
+    }
+
+    /// Multiplies, relinearizes, and rescales using the NTT-backed
+    /// RNS CKKS multiplication path while selecting the evaluation key
+    /// from the operands' active chain level.
+    pub fn multiply_with_ntt(
+        &self,
+        lhs: &RnsCkksCiphertext,
+        rhs: &RnsCkksCiphertext,
+        plan: &RnsNttPlan,
+    ) -> RnsCkksCiphertext {
+        lhs.assert_matches_chain(self.chain);
+        rhs.assert_matches_chain(self.chain);
+
+        assert_eq!(
+            lhs.level(),
+            rhs.level(),
+            "RNS CKKS multiplication requires matching levels"
+        );
+        assert_eq!(
+            lhs.basis(),
+            rhs.basis(),
+            "RNS CKKS multiplication requires matching bases"
+        );
+
+        let multiplication_key = self.keys.multiplication_for(lhs.state());
+
+        multiply_relinearize_rescale_rns_ckks_with_ntt(
+            lhs,
+            rhs,
+            multiplication_key,
+            self.chain,
+            plan,
+        )
     }
 
     pub fn rotate_left(&self, ciphertext: &RnsCkksCiphertext, steps: usize) -> RnsCkksCiphertext {
@@ -183,6 +259,65 @@ mod tests {
         assert_eq!(evaluator.chain(), &chain);
 
         assert_eq!(evaluator.keys(), &keys);
+    }
+
+    #[test]
+    fn evaluator_add_preserves_active_state() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let result = evaluator.add(&lhs, &rhs);
+
+        assert_eq!(result.level(), lhs.level());
+        assert_eq!(result.basis(), lhs.basis());
+        assert_eq!(result.scale(), lhs.scale());
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS CKKS addition requires matching levels")]
+    fn evaluator_add_rejects_mismatched_levels() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 0, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let _ = evaluator.add(&lhs, &rhs);
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS CKKS addition requires matching scales")]
+    fn evaluator_add_rejects_mismatched_scales() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 32_768.0);
+        let _ = evaluator.add(&lhs, &rhs);
+    }
+
+    #[test]
+    fn evaluator_ntt_multiply_selects_active_level_key() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 0, 256.0);
+        let rhs = zero_ciphertext(&chain, 0, 512.0);
+        let plan = RnsNttPlan::new(chain.level(0).moduli().to_vec(), 8);
+
+        let result = evaluator.multiply_with_ntt(&lhs, &rhs, &plan);
+
+        assert_eq!(result.level(), 1);
+        assert_eq!(result.basis(), chain.level(1));
+        assert_eq!(
+            result.scale(),
+            256.0 * 512.0 / chain.dropped_modulus(0).unwrap().value() as f64
+        );
     }
 
     #[test]
