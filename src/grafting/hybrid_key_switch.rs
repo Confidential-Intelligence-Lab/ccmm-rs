@@ -5,8 +5,8 @@ use crate::rlwe::{encrypt_raw_with_rng, RlweCiphertext, RlweParameters, SecretKe
 
 use super::{
     decrypt_pow2_raw, encrypt_pow2_raw_with_noise_rng, project_ternary_secret_pow2,
-    HybridRlweCiphertext, MixedGadgetLayout, Pow2Polynomial, Pow2RlweCiphertext, Pow2RnsPolynomial,
-    RnsRlweCiphertext,
+    HelperPrimeNttPlan, HybridRlweCiphertext, MixedGadgetLayout, Pow2Polynomial,
+    Pow2RlweCiphertext, Pow2RnsPolynomial, RnsRlweCiphertext,
 };
 
 /// Evaluation-key entry for one mixed gadget block.
@@ -284,6 +284,135 @@ pub fn hybrid_relinearize(
     sprout_b = sprout_b.add(&sprout_digit.negacyclic_mul(evaluation_key.b()));
 
     sprout_a = sprout_a.add(&sprout_digit.negacyclic_mul(evaluation_key.a()));
+
+    HybridRlweCiphertext::new(ordinary, Pow2RlweCiphertext::new(sprout_b, sprout_a))
+}
+
+/// Relinearizes a mixed hybrid degree-two ciphertext using a
+/// helper-prime NTT backend for the power-of-two sprout limb.
+///
+/// Odd-prime RNS limbs follow the reference hybrid path. Only
+/// multiplication inside the `2^k` sprout limb is replaced by
+/// exact helper-prime NTT multiplication.
+pub fn hybrid_relinearize_helper_prime(
+    product: &HybridQuadraticCiphertext,
+    multiplication_key: &HybridMultiplicationKey,
+    helper_plan: &HelperPrimeNttPlan,
+) -> HybridRlweCiphertext {
+    let layout = multiplication_key.layout();
+
+    assert_eq!(
+        product.c0().ordinary_basis(),
+        layout.ordinary_basis(),
+        "hybrid quadratic basis must match multiplication key"
+    );
+
+    assert_eq!(
+        product.c0().sprout_bits(),
+        layout.sprout_bits(),
+        "hybrid quadratic sprout size must match multiplication key"
+    );
+
+    assert_eq!(
+        helper_plan.bits(),
+        layout.sprout_bits(),
+        "helper-prime plan sprout size must match hybrid layout"
+    );
+
+    assert_eq!(
+        helper_plan.degree(),
+        product.c0().degree(),
+        "helper-prime plan degree must match hybrid ciphertext"
+    );
+
+    let decomposition = layout.decompose(product.c2());
+
+    let ordinary_basis = layout.ordinary_basis();
+
+    let ordinary_block_count = layout.ordinary_layout().block_count();
+
+    let mut ordinary_output = Vec::with_capacity(ordinary_basis.len());
+
+    for limb_index in 0..ordinary_basis.len() {
+        let modulus = ordinary_basis.modulus(limb_index);
+
+        let mut b = product.c0().ordinary().residue(limb_index).clone();
+
+        let mut a = product.c1().ordinary().residue(limb_index).clone();
+
+        for block_index in 0..ordinary_block_count {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .ordinary_digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let evaluation_key = multiplication_key
+                .entry(block_index)
+                .ordinary()
+                .limb(limb_index);
+
+            b = b.add(&digit.negacyclic_mul(evaluation_key.b()));
+
+            a = a.add(&digit.negacyclic_mul(evaluation_key.a()));
+        }
+
+        let sprout_digit = Polynomial::new(
+            modulus,
+            decomposition
+                .sprout_digit()
+                .iter()
+                .map(|&value| value % modulus.value())
+                .collect(),
+        );
+
+        let sprout_entry = multiplication_key
+            .entry(ordinary_block_count)
+            .ordinary()
+            .limb(limb_index);
+
+        b = b.add(&sprout_digit.negacyclic_mul(sprout_entry.b()));
+
+        a = a.add(&sprout_digit.negacyclic_mul(sprout_entry.a()));
+
+        ordinary_output.push(RlweCiphertext::new(b, a));
+    }
+
+    let ordinary = RnsRlweCiphertext::from_limbs(ordinary_output);
+
+    let bits = layout.sprout_bits();
+
+    let mut sprout_b = product.c0().sprout().clone();
+
+    let mut sprout_a = product.c1().sprout().clone();
+
+    for block_index in 0..ordinary_block_count {
+        let digit = Pow2Polynomial::new(
+            bits,
+            decomposition
+                .ordinary_digit(block_index)
+                .iter()
+                .map(|&value| (value % (1_u128 << bits)) as u64)
+                .collect(),
+        );
+
+        let evaluation_key = multiplication_key.entry(block_index).sprout();
+
+        sprout_b = sprout_b.add(&helper_plan.negacyclic_mul(&digit, evaluation_key.b()));
+
+        sprout_a = sprout_a.add(&helper_plan.negacyclic_mul(&digit, evaluation_key.a()));
+    }
+
+    let sprout_digit = Pow2Polynomial::new(bits, decomposition.sprout_digit().to_vec());
+
+    let evaluation_key = multiplication_key.entry(ordinary_block_count).sprout();
+
+    sprout_b = sprout_b.add(&helper_plan.negacyclic_mul(&sprout_digit, evaluation_key.b()));
+
+    sprout_a = sprout_a.add(&helper_plan.negacyclic_mul(&sprout_digit, evaluation_key.a()));
 
     HybridRlweCiphertext::new(ordinary, Pow2RlweCiphertext::new(sprout_b, sprout_a))
 }
@@ -732,5 +861,54 @@ mod tests {
             "power-of-two hybrid relinearization noise \
              does not match evaluation-key noise"
         );
+    }
+
+    #[test]
+    fn helper_prime_relinearization_matches_reference_exactly() {
+        const HELPER_PRIME: u64 = 2_013_265_921;
+
+        for bits in [2_u32, 4, 6, 8, 10, 12] {
+            for block_sizes in [vec![3], vec![1, 2], vec![1, 1, 1]] {
+                for seed in 0_u64..32 {
+                    let layout = MixedGadgetLayout::new(basis(), block_sizes.clone(), bits);
+
+                    let product = quadratic(bits);
+
+                    let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0x5252_5A5A);
+
+                    let key = HybridMultiplicationKey::generate_with_rng(
+                        8,
+                        16,
+                        1,
+                        &ternary(),
+                        layout,
+                        &mut rng,
+                    );
+
+                    let helper_plan = HelperPrimeNttPlan::new(bits, 8, Modulus::new(HELPER_PRIME));
+
+                    let reference = hybrid_relinearize(&product, &key);
+
+                    let accelerated = hybrid_relinearize_helper_prime(&product, &key, &helper_plan);
+
+                    assert_eq!(
+                        accelerated, reference,
+                        "helper-prime hybrid relinearization \
+                         mismatch: bits={bits}, \
+                         blocks={block_sizes:?}, \
+                         seed={seed}"
+                    );
+
+                    assert_eq!(
+                        decrypt_hybrid_raw(&accelerated, &ternary(),),
+                        decrypt_hybrid_raw(&reference, &ternary(),),
+                        "helper-prime decrypted mismatch: \
+                         bits={bits}, \
+                         blocks={block_sizes:?}, \
+                         seed={seed}"
+                    );
+                }
+            }
+        }
     }
 }
