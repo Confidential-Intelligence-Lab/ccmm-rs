@@ -27,3 +27,6 @@ pub use modulus_chain::ModulusChain;
 
 pub mod basis_conversion;
 pub use basis_conversion::convert_basis;
+
+pub mod basis_transition;
+pub use basis_transition::{drop_basis_prefix, extend_basis_prefix};
