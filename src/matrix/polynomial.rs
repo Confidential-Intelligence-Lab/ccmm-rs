@@ -127,7 +127,7 @@ impl PolynomialMatrix {
         Self::from_vec_column_major(self.rows, self.cols, data)
     }
 
-    /// Matrix multiplication over R_q = `Z_q[X]/(X^N + 1)`.
+    /// Matrix multiplication over R_q = ``Z_q[X]/(X^N + 1)``.
     ///
     /// Matrix addition is polynomial addition and scalar
     /// multiplication is negacyclic polynomial multiplication.
