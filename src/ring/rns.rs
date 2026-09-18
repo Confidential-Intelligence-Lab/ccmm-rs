@@ -1,4 +1,4 @@
-use super::{Modulus, Polynomial};
+use super::{Modulus, ModulusBasis, Polynomial};
 
 /// Polynomial represented in residue-number-system form.
 ///
@@ -11,7 +11,7 @@ use super::{Modulus, Polynomial};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RnsPolynomial {
     degree: usize,
-    moduli: Vec<Modulus>,
+    basis: ModulusBasis,
     residues: Vec<Polynomial>,
 }
 
@@ -20,7 +20,7 @@ impl RnsPolynomial {
     ///
     /// Each coefficient is reduced independently modulo every RNS limb.
     pub fn from_coefficients(moduli: Vec<Modulus>, coefficients: &[u128]) -> Self {
-        validate_moduli(&moduli);
+        let basis = ModulusBasis::new(moduli);
 
         assert!(
             !coefficients.is_empty(),
@@ -29,7 +29,8 @@ impl RnsPolynomial {
 
         let degree = coefficients.len();
 
-        let residues = moduli
+        let residues = basis
+            .moduli()
             .iter()
             .copied()
             .map(|modulus| {
@@ -45,7 +46,7 @@ impl RnsPolynomial {
 
         Self {
             degree,
-            moduli,
+            basis,
             residues,
         }
     }
@@ -61,7 +62,7 @@ impl RnsPolynomial {
 
         let moduli: Vec<_> = residues.iter().map(Polynomial::modulus).collect();
 
-        validate_moduli(&moduli);
+        let basis = ModulusBasis::new(moduli);
 
         for residue in &residues {
             assert_eq!(
@@ -73,17 +74,18 @@ impl RnsPolynomial {
 
         Self {
             degree,
-            moduli,
+            basis,
             residues,
         }
     }
 
     pub fn zero(moduli: Vec<Modulus>, degree: usize) -> Self {
-        validate_moduli(&moduli);
+        let basis = ModulusBasis::new(moduli);
 
         assert!(degree > 0, "RNS polynomial degree must be positive");
 
-        let residues = moduli
+        let residues = basis
+            .moduli()
             .iter()
             .copied()
             .map(|modulus| Polynomial::zero(modulus, degree))
@@ -91,7 +93,7 @@ impl RnsPolynomial {
 
         Self {
             degree,
-            moduli,
+            basis,
             residues,
         }
     }
@@ -100,8 +102,12 @@ impl RnsPolynomial {
         self.degree
     }
 
+    pub fn basis(&self) -> &ModulusBasis {
+        &self.basis
+    }
+
     pub fn moduli(&self) -> &[Modulus] {
-        &self.moduli
+        self.basis.moduli()
     }
 
     pub fn residues(&self) -> &[Polynomial] {
@@ -114,7 +120,7 @@ impl RnsPolynomial {
 
     /// Product of all RNS moduli.
     pub fn composite_modulus(&self) -> u128 {
-        self.moduli.iter().fold(1_u128, |product, modulus| {
+        self.moduli().iter().fold(1_u128, |product, modulus| {
             product
                 .checked_mul(u128::from(modulus.value()))
                 .expect("RNS composite modulus exceeds u128")
@@ -158,7 +164,7 @@ impl RnsPolynomial {
             .map(|coefficient_index| {
                 let mut reconstructed = 0_u128;
 
-                for (limb_index, modulus) in self.moduli.iter().copied().enumerate() {
+                for (limb_index, modulus) in self.moduli().iter().copied().enumerate() {
                     let qi = u128::from(modulus.value());
                     let partial = composite / qi;
 
@@ -183,37 +189,10 @@ impl RnsPolynomial {
         assert_eq!(self.degree, rhs.degree, "RNS polynomial degrees must match");
 
         assert_eq!(
-            self.moduli, rhs.moduli,
+            self.basis, rhs.basis,
             "RNS polynomial modulus bases must match"
         );
     }
-}
-
-fn validate_moduli(moduli: &[Modulus]) {
-    assert!(
-        !moduli.is_empty(),
-        "RNS basis must contain at least one modulus"
-    );
-
-    for (index, lhs) in moduli.iter().enumerate() {
-        for rhs in &moduli[index + 1..] {
-            assert_eq!(
-                gcd(lhs.value(), rhs.value()),
-                1,
-                "RNS moduli must be pairwise coprime"
-            );
-        }
-    }
-}
-
-fn gcd(mut lhs: u64, mut rhs: u64) -> u64 {
-    while rhs != 0 {
-        let remainder = lhs % rhs;
-        lhs = rhs;
-        rhs = remainder;
-    }
-
-    lhs
 }
 
 #[cfg(test)]

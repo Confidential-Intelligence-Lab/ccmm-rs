@@ -18,3 +18,6 @@ pub use rns::RnsPolynomial;
 
 pub mod rns_ntt;
 pub use rns_ntt::{RnsNttPlan, RnsNttPolynomial};
+
+pub mod modulus_basis;
+pub use modulus_basis::ModulusBasis;
