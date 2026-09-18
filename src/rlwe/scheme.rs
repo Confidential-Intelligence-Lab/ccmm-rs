@@ -101,6 +101,58 @@ where
     RlweCiphertext::new(b, a)
 }
 
+/// Encrypts an already encoded polynomial.
+///
+/// This is the raw RLWE primitive used by higher-level encodings such as
+/// CKKS. It does not apply the coefficient-message encoding from
+/// `RlwePlaintext`.
+///
+/// Encryption computes:
+///
+/// `b = m + e - a*s`.
+pub fn encrypt_raw_with_rng<R>(
+    params: RlweParameters,
+    secret_key: &SecretKey,
+    message: &Polynomial,
+    rng: &mut R,
+) -> RlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        message.modulus(),
+        params.modulus(),
+        "raw plaintext modulus must match RLWE parameters"
+    );
+
+    assert_eq!(
+        message.degree(),
+        params.degree(),
+        "raw plaintext degree must match RLWE parameters"
+    );
+
+    assert_eq!(
+        secret_key.polynomial().modulus(),
+        params.modulus(),
+        "secret key modulus must match RLWE parameters"
+    );
+
+    assert_eq!(
+        secret_key.polynomial().degree(),
+        params.degree(),
+        "secret key degree must match RLWE parameters"
+    );
+
+    let a = sample_uniform(params, rng);
+    let error = sample_error(params, rng);
+
+    let a_times_s = a.negacyclic_mul(secret_key.polynomial());
+
+    let b = message.add(&error).sub(&a_times_s);
+
+    RlweCiphertext::new(b, a)
+}
+
 /// Returns the noisy encoded plaintext polynomial:
 ///
 /// `b + a*s = m + e`.

@@ -42,6 +42,10 @@ impl SecretKey {
         }
     }
 
+    pub(crate) fn from_polynomial(polynomial: Polynomial) -> Self {
+        Self { polynomial }
+    }
+
     pub fn polynomial(&self) -> &Polynomial {
         &self.polynomial
     }
