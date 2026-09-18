@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/ccmm_rs-927a1cd8e9e01170)
+
+running 1 test
+R3_1B_BASE_LOG=4 BASE=16 DIGITS=27 MAX_DIGIT=8 BOUND=8
+R3_1B_BASE_LOG=8 BASE=256 DIGITS=14 MAX_DIGIT=128 BOUND=128
+R3_1B_BASE_LOG=12 BASE=4096 DIGITS=9 MAX_DIGIT=2048 BOUND=2048
+R3_1B_BASE_LOG=16 BASE=65536 DIGITS=7 MAX_DIGIT=32766 BOUND=32768
+R3_1B_BASE_LOG=20 BASE=1048576 DIGITS=6 MAX_DIGIT=524244 BOUND=524288
+test grafting::bounded_gadget::tests::realistic_4096_decomposition_reconstructs_exactly ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 519 filtered out; finished in 0.23s
+

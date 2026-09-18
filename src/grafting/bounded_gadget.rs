@@ -300,6 +300,49 @@ mod tests {
     }
 
     #[test]
+    fn realistic_4096_decomposition_reconstructs_exactly() {
+        use crate::ckks::research_profile_4096;
+
+        let profile = research_profile_4096();
+        let basis = profile.modulus_chain().top().clone();
+        let q = basis.composite_modulus();
+
+        let coefficients: Vec<u128> = (0..profile.degree())
+            .map(|index| {
+                let index = index as u128;
+                (index * index * 1_000_003 + index * 97 + q / 3) % q
+            })
+            .collect();
+
+        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        for base_log in [4_u32, 8, 12, 16, 20] {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+            let decomposition = layout.decompose(&polynomial);
+
+            assert_eq!(
+                decomposition.reconstruct_coefficients(),
+                coefficients,
+                "N=4096 bounded decomposition mismatch for base_log={base_log}"
+            );
+
+            assert!(
+                decomposition.maximum_observed_digit_magnitude()
+                    <= layout.maximum_digit_magnitude(),
+                "N=4096 digit bound violated for base_log={base_log}"
+            );
+
+            println!(
+                "R3_1B_BASE_LOG={base_log} BASE={} DIGITS={} MAX_DIGIT={} BOUND={}",
+                layout.base(),
+                layout.digit_count(),
+                decomposition.maximum_observed_digit_magnitude(),
+                layout.maximum_digit_magnitude(),
+            );
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "base_log must be in 1..=63")]
     fn rejects_zero_base_log() {
         let _ = BoundedGadgetLayout::new(basis(), 0);
