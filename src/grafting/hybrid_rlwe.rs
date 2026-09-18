@@ -182,6 +182,78 @@ pub fn reconstruct_hybrid_plaintext(
     Pow2RnsPolynomial::from_parts(ordinary.clone(), sprout.clone())
 }
 
+/// Raw RLWE encryption over a power-of-two sprout with bounded
+/// coefficient error.
+///
+/// Encryption follows
+///
+/// ```text
+/// b = m + e - a*s
+/// ```
+///
+/// where every error coefficient lies in
+/// `[-noise_bound, noise_bound]`.
+pub fn encrypt_pow2_raw_with_noise_rng<R>(
+    secret: &Pow2Polynomial,
+    message: &Pow2Polynomial,
+    noise_bound: i64,
+    rng: &mut R,
+) -> Pow2RlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    use rand::Rng;
+
+    assert!(
+        noise_bound >= 0,
+        "power-of-two RLWE noise bound must be nonnegative"
+    );
+
+    assert_eq!(
+        secret.bits(),
+        message.bits(),
+        "power-of-two secret/message moduli must match"
+    );
+
+    assert_eq!(
+        secret.degree(),
+        message.degree(),
+        "power-of-two secret/message degrees must match"
+    );
+
+    let bits = secret.bits();
+    let modulus = 1_u64 << bits;
+    let mask = modulus - 1;
+
+    let a = Pow2Polynomial::new(
+        bits,
+        (0..secret.degree())
+            .map(|_| rng.next_u64() & mask)
+            .collect(),
+    );
+
+    let error = Pow2Polynomial::new(
+        bits,
+        (0..secret.degree())
+            .map(|_| {
+                let value = rng.gen_range(-noise_bound..=noise_bound);
+
+                if value >= 0 {
+                    value as u64
+                } else {
+                    modulus - value.unsigned_abs()
+                }
+            })
+            .collect(),
+    );
+
+    let a_times_s = a.negacyclic_mul(secret);
+
+    let b = message.add(&error).sub(&a_times_s);
+
+    Pow2RlweCiphertext::new(b, a)
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;

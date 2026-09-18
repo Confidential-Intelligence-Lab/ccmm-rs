@@ -4,8 +4,9 @@ use crate::ring::{Polynomial, RnsPolynomial};
 use crate::rlwe::{encrypt_raw_with_rng, RlweCiphertext, RlweParameters, SecretKey};
 
 use super::{
-    decrypt_pow2_raw, encrypt_pow2_raw_with_rng, project_ternary_secret_pow2, HybridRlweCiphertext,
-    MixedGadgetLayout, Pow2Polynomial, Pow2RlweCiphertext, Pow2RnsPolynomial, RnsRlweCiphertext,
+    decrypt_pow2_raw, encrypt_pow2_raw_with_noise_rng, project_ternary_secret_pow2,
+    HybridRlweCiphertext, MixedGadgetLayout, Pow2Polynomial, Pow2RlweCiphertext, Pow2RnsPolynomial,
+    RnsRlweCiphertext,
 };
 
 /// Evaluation-key entry for one mixed gadget block.
@@ -37,6 +38,7 @@ impl HybridMultiplicationKey {
     pub fn generate_with_rng<R>(
         degree: usize,
         plaintext_modulus: u64,
+        noise_bound: i64,
         secret_coefficients: &[i8],
         layout: MixedGadgetLayout,
         rng: &mut R,
@@ -69,27 +71,29 @@ impl HybridMultiplicationKey {
         for block_index in 0..ordinary_block_count {
             let idempotent = layout.ordinary_idempotent(block_index);
 
-            entries.push(generate_entry(
+            let context = HybridEntryContext {
                 degree,
                 plaintext_modulus,
+                noise_bound,
                 secret_coefficients,
-                &ordinary_basis,
+                ordinary_basis: &ordinary_basis,
                 sprout_bits,
-                idempotent,
-                rng,
-            ));
+            };
+
+            entries.push(generate_entry(&context, idempotent, rng));
         }
 
         // Terminal power-of-two sprout block.
-        entries.push(generate_entry(
+        let context = HybridEntryContext {
             degree,
             plaintext_modulus,
+            noise_bound,
             secret_coefficients,
-            &ordinary_basis,
+            ordinary_basis: &ordinary_basis,
             sprout_bits,
-            layout.sprout_idempotent(),
-            rng,
-        ));
+        };
+
+        entries.push(generate_entry(&context, layout.sprout_idempotent(), rng));
 
         Self { layout, entries }
     }
@@ -364,26 +368,37 @@ pub fn decrypt_hybrid_quadratic_raw(
     Pow2RnsPolynomial::from_parts(ordinary, sprout)
 }
 
-fn generate_entry<R>(
+struct HybridEntryContext<'a> {
     degree: usize,
     plaintext_modulus: u64,
-    secret_coefficients: &[i8],
-    ordinary_basis: &crate::ring::ModulusBasis,
+    noise_bound: i64,
+    secret_coefficients: &'a [i8],
+    ordinary_basis: &'a crate::ring::ModulusBasis,
     sprout_bits: u32,
+}
+
+fn generate_entry<R>(
+    context: &HybridEntryContext<'_>,
     idempotent: u128,
     rng: &mut R,
 ) -> HybridEvaluationKeyEntry
 where
     R: RngCore + CryptoRng,
 {
-    let ordinary_limbs = ordinary_basis
+    let ordinary_limbs = context
+        .ordinary_basis
         .moduli()
         .iter()
         .copied()
         .map(|modulus| {
-            let params = RlweParameters::new(degree, modulus, plaintext_modulus, 0);
+            let params = RlweParameters::new(
+                context.degree,
+                modulus,
+                context.plaintext_modulus,
+                context.noise_bound,
+            );
 
-            let secret = project_secret_odd(modulus, secret_coefficients);
+            let secret = project_secret_odd(modulus, context.secret_coefficients);
 
             let s_squared = secret.polynomial().negacyclic_mul(secret.polynomial());
 
@@ -397,14 +412,15 @@ where
 
     let ordinary = RnsRlweCiphertext::from_limbs(ordinary_limbs);
 
-    let sprout_secret = project_ternary_secret_pow2(sprout_bits, secret_coefficients);
+    let sprout_secret =
+        project_ternary_secret_pow2(context.sprout_bits, context.secret_coefficients);
 
     let sprout_squared = sprout_secret.negacyclic_mul(&sprout_secret);
 
-    let factor = (idempotent % (1_u128 << sprout_bits)) as u64;
+    let factor = (idempotent % (1_u128 << context.sprout_bits)) as u64;
 
     let sprout_target = Pow2Polynomial::new(
-        sprout_bits,
+        context.sprout_bits,
         sprout_squared
             .coefficients()
             .iter()
@@ -412,7 +428,8 @@ where
             .collect(),
     );
 
-    let sprout = encrypt_pow2_raw_with_rng(&sprout_secret, &sprout_target, rng);
+    let sprout =
+        encrypt_pow2_raw_with_noise_rng(&sprout_secret, &sprout_target, context.noise_bound, rng);
 
     HybridEvaluationKeyEntry { ordinary, sprout }
 }
@@ -476,8 +493,14 @@ mod tests {
 
         let mut rng = ChaCha20Rng::seed_from_u64(1);
 
-        let key =
-            HybridMultiplicationKey::generate_with_rng(8, 16, &ternary(), layout.clone(), &mut rng);
+        let key = HybridMultiplicationKey::generate_with_rng(
+            8,
+            16,
+            0,
+            &ternary(),
+            layout.clone(),
+            &mut rng,
+        );
 
         assert_eq!(key.entries().len(), layout.block_count());
     }
@@ -490,7 +513,8 @@ mod tests {
 
         let mut rng = ChaCha20Rng::seed_from_u64(2);
 
-        let key = HybridMultiplicationKey::generate_with_rng(8, 16, &ternary(), layout, &mut rng);
+        let key =
+            HybridMultiplicationKey::generate_with_rng(8, 16, 0, &ternary(), layout, &mut rng);
 
         let linear = hybrid_relinearize(&product, &key);
 
@@ -514,6 +538,7 @@ mod tests {
                     let key = HybridMultiplicationKey::generate_with_rng(
                         8,
                         16,
+                        0,
                         &ternary(),
                         layout,
                         &mut rng,
@@ -529,5 +554,183 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hybrid_relinearization_noise_matches_evaluation_key_noise_exactly() {
+        let bits = 12;
+        let noise_bound = 1_i64;
+
+        let layout = MixedGadgetLayout::new(basis(), vec![1, 2], bits);
+
+        let product = quadratic(bits);
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5151);
+
+        let key = HybridMultiplicationKey::generate_with_rng(
+            8,
+            16,
+            noise_bound,
+            &ternary(),
+            layout,
+            &mut rng,
+        );
+
+        let actual = decrypt_hybrid_raw(&hybrid_relinearize(&product, &key), &ternary());
+
+        let quadratic_raw = decrypt_hybrid_quadratic_raw(&product, &ternary());
+
+        let decomposition = key.layout().decompose(product.c2());
+
+        let ordinary_block_count = key.layout().ordinary_layout().block_count();
+
+        /*
+         * Odd-prime limbs.
+         *
+         * For every evaluation-key entry j:
+         *
+         *   Dec(EK_j) = E_j s^2 + e_j
+         *
+         * therefore:
+         *
+         *   Dec(Rel(ct^2))
+         *     = Dec_quad(ct^2)
+         *       + sum_j d_j e_j.
+         */
+        for limb_index in 0..key.layout().ordinary_basis().len() {
+            let modulus = key.layout().ordinary_basis().modulus(limb_index);
+
+            let secret = project_secret_odd(modulus, &ternary());
+
+            let s_squared = secret.polynomial().negacyclic_mul(secret.polynomial());
+
+            let mut expected = quadratic_raw.ordinary().residue(limb_index).clone();
+
+            for block_index in 0..ordinary_block_count {
+                let digit = Polynomial::new(
+                    modulus,
+                    decomposition
+                        .ordinary_digit(block_index)
+                        .iter()
+                        .map(|&value| (value % u128::from(modulus.value())) as u64)
+                        .collect(),
+                );
+
+                let evaluation_key = key.entry(block_index).ordinary().limb(limb_index);
+
+                let decrypted_key = evaluation_key
+                    .b()
+                    .add(&evaluation_key.a().negacyclic_mul(secret.polynomial()));
+
+                let factor = (key.layout().ordinary_idempotent(block_index)
+                    % u128::from(modulus.value())) as u64;
+
+                let target = s_squared.scalar_mul(factor);
+
+                let evaluation_noise = decrypted_key.sub(&target);
+
+                expected = expected.add(&digit.negacyclic_mul(&evaluation_noise));
+            }
+
+            // Terminal power-of-two gadget block also
+            // has an ordinary-modulus evaluation-key limb.
+            let sprout_digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .sprout_digit()
+                    .iter()
+                    .map(|&value| value % modulus.value())
+                    .collect(),
+            );
+
+            let evaluation_key = key.entry(ordinary_block_count).ordinary().limb(limb_index);
+
+            let decrypted_key = evaluation_key
+                .b()
+                .add(&evaluation_key.a().negacyclic_mul(secret.polynomial()));
+
+            let factor = (key.layout().sprout_idempotent() % u128::from(modulus.value())) as u64;
+
+            let target = s_squared.scalar_mul(factor);
+
+            let evaluation_noise = decrypted_key.sub(&target);
+
+            expected = expected.add(&sprout_digit.negacyclic_mul(&evaluation_noise));
+
+            assert_eq!(
+                actual.ordinary().residue(limb_index,),
+                &expected,
+                "ordinary hybrid relinearization noise \
+                 does not match evaluation-key noise \
+                 for limb {limb_index}"
+            );
+        }
+
+        /*
+         * Power-of-two sprout limb.
+         */
+        let sprout_secret = project_ternary_secret_pow2(bits, &ternary());
+
+        let sprout_squared = sprout_secret.negacyclic_mul(&sprout_secret);
+
+        let mut expected = quadratic_raw.sprout().clone();
+
+        for block_index in 0..ordinary_block_count {
+            let digit = Pow2Polynomial::new(
+                bits,
+                decomposition
+                    .ordinary_digit(block_index)
+                    .iter()
+                    .map(|&value| (value % (1_u128 << bits)) as u64)
+                    .collect(),
+            );
+
+            let evaluation_key = key.entry(block_index).sprout();
+
+            let decrypted_key = decrypt_pow2_raw(&sprout_secret, evaluation_key);
+
+            let factor = (key.layout().ordinary_idempotent(block_index) % (1_u128 << bits)) as u64;
+
+            let target = Pow2Polynomial::new(
+                bits,
+                sprout_squared
+                    .coefficients()
+                    .iter()
+                    .map(|&value| value.wrapping_mul(factor))
+                    .collect(),
+            );
+
+            let evaluation_noise = decrypted_key.sub(&target);
+
+            expected = expected.add(&digit.negacyclic_mul(&evaluation_noise));
+        }
+
+        let digit = Pow2Polynomial::new(bits, decomposition.sprout_digit().to_vec());
+
+        let evaluation_key = key.entry(ordinary_block_count).sprout();
+
+        let decrypted_key = decrypt_pow2_raw(&sprout_secret, evaluation_key);
+
+        let factor = (key.layout().sprout_idempotent() % (1_u128 << bits)) as u64;
+
+        let target = Pow2Polynomial::new(
+            bits,
+            sprout_squared
+                .coefficients()
+                .iter()
+                .map(|&value| value.wrapping_mul(factor))
+                .collect(),
+        );
+
+        let evaluation_noise = decrypted_key.sub(&target);
+
+        expected = expected.add(&digit.negacyclic_mul(&evaluation_noise));
+
+        assert_eq!(
+            actual.sprout(),
+            &expected,
+            "power-of-two hybrid relinearization noise \
+             does not match evaluation-key noise"
+        );
     }
 }

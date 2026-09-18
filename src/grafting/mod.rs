@@ -6,8 +6,9 @@ pub mod hybrid_key_switch;
 pub use mixed_gadget::{MixedGadgetDecomposition, MixedGadgetLayout};
 pub mod mixed_gadget;
 pub use hybrid_rlwe::{
-    decrypt_pow2_raw, encrypt_pow2_raw_with_rng, project_ternary_secret_pow2,
-    reconstruct_hybrid_plaintext, HybridRlweCiphertext, Pow2RlweCiphertext,
+    decrypt_pow2_raw, encrypt_pow2_raw_with_noise_rng, encrypt_pow2_raw_with_rng,
+    project_ternary_secret_pow2, reconstruct_hybrid_plaintext, HybridRlweCiphertext,
+    Pow2RlweCiphertext,
 };
 pub mod hybrid_rlwe;
 pub use pow2_transition_apply::{
@@ -258,3 +259,6 @@ mod tests {
         let _ = Sprout::new(vec![Modulus::new(15), Modulus::new(21)]);
     }
 }
+
+#[cfg(test)]
+mod differential;
