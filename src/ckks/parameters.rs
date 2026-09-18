@@ -14,6 +14,28 @@ pub enum CkksParameterClass {
     Research,
 }
 
+/// Secret-key distribution assumed by a security analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CkksSecretDistribution {
+    UniformTernary,
+}
+
+/// Error distribution assumed by a security analysis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CkksErrorDistribution {
+    DiscreteGaussian { sigma: f64 },
+}
+
+/// Reproducible security-analysis assumptions for a CKKS profile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CkksSecurityModel {
+    pub classical_security_bits: u32,
+    pub secret_distribution: CkksSecretDistribution,
+    pub error_distribution: CkksErrorDistribution,
+    pub estimator: &'static str,
+    pub reduction_cost_model: &'static str,
+}
+
 /// Coherent CKKS ring, modulus-chain, and scale configuration.
 ///
 /// Security-bearing status is explicit rather than inferred from the ring
@@ -26,7 +48,7 @@ pub struct CkksParameterProfile {
     modulus_values: &'static [u64],
     initial_scale: f64,
     class: CkksParameterClass,
-    security_bearing: bool,
+    security_model: Option<CkksSecurityModel>,
 }
 
 impl CkksParameterProfile {
@@ -36,7 +58,7 @@ impl CkksParameterProfile {
         modulus_values: &'static [u64],
         initial_scale: f64,
         class: CkksParameterClass,
-        security_bearing: bool,
+        security_model: Option<CkksSecurityModel>,
     ) -> Self {
         let profile = Self {
             name,
@@ -44,7 +66,7 @@ impl CkksParameterProfile {
             modulus_values,
             initial_scale,
             class,
-            security_bearing,
+            security_model,
         };
         profile.validate();
         profile
@@ -75,7 +97,11 @@ impl CkksParameterProfile {
     }
 
     pub fn security_bearing(&self) -> bool {
-        self.security_bearing
+        self.security_model.is_some()
+    }
+
+    pub fn security_model(&self) -> Option<CkksSecurityModel> {
+        self.security_model
     }
 
     pub fn modulus_basis(&self) -> ModulusBasis {
@@ -150,10 +176,31 @@ impl CkksParameterProfile {
         // the negacyclic NTT required by the implementation.
         let _ = self.rns_ntt_plan();
 
-        assert!(
-            !self.security_bearing,
-            "security-bearing CKKS profiles require R2.9b security validation"
-        );
+        if let Some(model) = self.security_model {
+            assert!(
+                model.classical_security_bits > 0,
+                "CKKS security target must be positive"
+            );
+
+            match model.error_distribution {
+                CkksErrorDistribution::DiscreteGaussian { sigma } => {
+                    assert!(
+                        sigma.is_finite() && sigma > 0.0,
+                        "CKKS security-model Gaussian sigma must be positive and finite"
+                    );
+                }
+            }
+
+            assert!(
+                !model.estimator.is_empty(),
+                "CKKS security estimator must be nonempty"
+            );
+
+            assert!(
+                !model.reduction_cost_model.is_empty(),
+                "CKKS reduction-cost model must be nonempty"
+            );
+        }
     }
 }
 
@@ -166,65 +213,75 @@ pub fn correctness_profile_8() -> CkksParameterProfile {
         &[12_289, 40_961, 65_537],
         65_537.0,
         CkksParameterClass::CorrectnessOriented,
-        false,
+        None,
     )
 }
 
-/// Large-N research profile derived from the Microsoft SEAL tc128
-/// coefficient-modulus table for polynomial degree 4096.
+/// Large-N research profile for polynomial degree 4096.
 ///
-/// This profile is intentionally not marked security-bearing. R2.9b
-/// performs the independent RLWE security analysis.
+/// The 35-bit NTT primes are selected to satisfy `2N | q - 1`,
+/// keep the aggregate modulus budget within the published 128-bit
+/// classical-security guideline for uniform-ternary secrets with
+/// Gaussian error sigma 3.19, and remain coherent with the CKKS scale.
+///
+/// The profile remains non-security-bearing until the implementation
+/// provides the corresponding security-bearing error sampler.
 pub fn research_profile_4096() -> CkksParameterProfile {
     CkksParameterProfile::new(
         "research-4096",
         4096,
-        &[0x0ffffee001, 0x0ffffc4001, 0x1ffffe0001],
-        2.0_f64.powi(30),
+        &[0x7ffff6001, 0x7fffba001, 0x7fffb0001],
+        2.0_f64.powi(35),
         CkksParameterClass::Research,
-        false,
+        None,
     )
 }
 
-/// Large-N research profile derived from the Microsoft SEAL tc128
-/// coefficient-modulus table for polynomial degree 8192.
+/// Large-N research profile for polynomial degree 8192.
+///
+/// The five 40-bit NTT primes preserve scale across ordinary CKKS
+/// multiply-rescale steps while keeping the aggregate modulus budget
+/// below the published 128-bit classical-security guideline.
 pub fn research_profile_8192() -> CkksParameterProfile {
     CkksParameterProfile::new(
         "research-8192",
         8192,
         &[
-            0x07fffffd8001,
-            0x07fffffc8001,
-            0x0fffffffc001,
-            0x0ffffff6c001,
-            0x0fffffebc001,
+            0xfffffdc001,
+            0xfffff4c001,
+            0xfffff3c001,
+            0xffffe80001,
+            0xffffe74001,
         ],
         2.0_f64.powi(40),
         CkksParameterClass::Research,
-        false,
+        None,
     )
 }
 
-/// Large-N research profile derived from the Microsoft SEAL tc128
-/// coefficient-modulus table for polynomial degree 16384.
+/// Large-N research profile for polynomial degree 16384.
+///
+/// The nine 45-bit NTT primes preserve scale across ordinary CKKS
+/// multiply-rescale steps while keeping the aggregate modulus budget
+/// below the published 128-bit classical-security guideline.
 pub fn research_profile_16384() -> CkksParameterProfile {
     CkksParameterProfile::new(
         "research-16384",
         16384,
         &[
-            0x0fffffffd8001,
-            0x0fffffffa0001,
-            0x0fffffff00001,
-            0x1fffffff68001,
-            0x1fffffff50001,
-            0x1ffffffee8001,
-            0x1ffffffea0001,
-            0x1ffffffe88001,
-            0x1ffffffe48001,
+            0x1ffffff18001,
+            0x1fffffee8001,
+            0x1fffffe58001,
+            0x1fffffe28001,
+            0x1fffffde8001,
+            0x1fffffcf0001,
+            0x1fffffc68001,
+            0x1fffffc20001,
+            0x1fffffbf0001,
         ],
         2.0_f64.powi(45),
         CkksParameterClass::Research,
-        false,
+        None,
     )
 }
 
@@ -307,6 +364,43 @@ mod tests {
             .sum::<u32>();
 
         assert_eq!(profile.total_modulus_bits(), expected);
+    }
+
+    #[test]
+    fn research_profiles_are_not_security_bearing_before_end_to_end_validation() {
+        for profile in [
+            research_profile_4096(),
+            research_profile_8192(),
+            research_profile_16384(),
+        ] {
+            assert!(!profile.security_bearing());
+            assert_eq!(profile.security_model(), None);
+        }
+    }
+
+    #[test]
+    fn research_4096_uses_scale_coherent_with_first_rescale() {
+        let profile = research_profile_4096();
+
+        assert_eq!(profile.initial_scale(), 2.0_f64.powi(35));
+    }
+
+    #[test]
+    fn research_profile_modulus_budgets_are_exact() {
+        let cases = [
+            (research_profile_4096(), 105_u32),
+            (research_profile_8192(), 200_u32),
+            (research_profile_16384(), 405_u32),
+        ];
+
+        for (profile, expected_bits) in cases {
+            assert_eq!(
+                profile.total_modulus_bits(),
+                expected_bits,
+                "unexpected modulus budget for {}",
+                profile.name()
+            );
+        }
     }
 
     #[test]
@@ -439,7 +533,7 @@ mod tests {
             &[12_289],
             64.0,
             CkksParameterClass::Research,
-            false,
+            None,
         );
     }
 
@@ -447,7 +541,7 @@ mod tests {
     #[should_panic(expected = "at least one modulus")]
     fn rejects_empty_modulus_chain() {
         let _ =
-            CkksParameterProfile::new("empty", 8, &[], 64.0, CkksParameterClass::Research, false);
+            CkksParameterProfile::new("empty", 8, &[], 64.0, CkksParameterClass::Research, None);
     }
 
     #[test]
@@ -459,7 +553,7 @@ mod tests {
             &[12_289, 12_289],
             64.0,
             CkksParameterClass::Research,
-            false,
+            None,
         );
     }
 
@@ -472,7 +566,7 @@ mod tests {
             &[101],
             64.0,
             CkksParameterClass::Research,
-            false,
+            None,
         );
     }
 
@@ -485,20 +579,26 @@ mod tests {
             &[12_289],
             0.0,
             CkksParameterClass::Research,
-            false,
+            None,
         );
     }
 
     #[test]
-    #[should_panic(expected = "R2.9b security validation")]
-    fn refuses_unvalidated_security_claim() {
+    #[should_panic(expected = "CKKS security target must be positive")]
+    fn rejects_invalid_security_model() {
         let _ = CkksParameterProfile::new(
-            "premature-security-claim",
-            8,
-            &[12_289],
-            64.0,
+            "invalid-security-model",
+            4096,
+            &[0x0ffffee001, 0x0ffffc4001, 0x1ffffe0001],
+            2.0_f64.powi(37),
             CkksParameterClass::Research,
-            true,
+            Some(CkksSecurityModel {
+                classical_security_bits: 0,
+                secret_distribution: CkksSecretDistribution::UniformTernary,
+                error_distribution: CkksErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                estimator: "Lattice Estimator",
+                reduction_cost_model: "RC.MATZOV",
+            }),
         );
     }
 }

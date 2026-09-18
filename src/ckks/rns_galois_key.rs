@@ -1,6 +1,7 @@
 use rand::{CryptoRng, RngCore};
 
 use crate::grafting::{RnsGadgetLayout, RnsKeySwitchKey, RnsRlweCiphertext};
+use crate::rlwe::ErrorDistribution;
 
 use super::{apply_automorphism, apply_rns_automorphism};
 
@@ -96,6 +97,154 @@ impl RnsGaloisKey {
             &transformed_secret,
             secret_coefficients,
             layout,
+            rng,
+        );
+
+        Self {
+            exponent,
+            key_switch_key,
+        }
+    }
+
+    pub fn generate_with_ntt_rng<R>(
+        config: crate::grafting::RnsKeygenConfig<'_>,
+        secret_coefficients: &[i8],
+        exponent: usize,
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            secret_coefficients.len(),
+            config.degree,
+            "secret coefficient count must match RLWE degree"
+        );
+        assert!(
+            secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS Galois secret coefficients must be ternary"
+        );
+
+        let two_n = 2 * config.degree;
+        let exponent = exponent % two_n;
+
+        assert!(
+            exponent % 2 == 1,
+            "CKKS Galois exponent must be odd modulo 2N"
+        );
+
+        let modulus = crate::ring::Modulus::new(3);
+
+        let polynomial = crate::ring::Polynomial::new(
+            modulus,
+            secret_coefficients
+                .iter()
+                .map(|&value| match value {
+                    -1 => modulus.value() - 1,
+                    0 => 0,
+                    1 => 1,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        );
+
+        let transformed = apply_automorphism(&polynomial, exponent);
+
+        let transformed_secret: Vec<i8> = transformed
+            .coefficients()
+            .iter()
+            .map(|&value| match value {
+                0 => 0,
+                1 => 1,
+                value if value == modulus.value() - 1 => -1,
+                _ => panic!("automorphism of ternary secret must remain ternary"),
+            })
+            .collect();
+
+        let key_switch_key = RnsKeySwitchKey::generate_with_ntt_rng(
+            config,
+            &transformed_secret,
+            secret_coefficients,
+            rng,
+        );
+
+        Self {
+            exponent,
+            key_switch_key,
+        }
+    }
+
+    /// Generates an NTT-backed RNS Galois key with an explicit
+    /// logical error distribution.
+    pub fn generate_with_distribution_ntt_rng<R>(
+        config: crate::grafting::RnsKeygenConfig<'_>,
+        secret_coefficients: &[i8],
+        exponent: usize,
+        distribution: ErrorDistribution,
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            secret_coefficients.len(),
+            config.degree,
+            "secret coefficient count must match RLWE degree"
+        );
+        assert!(
+            secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS Galois secret coefficients must be ternary"
+        );
+        assert!(
+            secret_coefficients.iter().any(|&value| value != 0),
+            "RNS Galois secret must be nonzero"
+        );
+
+        let two_n = 2 * config.degree;
+        let exponent = exponent % two_n;
+
+        assert!(
+            exponent % 2 == 1,
+            "CKKS Galois exponent must be odd modulo 2N"
+        );
+
+        let modulus = crate::ring::Modulus::new(3);
+
+        let polynomial = crate::ring::Polynomial::new(
+            modulus,
+            secret_coefficients
+                .iter()
+                .map(|&value| match value {
+                    -1 => modulus.value() - 1,
+                    0 => 0,
+                    1 => 1,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        );
+
+        let transformed = apply_automorphism(&polynomial, exponent);
+
+        let transformed_secret: Vec<i8> = transformed
+            .coefficients()
+            .iter()
+            .map(|&value| match value {
+                0 => 0,
+                1 => 1,
+                value if value == modulus.value() - 1 => -1,
+                _ => panic!("automorphism of ternary secret must remain ternary"),
+            })
+            .collect();
+
+        let key_switch_key = RnsKeySwitchKey::generate_with_distribution_ntt_rng(
+            config,
+            &transformed_secret,
+            secret_coefficients,
+            distribution,
             rng,
         );
 
@@ -285,6 +434,95 @@ mod tests {
             .collect();
 
         RnsRlweCiphertext::from_limbs(limbs)
+    }
+
+    #[test]
+    fn gaussian_rns_galois_key_is_seed_reproducible() {
+        let degree = 8;
+        let basis = basis();
+        let plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let lhs_layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+        let rhs_layout = RnsGadgetLayout::new(basis, vec![1, 2]);
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_3001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_3001);
+
+        let lhs = RnsGaloisKey::generate_with_distribution_ntt_rng(
+            crate::grafting::RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: lhs_layout,
+                plan: &plan,
+            },
+            &secret,
+            3,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut lhs_rng,
+        );
+
+        let rhs = RnsGaloisKey::generate_with_distribution_ntt_rng(
+            crate::grafting::RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: rhs_layout,
+                plan: &plan,
+            },
+            &secret,
+            3,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut rhs_rng,
+        );
+
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn ntt_rns_galois_key_generation_matches_reference_exactly() {
+        let basis = basis();
+        let secret = secret();
+        let degree = secret.len();
+        let exponent = 5;
+
+        let plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        for seed in 0_u64..32 {
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xB0A0);
+
+            let reference = RnsGaloisKey::generate_with_rng(
+                degree,
+                2,
+                1,
+                &secret,
+                exponent,
+                RnsGadgetLayout::new(basis.clone(), vec![1, 2]),
+                &mut reference_rng,
+            );
+
+            let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xB0A0);
+
+            let optimized = RnsGaloisKey::generate_with_ntt_rng(
+                crate::grafting::RnsKeygenConfig {
+                    degree,
+                    plaintext_modulus: 2,
+                    noise_bound: 1,
+                    layout: RnsGadgetLayout::new(basis.clone(), vec![1, 2]),
+                    plan: &plan,
+                },
+                &secret,
+                exponent,
+                &mut optimized_rng,
+            );
+
+            assert_eq!(
+                optimized, reference,
+                "NTT Galois-key generation diverged for seed {seed}"
+            );
+        }
     }
 
     #[test]

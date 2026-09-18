@@ -25,8 +25,11 @@ pub mod pow2_transition;
 pub use prime_resurrection::PrimeSproutKeySwitchPlan;
 pub mod prime_resurrection;
 pub use rns_key_switch::{
-    decrypt_rns_quadratic_raw, decrypt_rns_raw, rns_relinearize, ternary_secret_coefficients,
-    RnsKeySwitchKey, RnsMultiplicationKey, RnsQuadraticCiphertext, RnsRlweCiphertext,
+    decrypt_rns_quadratic_raw, decrypt_rns_raw, decrypt_rns_raw_with_ntt,
+    encrypt_rns_raw_with_distribution_ntt_rng, encrypt_rns_raw_with_ntt_rng,
+    rns_key_switch_with_ntt, rns_relinearize, rns_relinearize_with_ntt, rns_tensor_with_ntt,
+    ternary_secret_coefficients, RnsKeySwitchKey, RnsKeygenConfig, RnsMultiplicationKey,
+    RnsQuadraticCiphertext, RnsRlweCiphertext,
 };
 pub mod rns_key_switch;
 pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};

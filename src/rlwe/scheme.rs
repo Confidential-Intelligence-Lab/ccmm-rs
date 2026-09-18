@@ -1,7 +1,7 @@
 use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng, RngCore};
 
-use crate::ring::Polynomial;
+use crate::ring::{NttPlan, Polynomial};
 
 use super::{RlweCiphertext, RlweParameters, RlwePlaintext, SecretKey};
 
@@ -153,6 +153,61 @@ where
     RlweCiphertext::new(b, a)
 }
 
+/// NTT-backed raw RLWE encryption.
+///
+/// This is semantically identical to `encrypt_raw_with_rng`, but computes
+/// the `a*s` product through the supplied negacyclic NTT plan.
+pub fn encrypt_raw_with_ntt_rng<R>(
+    params: RlweParameters,
+    secret_key: &SecretKey,
+    message: &Polynomial,
+    plan: &NttPlan,
+    rng: &mut R,
+) -> RlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        plan.modulus(),
+        params.modulus(),
+        "NTT plan modulus must match RLWE parameters"
+    );
+    assert_eq!(
+        plan.degree(),
+        params.degree(),
+        "NTT plan degree must match RLWE parameters"
+    );
+    assert_eq!(
+        message.modulus(),
+        params.modulus(),
+        "raw plaintext modulus must match RLWE parameters"
+    );
+    assert_eq!(
+        message.degree(),
+        params.degree(),
+        "raw plaintext degree must match RLWE parameters"
+    );
+    assert_eq!(
+        secret_key.polynomial().modulus(),
+        params.modulus(),
+        "secret key modulus must match RLWE parameters"
+    );
+    assert_eq!(
+        secret_key.polynomial().degree(),
+        params.degree(),
+        "secret key degree must match RLWE parameters"
+    );
+
+    let a = sample_uniform(params, rng);
+    let error = sample_error(params, rng);
+
+    let a_times_s = plan.negacyclic_mul(&a, secret_key.polynomial());
+
+    let b = message.add(&error).sub(&a_times_s);
+
+    RlweCiphertext::new(b, a)
+}
+
 /// Returns the noisy encoded plaintext polynomial:
 ///
 /// `b + a*s = m + e`.
@@ -174,6 +229,42 @@ pub fn decrypt_raw(
     );
 
     let a_times_s = ciphertext.a().negacyclic_mul(secret_key.polynomial());
+
+    ciphertext.b().add(&a_times_s)
+}
+
+/// NTT-backed raw RLWE decryption.
+///
+/// This is semantically identical to `decrypt_raw`, but computes `a*s`
+/// through the supplied negacyclic NTT plan.
+pub fn decrypt_raw_with_ntt(
+    params: RlweParameters,
+    secret_key: &SecretKey,
+    ciphertext: &RlweCiphertext,
+    plan: &NttPlan,
+) -> Polynomial {
+    assert_eq!(
+        plan.modulus(),
+        params.modulus(),
+        "NTT plan modulus must match RLWE parameters"
+    );
+    assert_eq!(
+        plan.degree(),
+        params.degree(),
+        "NTT plan degree must match RLWE parameters"
+    );
+    assert_eq!(
+        ciphertext.b().modulus(),
+        params.modulus(),
+        "ciphertext modulus must match RLWE parameters"
+    );
+    assert_eq!(
+        ciphertext.b().degree(),
+        params.degree(),
+        "ciphertext degree must match RLWE parameters"
+    );
+
+    let a_times_s = plan.negacyclic_mul(ciphertext.a(), secret_key.polynomial());
 
     ciphertext.b().add(&a_times_s)
 }
@@ -200,6 +291,67 @@ mod tests {
 
     fn params() -> RlweParameters {
         RlweParameters::new(8, Modulus::new(12_289), 16, 1)
+    }
+
+    #[test]
+    fn ntt_raw_encryption_matches_reference_exactly() {
+        use crate::ring::make_ntt_plan;
+
+        let params = params();
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x9100);
+        let key = SecretKey::generate_with_rng(params, &mut key_rng);
+
+        let message = Polynomial::new(
+            params.modulus(),
+            (0..params.degree())
+                .map(|index| (17 + 9 * index as u64) % params.modulus().value())
+                .collect(),
+        );
+
+        let plan = make_ntt_plan(params.modulus(), params.degree());
+
+        for seed in 0_u64..32 {
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9110);
+            let mut ntt_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9110);
+
+            let reference = encrypt_raw_with_rng(params, &key, &message, &mut reference_rng);
+
+            let optimized = encrypt_raw_with_ntt_rng(params, &key, &message, &plan, &mut ntt_rng);
+
+            assert_eq!(
+                optimized, reference,
+                "NTT raw encryption diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn ntt_raw_decryption_matches_reference_exactly() {
+        use crate::ring::make_ntt_plan;
+
+        let params = params();
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x9200);
+        let key = SecretKey::generate_with_rng(params, &mut key_rng);
+
+        let message = Polynomial::new(
+            params.modulus(),
+            (0..params.degree())
+                .map(|index| (31 + 7 * index as u64) % params.modulus().value())
+                .collect(),
+        );
+
+        let plan = make_ntt_plan(params.modulus(), params.degree());
+
+        for seed in 0_u64..32 {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9210);
+            let ciphertext = encrypt_raw_with_rng(params, &key, &message, &mut rng);
+
+            assert_eq!(
+                decrypt_raw_with_ntt(params, &key, &ciphertext, &plan),
+                decrypt_raw(params, &key, &ciphertext),
+                "NTT raw decryption diverged for seed {seed}"
+            );
+        }
     }
 
     #[test]

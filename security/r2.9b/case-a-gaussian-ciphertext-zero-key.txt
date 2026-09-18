@@ -1,0 +1,15 @@
+   Compiling ccmm-rs v0.1.0 (/Users/ro/Documents/uci_research/Prelim/ccmm-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (target/debug/deps/ccmm_rs-cf2f386a5cb90de2)
+
+running 1 test
+SECURITY_PROFILE=research-4096
+SECURITY_ERROR_SIGMA=3.19
+SECURITY_INPUT_SCALE=34359738368.000000
+SECURITY_OUTPUT_SCALE=34360066050.125008
+SECURITY_MAX_SLOT_ERROR=1.362844566946e-6
+SECURITY_MAX_ERROR_SLOT=1536
+test ckks::rns_multiply::tests::research_4096_security_profile_multiply_rescale_matches_slots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 499 filtered out; finished in 11.71s
+

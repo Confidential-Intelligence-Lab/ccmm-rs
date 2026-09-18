@@ -250,6 +250,179 @@ mod tests {
     }
 
     #[test]
+    fn research_4096_gaussian_encryption_multiply_rescale_matches_slots() {
+        use crate::ckks::research_profile_4096;
+        use crate::grafting::{
+            decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsKeygenConfig,
+        };
+        use crate::rlwe::ErrorDistribution;
+
+        let profile = research_profile_4096();
+        let chain = profile.modulus_chain();
+        let degree = profile.degree();
+        let scale = profile.initial_scale();
+        let top_basis = chain.top().clone();
+        let top_plan = RnsNttPlan::new(top_basis.moduli().to_vec(), degree);
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let mut lhs_slots = vec![Complex64::new(0.0, 0.0); profile.slot_count()];
+        let mut rhs_slots = vec![Complex64::new(0.0, 0.0); profile.slot_count()];
+
+        lhs_slots[0] = Complex64::new(0.50, 0.25);
+        lhs_slots[1] = Complex64::new(-0.75, 0.125);
+        lhs_slots[17] = Complex64::new(0.20, -0.30);
+        lhs_slots[257] = Complex64::new(-0.40, 0.10);
+        lhs_slots[1023] = Complex64::new(0.125, 0.375);
+        lhs_slots[2047] = Complex64::new(-0.25, -0.50);
+
+        rhs_slots[0] = Complex64::new(0.25, -0.50);
+        rhs_slots[1] = Complex64::new(0.50, 0.25);
+        rhs_slots[17] = Complex64::new(-0.10, 0.20);
+        rhs_slots[257] = Complex64::new(0.30, -0.15);
+        rhs_slots[1023] = Complex64::new(-0.50, 0.125);
+        rhs_slots[2047] = Complex64::new(0.20, 0.40);
+
+        let embedding = CkksCanonicalEmbedding::new(degree);
+
+        let encode_rns = |slots: &[Complex64]| {
+            let raw = embedding.slots_to_coefficients(slots);
+
+            let signed: Vec<i128> = raw
+                .iter()
+                .map(|&coefficient| {
+                    let scaled = coefficient * scale;
+                    assert!(scaled.is_finite(), "scaled CKKS coefficient must be finite");
+                    scaled.round() as i128
+                })
+                .collect();
+
+            let residues = top_basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    let q = i128::from(modulus.value());
+
+                    Polynomial::new(
+                        modulus,
+                        signed
+                            .iter()
+                            .map(|&value| {
+                                let residue = ((value % q) + q) % q;
+                                residue as u64
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            RnsPolynomial::from_residues(residues)
+        };
+
+        let lhs_plaintext = encode_rns(&lhs_slots);
+        let rhs_plaintext = encode_rns(&rhs_slots);
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x29B5_0001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x29B5_0002);
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x29B5_0003);
+
+        let lhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &lhs_plaintext,
+            2,
+            distribution,
+            &secret,
+            &top_plan,
+            &mut lhs_rng,
+        );
+
+        let rhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &rhs_plaintext,
+            2,
+            distribution,
+            &secret,
+            &top_plan,
+            &mut rhs_rng,
+        );
+
+        let lhs = RnsCkksCiphertext::new(lhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let rhs = RnsCkksCiphertext::new(rhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let multiplication_key = RnsMultiplicationKey::generate_with_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: RnsGadgetLayout::new(top_basis.clone(), vec![1, 2]),
+                plan: &top_plan,
+            },
+            &secret,
+            &mut key_rng,
+        );
+
+        let product = multiply_relinearize_rescale_rns_ckks_with_ntt(
+            &lhs,
+            &rhs,
+            &multiplication_key,
+            &chain,
+            &top_plan,
+        );
+
+        let result_plan = RnsNttPlan::new(product.rlwe().basis().moduli().to_vec(), degree);
+
+        let decrypted = decrypt_rns_raw_with_ntt(product.rlwe(), &secret, &result_plan);
+
+        let modulus = decrypted.composite_modulus();
+        let output_scale = product.state().scale();
+
+        let coefficients: Vec<f64> = decrypted
+            .reconstruct_coefficients()
+            .into_iter()
+            .map(|value| centered(value, modulus) as f64 / output_scale)
+            .collect();
+
+        let observed = embedding.coefficients_to_slots(&coefficients);
+        let expected = reference_slot_product(&lhs_slots, &rhs_slots);
+
+        let mut max_error = 0.0_f64;
+        let mut max_error_slot = 0_usize;
+
+        for (index, (&actual, &reference)) in observed.iter().zip(&expected).enumerate() {
+            let error = (actual - reference).norm();
+
+            if error > max_error {
+                max_error = error;
+                max_error_slot = index;
+            }
+        }
+
+        println!("GAUSSIAN_ENCRYPTION_PROFILE={}", profile.name());
+        println!("GAUSSIAN_ENCRYPTION_SIGMA=3.19");
+        println!("GAUSSIAN_ENCRYPTION_INPUT_SCALE={scale:.6}");
+        println!("GAUSSIAN_ENCRYPTION_OUTPUT_SCALE={output_scale:.6}");
+        println!("GAUSSIAN_ENCRYPTION_MAX_SLOT_ERROR={max_error:.12e}");
+        println!("GAUSSIAN_ENCRYPTION_MAX_ERROR_SLOT={max_error_slot}");
+
+        assert!(
+            max_error < 1.0e-3,
+            "Gaussian-encryption CKKS multiply-rescale error \
+             {max_error:.12e} at slot {max_error_slot} \
+             exceeds 1e-3"
+        );
+    }
+
+    #[test]
+
     fn research_4096_ntt_ckks_multiply_rescale_matches_slots() {
         use crate::ckks::research_profile_4096;
         use crate::grafting::decrypt_rns_quadratic_raw;
@@ -261,7 +434,7 @@ mod tests {
         let profile = research_profile_4096();
         let chain = profile.modulus_chain();
         let degree = profile.degree();
-        let scale = 2.0_f64.powi(37);
+        let scale = profile.initial_scale();
 
         assert_eq!(degree, 4096);
         assert_eq!(profile.slot_count(), 2048);

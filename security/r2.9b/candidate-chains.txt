@@ -1,0 +1,124 @@
+========================================================================
+PROFILE=research-4096
+N=4096
+SCALE_BITS=35
+LIMB_COUNT=3
+LIMB_BITS=35,35,35
+SUM_LIMB_BITS=105
+Q_BIT_LENGTH=105
+LOG2_Q=104.999972482785
+PUBLISHED_MAX=106
+HEADROOM=1.000028
+
+q0 = 34359697409
+     0x7ffff6001
+     bits=35
+     (q-1)%(2N)=0
+     prime=True
+q1 = 34359451649
+     0x7fffba001
+     bits=35
+     (q-1)%(2N)=0
+     prime=True
+q2 = 34359410689
+     0x7fffb0001
+     bits=35
+     (q-1)%(2N)=0
+     prime=True
+
+========================================================================
+PROFILE=research-8192
+N=8192
+SCALE_BITS=40
+LIMB_COUNT=5
+LIMB_BITS=40,40,40,40,40
+SUM_LIMB_BITS=200
+Q_BIT_LENGTH=200
+LOG2_Q=199.999993593649
+PUBLISHED_MAX=214
+HEADROOM=14.000006
+
+q0 = 1099511480321
+     0xfffffdc001
+     bits=40
+     (q-1)%(2N)=0
+     prime=True
+q1 = 1099510890497
+     0xfffff4c001
+     bits=40
+     (q-1)%(2N)=0
+     prime=True
+q2 = 1099510824961
+     0xfffff3c001
+     bits=40
+     (q-1)%(2N)=0
+     prime=True
+q3 = 1099510054913
+     0xffffe80001
+     bits=40
+     (q-1)%(2N)=0
+     prime=True
+q4 = 1099510005761
+     0xffffe74001
+     bits=40
+     (q-1)%(2N)=0
+     prime=True
+
+========================================================================
+PROFILE=research-16384
+N=16384
+SCALE_BITS=45
+LIMB_COUNT=9
+LIMB_BITS=45,45,45,45,45,45,45,45,45
+SUM_LIMB_BITS=405
+Q_BIT_LENGTH=405
+LOG2_Q=404.999999046034
+PUBLISHED_MAX=430
+HEADROOM=25.000001
+
+q0 = 35184371138561
+     0x1ffffff18001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q1 = 35184370941953
+     0x1fffffee8001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q2 = 35184370352129
+     0x1fffffe58001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q3 = 35184370155521
+     0x1fffffe28001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q4 = 35184369893377
+     0x1fffffde8001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q5 = 35184368877569
+     0x1fffffcf0001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q6 = 35184368320513
+     0x1fffffc68001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q7 = 35184368025601
+     0x1fffffc20001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+q8 = 35184367828993
+     0x1fffffbf0001
+     bits=45
+     (q-1)%(2N)=0
+     prime=True
+

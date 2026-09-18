@@ -1,0 +1,34 @@
+   Compiling ccmm-rs v0.1.0 (/Users/ro/Documents/uci_research/Prelim/ccmm-rs)
+warning: unused import: `encrypt_rns_raw_with_distribution_ntt_rng`
+   --> src/ckks/rns_multiply.rs:256:39
+    |
+256 |             decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` on by default
+
+warning: `ccmm-rs` (lib test) generated 1 warning (run `cargo fix --lib -p ccmm-rs --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running unittests src/lib.rs (target/debug/deps/ccmm_rs-cf2f386a5cb90de2)
+
+running 1 test
+SECURITY_PROFILE=research-4096
+SECURITY_ERROR_SIGMA=3.19
+SECURITY_INPUT_SCALE=34359738368.000000
+SECURITY_OUTPUT_SCALE=34360066050.125008
+SECURITY_MAX_SLOT_ERROR=1.147366499223e5
+SECURITY_MAX_ERROR_SLOT=1699
+
+thread 'ckks::rns_multiply::tests::research_4096_security_profile_multiply_rescale_matches_slots' panicked at src/ckks/rns_multiply.rs:406:9:
+security-profile CKKS multiply-rescale error 1.147366499223e5 at slot 1699 exceeds 1e-3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ckks::rns_multiply::tests::research_4096_security_profile_multiply_rescale_matches_slots ... FAILED
+
+failures:
+
+failures:
+    ckks::rns_multiply::tests::research_4096_security_profile_multiply_rescale_matches_slots
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 499 filtered out; finished in 11.75s
+
+error: test failed, to rerun pass `--lib`

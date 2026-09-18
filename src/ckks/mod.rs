@@ -7,6 +7,7 @@ mod galois_key;
 mod hybrid_ciphertext;
 mod hybrid_multiply;
 mod key_accounting;
+mod parameters;
 mod rns_automorphism;
 mod rns_ciphertext;
 mod rns_galois_key;
@@ -38,13 +39,20 @@ pub use key_accounting::{
     evaluation_key_storage, prepared_hybrid_cache_bytes, LogicalPayloadBytes,
     RnsCkksEvaluationKeyStorage, RnsCkksLevelKeyStorage,
 };
+pub use parameters::{
+    correctness_profile_8, research_profile_16384, research_profile_4096, research_profile_8192,
+    CkksParameterClass, CkksParameterProfile,
+};
 pub use rns_automorphism::apply_rns_automorphism;
 pub use rns_ciphertext::RnsCkksCiphertext;
 pub use rns_galois_key::{
     apply_rns_ckks_galois_automorphism, apply_rns_galois_automorphism, conjugate_rns_ckks,
     rotate_left_rns_ckks, rotate_right_rns_ckks, RnsGaloisKey,
 };
-pub use rns_multiply::{evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks};
+pub use rns_multiply::{
+    evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks,
+    multiply_relinearize_rescale_rns_ckks_with_ntt,
+};
 pub use rns_rescale::rescale_rns_ckks_to_next;
 pub use slot_encoder::CkksSlotEncoder;
 pub use slot_layout::CkksSlotLayout;

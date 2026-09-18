@@ -1,4 +1,4 @@
-use crate::ring::Polynomial;
+use crate::ring::{NttPlan, Polynomial};
 
 use super::{RlweCiphertext, RlweParameters, SecretKey};
 
@@ -92,6 +92,47 @@ pub fn tensor(lhs: &RlweCiphertext, rhs: &RlweCiphertext) -> RlweQuadraticCipher
     RlweQuadraticCiphertext::new(c0, c1, c2)
 }
 
+/// NTT-backed multiplication of two rank-1 RLWE ciphertexts.
+///
+/// This is semantically identical to `tensor`, but all polynomial products
+/// use the supplied negacyclic NTT plan.
+pub fn tensor_with_ntt(
+    lhs: &RlweCiphertext,
+    rhs: &RlweCiphertext,
+    plan: &NttPlan,
+) -> RlweQuadraticCiphertext {
+    assert_eq!(
+        lhs.b().modulus(),
+        rhs.b().modulus(),
+        "ciphertext moduli must match"
+    );
+    assert_eq!(
+        lhs.b().degree(),
+        rhs.b().degree(),
+        "ciphertext degrees must match"
+    );
+    assert_eq!(
+        plan.modulus(),
+        lhs.b().modulus(),
+        "NTT plan modulus must match ciphertext modulus"
+    );
+    assert_eq!(
+        plan.degree(),
+        lhs.b().degree(),
+        "NTT plan degree must match ciphertext degree"
+    );
+
+    let c0 = plan.negacyclic_mul(lhs.b(), rhs.b());
+
+    let c1 = plan
+        .negacyclic_mul(lhs.b(), rhs.a())
+        .add(&plan.negacyclic_mul(lhs.a(), rhs.b()));
+
+    let c2 = plan.negacyclic_mul(lhs.a(), rhs.a());
+
+    RlweQuadraticCiphertext::new(c0, c1, c2)
+}
+
 /// Decrypts a degree-2 RLWE ciphertext without decoding.
 ///
 /// Computes:
@@ -135,6 +176,34 @@ mod tests {
 
     fn params() -> RlweParameters {
         RlweParameters::new(8, Modulus::new(12_289), 16, 1)
+    }
+
+    #[test]
+    fn ntt_tensor_matches_reference_exactly() {
+        use crate::ring::make_ntt_plan;
+
+        let params = params();
+        let plan = make_ntt_plan(params.modulus(), params.degree());
+
+        for seed in 0_u64..32 {
+            let mut key_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9300);
+            let key = SecretKey::generate_with_rng(params, &mut key_rng);
+
+            let lhs_plaintext = RlwePlaintext::new(params, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+            let rhs_plaintext = RlwePlaintext::new(params, vec![8, 7, 6, 5, 4, 3, 2, 1]);
+
+            let mut lhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9310);
+            let mut rhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9320);
+
+            let lhs = encrypt_with_rng(params, &key, &lhs_plaintext, &mut lhs_rng);
+            let rhs = encrypt_with_rng(params, &key, &rhs_plaintext, &mut rhs_rng);
+
+            assert_eq!(
+                tensor_with_ntt(&lhs, &rhs, &plan),
+                tensor(&lhs, &rhs),
+                "NTT tensor diverged for seed {seed}"
+            );
+        }
     }
 
     #[test]

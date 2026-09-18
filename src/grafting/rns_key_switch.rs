@@ -1,9 +1,11 @@
-use rand::{CryptoRng, RngCore};
+use rand::{CryptoRng, Rng, RngCore};
 
 use crate::grafting::RnsGadgetLayout;
-use crate::ring::{ModulusBasis, Polynomial, RnsPolynomial};
+use crate::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
 use crate::rlwe::{
-    encrypt_raw_with_rng, RlweCiphertext, RlweParameters, RlweQuadraticCiphertext, SecretKey,
+    decrypt_raw_with_ntt, encrypt_raw_with_ntt_rng, encrypt_raw_with_rng, project_error,
+    sample_error_coefficients, ErrorDistribution, RlweCiphertext, RlweParameters,
+    RlweQuadraticCiphertext, SecretKey,
 };
 
 /// One RLWE ciphertext per RNS modulus.
@@ -50,6 +52,206 @@ impl RnsRlweCiphertext {
     pub fn degree(&self) -> usize {
         self.limbs[0].b().degree()
     }
+}
+
+/// NTT-backed raw RNS RLWE encryption.
+///
+/// Each RNS residue is encrypted under the same logical ternary secret,
+/// projected into that residue modulus. Polynomial multiplication uses the
+/// corresponding per-limb NTT plan.
+pub fn encrypt_rns_raw_with_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    noise_bound: i64,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        secret_coefficients.len(),
+        message.degree(),
+        "secret coefficient count must match RNS message degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        message.degree(),
+        "RNS NTT plan degree must match message degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        message.moduli(),
+        "RNS NTT plan basis must match message basis"
+    );
+    assert!(
+        secret_coefficients
+            .iter()
+            .all(|&value| matches!(value, -1..=1)),
+        "RNS secret coefficients must be ternary"
+    );
+
+    let limbs = message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            let params =
+                RlweParameters::new(message.degree(), modulus, plaintext_modulus, noise_bound);
+
+            let secret = project_secret(modulus, secret_coefficients);
+
+            encrypt_raw_with_ntt_rng(
+                params,
+                &secret,
+                message.residue(index),
+                plan.plan(index),
+                rng,
+            )
+        })
+        .collect();
+
+    RnsRlweCiphertext::from_limbs(limbs)
+}
+
+/// NTT-backed raw RNS RLWE encryption with an explicit logical error
+/// distribution.
+///
+/// One integer error polynomial is sampled in Z[X]/(X^N + 1) and projected
+/// into every RNS limb. This preserves the semantics of one logical RLWE
+/// sample represented in CRT/RNS form.
+pub fn encrypt_rns_raw_with_distribution_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        secret_coefficients.len(),
+        message.degree(),
+        "secret coefficient count must match RNS message degree"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        message.degree(),
+        "RNS NTT plan degree must match message degree"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        message.moduli(),
+        "RNS NTT plan basis must match message basis"
+    );
+
+    assert!(
+        secret_coefficients
+            .iter()
+            .all(|&value| matches!(value, -1..=1)),
+        "RNS secret coefficients must be ternary"
+    );
+
+    distribution.validate();
+
+    let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+
+    let limbs = message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            /*
+             * RlweParameters remains the correctness-oriented substrate.
+             * noise_bound=0 is intentional here because the security-bearing
+             * error is supplied explicitly below.
+             */
+            let params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
+
+            let secret = project_secret(modulus, secret_coefficients);
+
+            let q = modulus.value();
+            let a = Polynomial::new(
+                modulus,
+                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+            );
+
+            let error = project_error(modulus, &logical_error);
+
+            let a_times_s = plan.plan(index).negacyclic_mul(&a, secret.polynomial());
+
+            let b = message.residue(index).add(&error).sub(&a_times_s);
+
+            let _ = params;
+
+            RlweCiphertext::new(b, a)
+        })
+        .collect();
+
+    RnsRlweCiphertext::from_limbs(limbs)
+}
+
+/// NTT-backed raw RNS RLWE decryption.
+///
+/// This is semantically identical to `decrypt_rns_raw`, but evaluates `a*s`
+/// using the supplied per-limb NTT plans.
+pub fn decrypt_rns_raw_with_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+) -> RnsPolynomial {
+    assert_eq!(
+        secret_coefficients.len(),
+        ciphertext.degree(),
+        "secret coefficient count must match ciphertext degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match ciphertext degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "RNS NTT plan basis must match ciphertext basis"
+    );
+
+    let residues = ciphertext
+        .basis()
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            let secret = project_secret(modulus, secret_coefficients);
+
+            /*
+             * plaintext_modulus is irrelevant to raw decryption, but the
+             * parameter object still requires a valid value.
+             */
+            let params = RlweParameters::new(ciphertext.degree(), modulus, 2, 0);
+
+            decrypt_raw_with_ntt(params, &secret, ciphertext.limb(index), plan.plan(index))
+        })
+        .collect();
+
+    RnsPolynomial::from_residues(residues)
+}
+
+#[derive(Clone)]
+pub struct RnsKeygenConfig<'a> {
+    pub degree: usize,
+    pub plaintext_modulus: u64,
+    pub noise_bound: i64,
+    pub layout: RnsGadgetLayout,
+    pub plan: &'a RnsNttPlan,
 }
 
 /// Generic RNS evaluation key for switching one logical ternary secret
@@ -133,6 +335,186 @@ impl RnsKeySwitchKey {
         }
 
         Self { layout, entries }
+    }
+
+    /// Generates an RNS key-switch key using per-limb NTT-backed RLWE
+    /// encryption.
+    pub fn generate_with_ntt_rng<R>(
+        config: RnsKeygenConfig<'_>,
+        source_secret_coefficients: &[i8],
+        target_secret_coefficients: &[i8],
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            source_secret_coefficients.len(),
+            config.degree,
+            "source secret coefficient count must match RLWE degree"
+        );
+        assert_eq!(
+            target_secret_coefficients.len(),
+            config.degree,
+            "target secret coefficient count must match RLWE degree"
+        );
+        assert!(
+            source_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS source secret coefficients must be ternary"
+        );
+        assert!(
+            target_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS target secret coefficients must be ternary"
+        );
+
+        let basis = config.layout.full_basis().clone();
+
+        assert_eq!(
+            config.plan.moduli(),
+            basis.moduli(),
+            "RNS NTT plan basis must match key-switch basis"
+        );
+        assert_eq!(
+            config.plan.degree(),
+            config.degree,
+            "RNS NTT plan degree must match key-switch degree"
+        );
+
+        let mut entries = Vec::with_capacity(config.layout.block_count());
+
+        for block_index in 0..config.layout.block_count() {
+            let idempotent = config.layout.crt_idempotent(block_index);
+            let mut limbs = Vec::with_capacity(basis.len());
+
+            for (limb_index, &modulus) in basis.moduli().iter().enumerate() {
+                let params = RlweParameters::new(
+                    config.degree,
+                    modulus,
+                    config.plaintext_modulus,
+                    config.noise_bound,
+                );
+                let source = project_secret(modulus, source_secret_coefficients);
+                let target = project_secret(modulus, target_secret_coefficients);
+                let factor = (idempotent % u128::from(modulus.value())) as u64;
+                let message = source.polynomial().scalar_mul(factor);
+
+                limbs.push(encrypt_raw_with_ntt_rng(
+                    params,
+                    &target,
+                    &message,
+                    config.plan.plan(limb_index),
+                    rng,
+                ));
+            }
+
+            entries.push(RnsRlweCiphertext::from_limbs(limbs));
+        }
+
+        Self {
+            layout: config.layout,
+            entries,
+        }
+    }
+
+    /// Generates an NTT-backed RNS key-switch key with an explicit
+    /// logical error distribution.
+    ///
+    /// Each gadget entry receives an independently sampled logical error
+    /// polynomial. Within that entry, the same integer error polynomial is
+    /// projected into every RNS limb.
+    pub fn generate_with_distribution_ntt_rng<R>(
+        config: RnsKeygenConfig<'_>,
+        source_secret_coefficients: &[i8],
+        target_secret_coefficients: &[i8],
+        distribution: ErrorDistribution,
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            source_secret_coefficients.len(),
+            config.degree,
+            "source secret coefficient count must match RLWE degree"
+        );
+        assert_eq!(
+            target_secret_coefficients.len(),
+            config.degree,
+            "target secret coefficient count must match RLWE degree"
+        );
+        assert!(
+            source_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS source secret coefficients must be ternary"
+        );
+        assert!(
+            target_secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS target secret coefficients must be ternary"
+        );
+        assert!(
+            source_secret_coefficients.iter().any(|&value| value != 0),
+            "RNS source secret must be nonzero"
+        );
+        assert!(
+            target_secret_coefficients.iter().any(|&value| value != 0),
+            "RNS target secret must be nonzero"
+        );
+
+        distribution.validate();
+
+        let basis = config.layout.full_basis().clone();
+
+        assert_eq!(
+            config.plan.moduli(),
+            basis.moduli(),
+            "RNS NTT plan basis must match key-switch basis"
+        );
+        assert_eq!(
+            config.plan.degree(),
+            config.degree,
+            "RNS NTT plan degree must match key-switch degree"
+        );
+
+        let mut entries = Vec::with_capacity(config.layout.block_count());
+
+        for block_index in 0..config.layout.block_count() {
+            let idempotent = config.layout.crt_idempotent(block_index);
+
+            let message_residues = basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    let source = project_secret(modulus, source_secret_coefficients);
+                    let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                    source.polynomial().scalar_mul(factor)
+                })
+                .collect();
+
+            let message = RnsPolynomial::from_residues(message_residues);
+
+            entries.push(encrypt_rns_raw_with_distribution_ntt_rng(
+                &message,
+                config.plaintext_modulus,
+                distribution,
+                target_secret_coefficients,
+                config.plan,
+                rng,
+            ));
+        }
+
+        Self {
+            layout: config.layout,
+            entries,
+        }
     }
 
     pub fn layout(&self) -> &RnsGadgetLayout {
@@ -220,6 +602,173 @@ impl RnsMultiplicationKey {
         }
 
         Self { layout, entries }
+    }
+
+    /// Generates an RNS multiplication key using per-limb NTT-backed
+    /// secret squaring and RLWE encryption.
+    pub fn generate_with_ntt_rng<R>(
+        config: RnsKeygenConfig<'_>,
+        secret_coefficients: &[i8],
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            secret_coefficients.len(),
+            config.degree,
+            "secret coefficient count must match RLWE degree"
+        );
+        assert!(
+            secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS secret coefficients must be ternary"
+        );
+        assert!(
+            secret_coefficients.iter().any(|&value| value != 0),
+            "RNS secret must be nonzero"
+        );
+
+        let basis = config.layout.full_basis().clone();
+
+        assert_eq!(
+            config.plan.moduli(),
+            basis.moduli(),
+            "RNS NTT plan basis must match multiplication-key basis"
+        );
+        assert_eq!(
+            config.plan.degree(),
+            config.degree,
+            "RNS NTT plan degree must match multiplication-key degree"
+        );
+
+        let mut entries = Vec::with_capacity(config.layout.block_count());
+
+        for block_index in 0..config.layout.block_count() {
+            let idempotent = config.layout.crt_idempotent(block_index);
+            let mut limbs = Vec::with_capacity(basis.len());
+
+            for (limb_index, &modulus) in basis.moduli().iter().enumerate() {
+                let params = RlweParameters::new(
+                    config.degree,
+                    modulus,
+                    config.plaintext_modulus,
+                    config.noise_bound,
+                );
+                let secret = project_secret(modulus, secret_coefficients);
+                let limb_plan = config.plan.plan(limb_index);
+
+                let secret_squared =
+                    limb_plan.negacyclic_mul(secret.polynomial(), secret.polynomial());
+
+                let factor = (idempotent % u128::from(modulus.value())) as u64;
+                let target = secret_squared.scalar_mul(factor);
+
+                limbs.push(encrypt_raw_with_ntt_rng(
+                    params, &secret, &target, limb_plan, rng,
+                ));
+            }
+
+            entries.push(RnsRlweCiphertext::from_limbs(limbs));
+        }
+
+        Self {
+            layout: config.layout,
+            entries,
+        }
+    }
+
+    /// Generates an RNS multiplication key with an explicit logical
+    /// error distribution.
+    ///
+    /// Each evaluation-key entry samples one error polynomial over the
+    /// integers and projects that same polynomial into every RNS limb.
+    /// This is the security-bearing counterpart of `generate_with_ntt_rng`;
+    /// the existing bounded-noise generator remains unchanged for
+    /// correctness and differential testing.
+    pub fn generate_with_distribution_ntt_rng<R>(
+        config: RnsKeygenConfig<'_>,
+        secret_coefficients: &[i8],
+        distribution: ErrorDistribution,
+        rng: &mut R,
+    ) -> Self
+    where
+        R: RngCore + CryptoRng,
+    {
+        assert_eq!(
+            secret_coefficients.len(),
+            config.degree,
+            "secret coefficient count must match RLWE degree"
+        );
+
+        assert!(
+            secret_coefficients
+                .iter()
+                .all(|&value| matches!(value, -1..=1)),
+            "RNS secret coefficients must be ternary"
+        );
+
+        assert!(
+            secret_coefficients.iter().any(|&value| value != 0),
+            "RNS secret must be nonzero"
+        );
+
+        distribution.validate();
+
+        let basis = config.layout.full_basis().clone();
+
+        assert_eq!(
+            config.plan.moduli(),
+            basis.moduli(),
+            "RNS NTT plan basis must match multiplication-key basis"
+        );
+
+        assert_eq!(
+            config.plan.degree(),
+            config.degree,
+            "RNS NTT plan degree must match multiplication-key degree"
+        );
+
+        let mut entries = Vec::with_capacity(config.layout.block_count());
+
+        for block_index in 0..config.layout.block_count() {
+            let idempotent = config.layout.crt_idempotent(block_index);
+
+            let target_residues = basis
+                .moduli()
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(limb_index, modulus)| {
+                    let secret = project_secret(modulus, secret_coefficients);
+                    let limb_plan = config.plan.plan(limb_index);
+
+                    let secret_squared =
+                        limb_plan.negacyclic_mul(secret.polynomial(), secret.polynomial());
+
+                    let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                    secret_squared.scalar_mul(factor)
+                })
+                .collect();
+
+            let target = RnsPolynomial::from_residues(target_residues);
+
+            entries.push(encrypt_rns_raw_with_distribution_ntt_rng(
+                &target,
+                config.plaintext_modulus,
+                distribution,
+                secret_coefficients,
+                config.plan,
+                rng,
+            ));
+        }
+
+        Self {
+            layout: config.layout,
+            entries,
+        }
     }
 
     pub fn layout(&self) -> &RnsGadgetLayout {
@@ -382,6 +931,52 @@ impl RnsQuadraticCiphertext {
     }
 }
 
+/// Multiplies two RNS RLWE ciphertexts using per-limb NTT plans.
+pub fn rns_tensor_with_ntt(
+    lhs: &RnsRlweCiphertext,
+    rhs: &RnsRlweCiphertext,
+    plan: &RnsNttPlan,
+) -> RnsQuadraticCiphertext {
+    assert_eq!(lhs.basis(), rhs.basis(), "RNS ciphertext bases must match");
+    assert_eq!(
+        lhs.degree(),
+        rhs.degree(),
+        "RNS ciphertext degrees must match"
+    );
+    assert_eq!(
+        plan.moduli(),
+        lhs.basis().moduli(),
+        "RNS NTT plan basis must match ciphertext basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        lhs.degree(),
+        "RNS NTT plan degree must match ciphertext degree"
+    );
+
+    let mut c0 = Vec::with_capacity(lhs.basis().len());
+    let mut c1 = Vec::with_capacity(lhs.basis().len());
+    let mut c2 = Vec::with_capacity(lhs.basis().len());
+
+    for limb_index in 0..lhs.basis().len() {
+        let quadratic = crate::rlwe::tensor_with_ntt(
+            lhs.limb(limb_index),
+            rhs.limb(limb_index),
+            plan.plan(limb_index),
+        );
+
+        c0.push(quadratic.c0().clone());
+        c1.push(quadratic.c1().clone());
+        c2.push(quadratic.c2().clone());
+    }
+
+    RnsQuadraticCiphertext::from_rns_polynomials(
+        RnsPolynomial::from_residues(c0),
+        RnsPolynomial::from_residues(c1),
+        RnsPolynomial::from_residues(c2),
+    )
+}
+
 /// Relinearizes a degree-2 RNS ciphertext using CRT gadget blocks.
 pub fn rns_relinearize(
     product: &RnsQuadraticCiphertext,
@@ -433,6 +1028,75 @@ pub fn rns_relinearize(
             b = b.add(&digit.negacyclic_mul(evaluation_key.b()));
 
             a = a.add(&digit.negacyclic_mul(evaluation_key.a()));
+        }
+
+        output_limbs.push(RlweCiphertext::new(b, a));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// NTT-backed RNS relinearization using CRT gadget blocks.
+///
+/// Semantics are identical to `rns_relinearize`; gadget-digit products use
+/// the corresponding per-limb negacyclic NTT plan.
+pub fn rns_relinearize_with_ntt(
+    product: &RnsQuadraticCiphertext,
+    multiplication_key: &RnsMultiplicationKey,
+    plan: &RnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = multiplication_key.layout();
+
+    assert_eq!(
+        product.c0().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match RNS multiplication key"
+    );
+    assert_eq!(
+        product.c1().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match RNS multiplication key"
+    );
+    assert_eq!(
+        product.c2().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match RNS multiplication key"
+    );
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "RNS NTT plan basis must match multiplication-key basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        product.c0().degree(),
+        "RNS NTT plan degree must match quadratic ciphertext degree"
+    );
+
+    let decomposition = layout.decompose(product.c2());
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b = product.c0().residue(limb_index).clone();
+        let mut a = product.c1().residue(limb_index).clone();
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let evaluation_key = multiplication_key.entry(block_index).limb(limb_index);
+
+            b = b.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.b()));
+            a = a.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.a()));
         }
 
         output_limbs.push(RlweCiphertext::new(b, a));
@@ -496,6 +1160,73 @@ pub fn rns_key_switch(
             b = b.add(&digit.negacyclic_mul(evaluation_key.b()));
 
             a_out = a_out.add(&digit.negacyclic_mul(evaluation_key.a()));
+        }
+
+        output_limbs.push(RlweCiphertext::new(b, a_out));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// NTT-backed generic RNS key switching.
+///
+/// Semantics are identical to `rns_key_switch`; gadget-digit products use
+/// the corresponding per-limb negacyclic NTT plan.
+pub fn rns_key_switch_with_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    key_switch_key: &RnsKeySwitchKey,
+    plan: &RnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = key_switch_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match key-switch layout"
+    );
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "RNS NTT plan basis must match key-switch basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match ciphertext degree"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decomposition = layout.decompose(&a);
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b = ciphertext.limb(limb_index).b().clone();
+        let mut a_out = Polynomial::zero(modulus, ciphertext.degree());
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let evaluation_key = key_switch_key.entry(block_index).limb(limb_index);
+
+            b = b.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.b()));
+            a_out = a_out.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.a()));
         }
 
         output_limbs.push(RlweCiphertext::new(b, a_out));
@@ -584,6 +1315,106 @@ mod tests {
     }
 
     #[test]
+    fn shared_gaussian_rns_error_projects_identically_across_limbs() {
+        let degree = 8;
+        let basis = basis();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
+
+        let message = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &[0_u128; 8]);
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x29B4_0001);
+
+        let ciphertext = encrypt_rns_raw_with_distribution_ntt_rng(
+            &message,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &plan,
+            &mut rng,
+        );
+
+        let decrypted = decrypt_rns_raw_with_ntt(&ciphertext, &secret, &plan);
+
+        /*
+         * A single logical error was sampled before RNS projection.
+         * Therefore every limb must represent the same signed integer
+         * coefficient modulo its corresponding q_i.
+         */
+        for coefficient_index in 0..degree {
+            let reference = decrypted.residue(0).coefficient(coefficient_index);
+
+            let q0 = basis.modulus(0).value();
+            let signed = if reference <= q0 / 2 {
+                reference as i128
+            } else {
+                reference as i128 - q0 as i128
+            };
+
+            for limb_index in 1..basis.len() {
+                let q = basis.modulus(limb_index).value() as i128;
+                let expected = ((signed % q) + q) % q;
+
+                assert_eq!(
+                    decrypted.residue(limb_index).coefficient(coefficient_index) as i128,
+                    expected,
+                    "RNS Gaussian error projection mismatch at coefficient {} limb {}",
+                    coefficient_index,
+                    limb_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_gaussian_rns_encryption_is_seed_reproducible() {
+        let degree = 8;
+        let basis = basis();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
+
+        let message = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &[3_u128; 8]);
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_0002);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_0002);
+
+        let lhs = encrypt_rns_raw_with_distribution_ntt_rng(
+            &message,
+            2,
+            distribution,
+            &secret,
+            &plan,
+            &mut lhs_rng,
+        );
+
+        let rhs = encrypt_rns_raw_with_distribution_ntt_rng(
+            &message,
+            2,
+            distribution,
+            &secret,
+            &plan,
+            &mut rhs_rng,
+        );
+
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
     fn ternary_secret_projects_identically_across_moduli() {
         let params = source_params();
 
@@ -648,6 +1479,271 @@ mod tests {
 
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    #[test]
+    fn ntt_rns_raw_encryption_matches_reference_exactly() {
+        use crate::ring::RnsNttPlan;
+
+        let basis = basis();
+        let degree = 8;
+
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let message = RnsPolynomial::from_coefficients(
+            basis.moduli().to_vec(),
+            &[3_u128, 1, 4, 1, 5, 9, 2, 6],
+        );
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        for seed in 0_u64..32 {
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xA900);
+
+            let reference_limbs = basis
+                .moduli()
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, modulus)| {
+                    let params = RlweParameters::new(degree, modulus, 2, 1);
+
+                    let projected_secret = project_secret(modulus, &secret);
+
+                    encrypt_raw_with_rng(
+                        params,
+                        &projected_secret,
+                        message.residue(index),
+                        &mut reference_rng,
+                    )
+                })
+                .collect();
+
+            let reference = RnsRlweCiphertext::from_limbs(reference_limbs);
+
+            let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xA900);
+
+            let optimized =
+                encrypt_rns_raw_with_ntt_rng(&message, 2, 1, &secret, &plan, &mut optimized_rng);
+
+            assert_eq!(
+                optimized, reference,
+                "NTT RNS encryption diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn ntt_rns_raw_decryption_matches_reference_exactly() {
+        use crate::ring::RnsNttPlan;
+
+        let basis = basis();
+        let degree = 8;
+
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let message = RnsPolynomial::from_coefficients(
+            basis.moduli().to_vec(),
+            &[2_u128, 7, 1, 8, 2, 8, 1, 8],
+        );
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        for seed in 0_u64..32 {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAA00);
+
+            let ciphertext = encrypt_rns_raw_with_ntt_rng(&message, 2, 1, &secret, &plan, &mut rng);
+
+            assert_eq!(
+                decrypt_rns_raw_with_ntt(&ciphertext, &secret, &plan,),
+                decrypt_rns_raw(&ciphertext, &secret,),
+                "NTT RNS decryption diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn ntt_rns_tensor_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        for seed in 0_u64..32 {
+            let lhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[1_u128, 2, 3, 4, 5, 6, 7, 8],
+            );
+            let rhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[8_u128, 7, 6, 5, 4, 3, 2, 1],
+            );
+
+            let mut lhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAB10);
+            let mut rhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAB20);
+
+            let lhs =
+                encrypt_rns_raw_with_ntt_rng(&lhs_message, 2, 1, &secret, &plan, &mut lhs_rng);
+
+            let rhs =
+                encrypt_rns_raw_with_ntt_rng(&rhs_message, 2, 1, &secret, &plan, &mut rhs_rng);
+
+            let optimized = rns_tensor_with_ntt(&lhs, &rhs, &plan);
+
+            let mut c0 = Vec::new();
+            let mut c1 = Vec::new();
+            let mut c2 = Vec::new();
+
+            for limb_index in 0..basis.len() {
+                let reference = tensor(lhs.limb(limb_index), rhs.limb(limb_index));
+
+                c0.push(reference.c0().clone());
+                c1.push(reference.c1().clone());
+                c2.push(reference.c2().clone());
+            }
+
+            let reference = RnsQuadraticCiphertext::from_rns_polynomials(
+                RnsPolynomial::from_residues(c0),
+                RnsPolynomial::from_residues(c1),
+                RnsPolynomial::from_residues(c2),
+            );
+
+            assert_eq!(
+                optimized, reference,
+                "NTT RNS tensor diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn ntt_rns_relinearization_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xAC00);
+        let key =
+            RnsMultiplicationKey::generate_with_rng(degree, 2, 0, &secret, layout, &mut key_rng);
+
+        for seed in 0_u64..32 {
+            let lhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[1_u128, 3, 5, 7, 9, 11, 13, 15],
+            );
+            let rhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[2_u128, 4, 6, 8, 10, 12, 14, 16],
+            );
+
+            let mut lhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAC10);
+            let mut rhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAC20);
+
+            let lhs =
+                encrypt_rns_raw_with_ntt_rng(&lhs_message, 2, 0, &secret, &plan, &mut lhs_rng);
+
+            let rhs =
+                encrypt_rns_raw_with_ntt_rng(&rhs_message, 2, 0, &secret, &plan, &mut rhs_rng);
+
+            let product = rns_tensor_with_ntt(&lhs, &rhs, &plan);
+
+            assert_eq!(
+                rns_relinearize_with_ntt(&product, &key, &plan),
+                rns_relinearize(&product, &key),
+                "NTT RNS relinearization diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_rns_multiplication_key_is_seed_reproducible() {
+        let basis = basis();
+        let degree = 8;
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let lhs_layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+        let rhs_layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_1001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_1001);
+
+        let lhs = RnsMultiplicationKey::generate_with_distribution_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: lhs_layout,
+                plan: &plan,
+            },
+            &secret,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut lhs_rng,
+        );
+
+        let rhs = RnsMultiplicationKey::generate_with_distribution_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: rhs_layout,
+                plan: &plan,
+            },
+            &secret,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut rhs_rng,
+        );
+
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn ntt_rns_multiplication_key_generation_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+        let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        for seed in 0_u64..32 {
+            let layout_reference = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+            let layout_optimized = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAE10);
+
+            let reference = RnsMultiplicationKey::generate_with_rng(
+                degree,
+                2,
+                1,
+                &secret,
+                layout_reference,
+                &mut reference_rng,
+            );
+
+            let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAE10);
+
+            let optimized = RnsMultiplicationKey::generate_with_ntt_rng(
+                RnsKeygenConfig {
+                    degree,
+                    plaintext_modulus: 2,
+                    noise_bound: 1,
+                    layout: layout_optimized,
+                    plan: &plan,
+                },
+                &secret,
+                &mut optimized_rng,
+            );
+
+            assert_eq!(
+                optimized, reference,
+                "NTT multiplication-key generation diverged for seed {seed}"
+            );
         }
     }
 
@@ -809,6 +1905,143 @@ mod tests {
         let after = decrypt_rns_raw(&switched, &target_secret);
 
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn ntt_rns_key_switch_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let source_secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+        let target_secret = [1, 0, -1, 0, 1, 1, 0, -1];
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xAD00);
+
+        let key = RnsKeySwitchKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &source_secret,
+            &target_secret,
+            layout,
+            &mut key_rng,
+        );
+
+        let message = RnsPolynomial::from_coefficients(
+            basis.moduli().to_vec(),
+            &[3_u128, 1, 4, 1, 5, 9, 2, 6],
+        );
+
+        for seed in 0_u64..32 {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAD10);
+
+            let ciphertext =
+                encrypt_rns_raw_with_ntt_rng(&message, 2, 0, &source_secret, &plan, &mut rng);
+
+            assert_eq!(
+                rns_key_switch_with_ntt(&ciphertext, &key, &plan,),
+                rns_key_switch(&ciphertext, &key,),
+                "NTT RNS key switch diverged for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_rns_key_switch_key_is_seed_reproducible() {
+        let degree = 8;
+        let basis = basis();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let source = [-1, 0, 1, 1, 0, -1, 1, 0];
+        let target = [1, -1, 0, 1, -1, 0, 0, 1];
+
+        let lhs_layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+        let rhs_layout = RnsGadgetLayout::new(basis, vec![1, 2]);
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_2001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x29B4_2001);
+
+        let lhs = RnsKeySwitchKey::generate_with_distribution_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: lhs_layout,
+                plan: &plan,
+            },
+            &source,
+            &target,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut lhs_rng,
+        );
+
+        let rhs = RnsKeySwitchKey::generate_with_distribution_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: rhs_layout,
+                plan: &plan,
+            },
+            &source,
+            &target,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut rhs_rng,
+        );
+
+        assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn ntt_rns_key_switch_key_generation_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+
+        let source_secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+        let target_secret = [1, 0, -1, 0, 1, 1, 0, -1];
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        for seed in 0_u64..32 {
+            let layout_reference = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+            let layout_optimized = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAF10);
+
+            let reference = RnsKeySwitchKey::generate_with_rng(
+                degree,
+                2,
+                1,
+                &source_secret,
+                &target_secret,
+                layout_reference,
+                &mut reference_rng,
+            );
+
+            let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAF10);
+
+            let optimized = RnsKeySwitchKey::generate_with_ntt_rng(
+                RnsKeygenConfig {
+                    degree,
+                    plaintext_modulus: 2,
+                    noise_bound: 1,
+                    layout: layout_optimized,
+                    plan: &plan,
+                },
+                &source_secret,
+                &target_secret,
+                &mut optimized_rng,
+            );
+
+            assert_eq!(
+                optimized, reference,
+                "NTT key-switch-key generation diverged for seed {seed}"
+            );
+        }
     }
 
     #[test]

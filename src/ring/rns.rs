@@ -175,9 +175,13 @@ impl RnsPolynomial {
                     let residue =
                         u128::from(self.residues[limb_index].coefficients()[coefficient_index]);
 
-                    let term = residue * partial * u128::from(inverse);
+                    let term = mul_mod_u128(
+                        mul_mod_u128(residue, partial, composite),
+                        u128::from(inverse),
+                        composite,
+                    );
 
-                    reconstructed = (reconstructed + term % composite) % composite;
+                    reconstructed = add_mod_u128(reconstructed, term, composite);
                 }
 
                 reconstructed
@@ -193,6 +197,48 @@ impl RnsPolynomial {
             "RNS polynomial modulus bases must match"
         );
     }
+}
+
+/// Computes `(lhs + rhs) mod modulus` without overflowing `u128`.
+fn add_mod_u128(lhs: u128, rhs: u128, modulus: u128) -> u128 {
+    debug_assert!(modulus > 0);
+
+    let lhs = lhs % modulus;
+    let rhs = rhs % modulus;
+
+    if lhs >= modulus - rhs {
+        lhs - (modulus - rhs)
+    } else {
+        lhs + rhs
+    }
+}
+
+/// Computes `(lhs * rhs) mod modulus` without overflowing `u128`.
+///
+/// This correctness-oriented path uses binary double-and-add so that
+/// realistic composite RNS moduli remain representable without requiring
+/// wider-than-u128 intermediate products.
+fn mul_mod_u128(mut lhs: u128, mut rhs: u128, modulus: u128) -> u128 {
+    debug_assert!(modulus > 0);
+
+    lhs %= modulus;
+    rhs %= modulus;
+
+    let mut result = 0_u128;
+
+    while rhs != 0 {
+        if rhs & 1 == 1 {
+            result = add_mod_u128(result, lhs, modulus);
+        }
+
+        rhs >>= 1;
+
+        if rhs != 0 {
+            lhs = add_mod_u128(lhs, lhs, modulus);
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
