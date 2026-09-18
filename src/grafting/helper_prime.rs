@@ -1,4 +1,4 @@
-use crate::ring::{make_ntt_plan, Modulus, NttPlan, Polynomial};
+use crate::ring::{make_ntt_plan, Modulus, NttPlan, NttPolynomial, Polynomial};
 
 use super::Pow2Polynomial;
 
@@ -154,6 +154,88 @@ impl HelperPrimeNttPlan {
     }
 }
 
+/// Power-of-two polynomial cached in the helper-prime NTT domain.
+///
+/// The coefficients have been canonically lifted from `Z_(2^k)` into
+/// the helper-prime ring and transformed once. This representation is
+/// intended for operands such as evaluation-key polynomials that are
+/// reused across many multiplications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperPrimeNttPolynomial {
+    bits: u32,
+    helper_modulus: Modulus,
+    transformed: NttPolynomial,
+}
+
+impl HelperPrimeNttPolynomial {
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    pub fn degree(&self) -> usize {
+        self.transformed.degree()
+    }
+
+    pub fn helper_modulus(&self) -> Modulus {
+        self.helper_modulus
+    }
+
+    pub fn transformed(&self) -> &NttPolynomial {
+        &self.transformed
+    }
+}
+
+impl HelperPrimeNttPlan {
+    /// Lifts and transforms a power-of-two polynomial once for reuse.
+    pub fn prepare(&self, polynomial: &Pow2Polynomial) -> HelperPrimeNttPolynomial {
+        self.assert_compatible(polynomial);
+
+        let helper = self.lift(polynomial);
+
+        HelperPrimeNttPolynomial {
+            bits: self.bits,
+            helper_modulus: self.helper_modulus,
+            transformed: NttPolynomial::from_polynomial(&self.ntt_plan, &helper),
+        }
+    }
+
+    /// Multiplies a coefficient-domain power-of-two polynomial by a
+    /// reusable helper-prime NTT-domain operand.
+    pub fn negacyclic_mul_prepared(
+        &self,
+        lhs: &Pow2Polynomial,
+        rhs: &HelperPrimeNttPolynomial,
+    ) -> Pow2Polynomial {
+        self.assert_compatible(lhs);
+
+        assert_eq!(
+            rhs.bits, self.bits,
+            "prepared helper operand sprout size must match plan"
+        );
+
+        assert_eq!(
+            rhs.helper_modulus, self.helper_modulus,
+            "prepared helper operand modulus must match plan"
+        );
+
+        assert_eq!(
+            rhs.degree(),
+            self.degree,
+            "prepared helper operand degree must match plan"
+        );
+
+        let lhs_helper = self.lift(lhs);
+
+        let lhs_ntt = NttPolynomial::from_polynomial(&self.ntt_plan, &lhs_helper);
+
+        let product_ntt = lhs_ntt.pointwise_mul(&rhs.transformed);
+
+        let product = product_ntt.to_polynomial(&self.ntt_plan);
+
+        self.project(&product)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +369,31 @@ mod tests {
         let rhs = Pow2Polynomial::zero(8, 64);
 
         let _ = plan.negacyclic_mul(&wrong, &rhs);
+    }
+
+    #[test]
+    fn prepared_helper_operand_matches_uncached_path() {
+        for bits in [2_u32, 4, 8, 10] {
+            for degree in [16_usize, 64, 256] {
+                let plan = HelperPrimeNttPlan::new(bits, degree, Modulus::new(HELPER_PRIME));
+
+                for seed in 0_u64..16 {
+                    let lhs = polynomial(bits, degree, seed + 1, 17);
+
+                    let rhs = polynomial(bits, degree, seed + 101, 31);
+
+                    let prepared = plan.prepare(&rhs);
+
+                    assert_eq!(
+                        plan.negacyclic_mul_prepared(&lhs, &prepared,),
+                        plan.negacyclic_mul(&lhs, &rhs,),
+                        "prepared helper mismatch: \
+                         bits={bits}, \
+                         degree={degree}, \
+                         seed={seed}"
+                    );
+                }
+            }
+        }
     }
 }

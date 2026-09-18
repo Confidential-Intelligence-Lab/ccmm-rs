@@ -1,6 +1,8 @@
 pub use hybrid_key_switch::{
-    decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_relinearize, HybridEvaluationKeyEntry,
-    HybridMultiplicationKey, HybridQuadraticCiphertext,
+    decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_relinearize,
+    hybrid_relinearize_helper_prime, hybrid_relinearize_prepared, HybridEvaluationKeyEntry,
+    HybridMultiplicationKey, HybridQuadraticCiphertext, PreparedHybridEvaluationKeyEntry,
+    PreparedHybridMultiplicationKey,
 };
 pub mod hybrid_key_switch;
 pub use mixed_gadget::{MixedGadgetDecomposition, MixedGadgetLayout};
@@ -34,7 +36,7 @@ pub use gadget::{GadgetBlock, GadgetLayout};
 pub mod gadget;
 pub use pow2_rs::{inv_rs_power_of_two, rs_power_of_two, Pow2RnsPolynomial};
 pub mod pow2_rs;
-pub use helper_prime::HelperPrimeNttPlan;
+pub use helper_prime::{HelperPrimeNttPlan, HelperPrimeNttPolynomial};
 pub mod helper_prime;
 pub use pow2::Pow2Polynomial;
 pub mod pow2;
