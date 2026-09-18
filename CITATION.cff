@@ -8,8 +8,8 @@ family-names: "Cammarota"
 given-names: "Rosario"
 repository-code: "https://github.com/Confidential-Intelligence-Lab/ccmm-rs"
 license: "MIT"
-version: "0.1.0"
-date-released: "2026-09-17"
+version: "2.0.0"
+date-released: "2026-09-18"
 preferred-citation:
 type: conference-paper
 title: "Fast Batch Matrix Multiplication in Ciphertexts"

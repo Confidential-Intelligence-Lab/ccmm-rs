@@ -529,10 +529,14 @@ current artifact.
 
 The original `v0.1.0` release established the correctness baseline.
 
-Subsequent Roadmap-2 development has added the RNS/NTT CKKS research
-architecture and realistic matrix characterization described above.
-Package and citation version metadata remain at `0.1.0` until the
-coordinated Roadmap-2 release freeze.
+`v2.0.0` completes the Roadmap-2 architecture described in this repository:
+realistic RNS/NTT CKKS execution, canonical SIMD semantics, leveled
+evaluation, Galois operations, level-aware evaluation keys, security/noise
+characterization, and realistic encrypted matrix multiplication at N=4096.
+
+The realistic parameter profiles remain research profiles and are explicitly
+not designated security-bearing. See `docs/SECURITY_AND_PARAMETERS.md` for
+the current security-claim boundary.
 
 ## Citation
 

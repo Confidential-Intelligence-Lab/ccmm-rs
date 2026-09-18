@@ -1,6 +1,6 @@
 [package]
 name = "ccmm-rs"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 description = "Native Rust research implementation of encrypted matrix multiplication and RNS/NTT CKKS evaluation"
