@@ -38,6 +38,42 @@ impl NttPlan {
         values
     }
 
+    /// Multiplies two coefficient-domain polynomials using
+    /// the radix-2 negacyclic NTT.
+    ///
+    /// This is the optimized counterpart to
+    /// `Polynomial::negacyclic_mul`, which remains the correctness
+    /// reference implementation.
+    pub fn negacyclic_mul(&self, lhs: &Polynomial, rhs: &Polynomial) -> Polynomial {
+        assert_eq!(
+            lhs.modulus(),
+            self.modulus(),
+            "left polynomial modulus must match NTT plan"
+        );
+        assert_eq!(
+            rhs.modulus(),
+            self.modulus(),
+            "right polynomial modulus must match NTT plan"
+        );
+        assert_eq!(
+            lhs.degree(),
+            self.degree(),
+            "left polynomial degree must match NTT plan"
+        );
+        assert_eq!(
+            rhs.degree(),
+            self.degree(),
+            "right polynomial degree must match NTT plan"
+        );
+
+        let lhs_ntt = self.forward_radix2(lhs);
+        let rhs_ntt = self.forward_radix2(rhs);
+
+        let product_ntt = self.pointwise_mul(&lhs_ntt, &rhs_ntt);
+
+        self.inverse_radix2(&product_ntt)
+    }
+
     /// Optimized radix-2 inverse negacyclic NTT.
     pub fn inverse_radix2(&self, values: &[u64]) -> Polynomial {
         assert_eq!(

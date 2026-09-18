@@ -154,6 +154,45 @@ impl PolynomialMatrix {
         result
     }
 
+    /// Matrix multiplication over the same negacyclic ring using an
+    /// explicit radix-2 NTT multiplication plan for every scalar
+    /// polynomial product.
+    pub fn matmul_ntt(&self, rhs: &Self, plan: &crate::ring::NttPlan) -> Self {
+        assert_eq!(self.cols, rhs.rows, "matrix inner dimensions must match");
+
+        self.assert_same_ring(rhs);
+
+        assert_eq!(
+            self.modulus,
+            plan.modulus(),
+            "matrix modulus must match NTT plan"
+        );
+
+        assert_eq!(
+            self.ring_degree,
+            plan.degree(),
+            "matrix ring degree must match NTT plan"
+        );
+
+        let mut result = Self::new(self.rows, rhs.cols, self.modulus, self.ring_degree);
+
+        for col in 0..rhs.cols {
+            for row in 0..self.rows {
+                let mut accumulator = Polynomial::zero(self.modulus, self.ring_degree);
+
+                for k in 0..self.cols {
+                    let product = plan.negacyclic_mul(self.get(row, k), rhs.get(k, col));
+
+                    accumulator = accumulator.add(&product);
+                }
+
+                result.set(row, col, accumulator);
+            }
+        }
+
+        result
+    }
+
     fn index(&self, row: usize, col: usize) -> usize {
         row + col * self.rows
     }
@@ -351,5 +390,45 @@ mod tests {
 
         assert_eq!(sum.get(0, 0), &lhs.get(0, 0).add(rhs.get(0, 0)));
         assert_eq!(sum.get(0, 1), &lhs.get(0, 1).add(rhs.get(0, 1)));
+    }
+    #[test]
+    fn ntt_matrix_product_matches_reference_matrix_product() {
+        let q = Modulus::new(12_289);
+        let degree = 64;
+
+        let plan = crate::ring::make_ntt_plan(q, degree);
+
+        fn poly(q: Modulus, degree: usize, offset: u64) -> Polynomial {
+            Polynomial::new(
+                q,
+                (0..degree)
+                    .map(|i| (offset + 7 * i as u64 + (i as u64).pow(2)) % q.value())
+                    .collect(),
+            )
+        }
+
+        let lhs = PolynomialMatrix::from_vec_column_major(
+            2,
+            2,
+            vec![
+                poly(q, degree, 1),
+                poly(q, degree, 2),
+                poly(q, degree, 3),
+                poly(q, degree, 4),
+            ],
+        );
+
+        let rhs = PolynomialMatrix::from_vec_column_major(
+            2,
+            2,
+            vec![
+                poly(q, degree, 5),
+                poly(q, degree, 6),
+                poly(q, degree, 7),
+                poly(q, degree, 8),
+            ],
+        );
+
+        assert_eq!(lhs.matmul_ntt(&rhs, &plan), lhs.matmul(&rhs));
     }
 }

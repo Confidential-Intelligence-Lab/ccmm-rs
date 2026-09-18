@@ -167,6 +167,35 @@ mod tests {
     }
 
     #[test]
+    fn optimized_multiplier_matches_reference_across_degrees() {
+        let modulus = Modulus::new(12_289);
+
+        for degree in [16_usize, 32, 64, 128, 256] {
+            let plan = crate::ring::make_ntt_plan(modulus, degree);
+
+            let lhs = Polynomial::new(
+                modulus,
+                (0..degree)
+                    .map(|i| (7 + 13 * i as u64 + 5 * (i as u64).pow(2)) % modulus.value())
+                    .collect(),
+            );
+
+            let rhs = Polynomial::new(
+                modulus,
+                (0..degree)
+                    .map(|i| (19 + 17 * i as u64 + 3 * (i as u64).pow(2)) % modulus.value())
+                    .collect(),
+            );
+
+            assert_eq!(
+                plan.negacyclic_mul(&lhs, &rhs),
+                lhs.negacyclic_mul(&rhs),
+                "optimized/reference mismatch at degree {degree}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_values_are_reduced_mod_q() {
         let plan = plan();
         let q = plan.modulus().value();
