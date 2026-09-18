@@ -1,3 +1,8 @@
+//! RLWE ciphertext, key, encryption, decryption, and error-model primitives.
+//!
+//! The module includes both correctness-oriented noise paths and the research
+//! discrete-Gaussian error infrastructure used by Roadmap-2 validation.
+//!
 mod ciphertext;
 pub mod error;
 pub mod params;

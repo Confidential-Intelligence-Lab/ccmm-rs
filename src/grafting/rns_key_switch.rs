@@ -119,7 +119,7 @@ where
 /// NTT-backed raw RNS RLWE encryption with an explicit logical error
 /// distribution.
 ///
-/// One integer error polynomial is sampled in Z[X]/(X^N + 1) and projected
+/// One integer error polynomial is sampled in `Z[X]/(X^N + 1)` and projected
 /// into every RNS limb. This preserves the semantics of one logical RLWE
 /// sample represented in CRT/RNS form.
 pub fn encrypt_rns_raw_with_distribution_ntt_rng<R>(

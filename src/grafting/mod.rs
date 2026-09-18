@@ -1,3 +1,7 @@
+//! RNS key-switch, evaluation-key, and grafting infrastructure.
+//!
+//! These components support the Roadmap-2 leveled RNS CKKS evaluation path.
+//!
 pub use hybrid_key_switch::{
     decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_multiply_relinearize_with_backend,
     hybrid_relinearize, hybrid_relinearize_helper_prime, hybrid_relinearize_prepared,

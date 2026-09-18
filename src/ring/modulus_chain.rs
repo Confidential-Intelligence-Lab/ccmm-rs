@@ -8,7 +8,7 @@ use super::{Modulus, ModulusBasis};
 /// level 0: [q0, q1, q2, q3]
 /// level 1: [q0, q1, q2]
 /// level 2: [q0, q1]
-/// level 3: [q0]
+/// level 3: `q0`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModulusChain {
     levels: Vec<ModulusBasis>,

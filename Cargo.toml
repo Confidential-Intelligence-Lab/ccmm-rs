@@ -3,7 +3,8 @@ name = "ccmm-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Native Rust ciphertext-ciphertext matrix multiplication for RLWE/CKKS-style encrypted matrices"
+description = "Native Rust research implementation of encrypted matrix multiplication and RNS/NTT CKKS evaluation"
+repository = "https://github.com/Confidential-Intelligence-Lab/ccmm-rs"
 
 [dependencies]
 rand = "0.8"

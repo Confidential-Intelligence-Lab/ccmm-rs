@@ -1,3 +1,8 @@
+//! CKKS parameter, encoding, leveled-evaluation, and RNS/NTT infrastructure.
+//!
+//! This module contains both the legacy CKKS-style correctness machinery and
+//! the Roadmap-2 canonical-SIMD / leveled-RNS implementation.
+//!
 mod automorphism;
 mod chain;
 mod embedding;

@@ -59,7 +59,7 @@ impl CkksSlotEncoder {
         &self.embedding
     }
 
-    /// Encodes `N/2` complex CKKS slots into one polynomial in Z_Q[X].
+    /// Encodes `N/2` complex CKKS slots into one polynomial in `Z_Q[X]`.
     pub fn encode_slots(&self, slots: &[Complex64]) -> Polynomial {
         assert_eq!(
             slots.len(),
@@ -111,7 +111,7 @@ impl CkksSlotEncoder {
         self.encode_slots(&complex_slots)
     }
 
-    /// Decodes a polynomial in Z_Q[X] into canonical CKKS complex slots.
+    /// Decodes a polynomial in `Z_Q[X]` into canonical CKKS complex slots.
     ///
     /// This performs:
     ///

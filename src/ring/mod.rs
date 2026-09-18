@@ -1,3 +1,8 @@
+//! Ring, modulus, RNS, polynomial, and NTT arithmetic.
+//!
+//! This module provides the arithmetic substrate shared by the reference and
+//! optimized Roadmap-2 implementations.
+//!
 pub mod modulus;
 pub mod ntt;
 pub mod ntt_params;
