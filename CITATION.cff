@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use ccmm-rs, please cite this software and the original CCMM paper by Cheon, Kang, and Lee."
+title: "ccmm-rs: Native Rust Ciphertext-Ciphertext Matrix Multiplication"
+type: software
+authors:
+
+family-names: "Cammarota"
+given-names: "Rosario"
+repository-code: "https://github.com/Confidential-Intelligence-Lab/ccmm-rs"
+license: "MIT"
+version: "0.1.0"
+date-released: "2026-09-17"
+preferred-citation:
+type: conference-paper
+title: "Fast Batch Matrix Multiplication in Ciphertexts"
+authors:
+family-names: "Cheon"
+given-names: "Jung Hee"
+family-names: "Kang"
+given-names: "Minsik"
+family-names: "Lee"
+given-names: "Junho"
+collection-title: "Advances in Cryptology - CRYPTO 2026"
+publisher:
+name: "Springer"
+year: 2026
+volume: "16801"
+start: 558
+end: 590
+doi: "10.1007/978-3-032-35374-0_18"
