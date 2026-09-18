@@ -24,3 +24,6 @@ pub use modulus_basis::ModulusBasis;
 
 pub mod modulus_chain;
 pub use modulus_chain::ModulusChain;
+
+pub mod basis_conversion;
+pub use basis_conversion::convert_basis;
