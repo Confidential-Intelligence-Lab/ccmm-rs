@@ -87,6 +87,45 @@ pub fn multiply_relinearize_rescale_rns_ckks(
     rescale_rns_ckks_to_next(&product, chain)
 }
 
+/// Evaluates a leveled product chain over RNS CKKS ciphertexts.
+///
+/// `lhs` and `rhs` are multiplied at the initial level using
+/// `multiplication_keys[0]`. Each element of `remaining_operands`
+/// is then multiplied into the accumulated ciphertext at the next
+/// active level using the corresponding subsequent key.
+///
+/// Therefore:
+///
+/// ```text
+/// multiplication_keys.len()
+///     == remaining_operands.len() + 1
+/// ```
+///
+/// Each multiplication performs relinearization followed by one
+/// modulus-chain rescale.
+pub fn evaluate_rns_ckks_product_chain(
+    lhs: &RnsCkksCiphertext,
+    rhs: &RnsCkksCiphertext,
+    remaining_operands: &[RnsCkksCiphertext],
+    multiplication_keys: &[RnsMultiplicationKey],
+    chain: &ModulusChain,
+) -> RnsCkksCiphertext {
+    assert_eq!(
+        multiplication_keys.len(),
+        remaining_operands.len() + 1,
+        "leveled CKKS evaluation requires one multiplication key per depth"
+    );
+
+    let mut accumulator =
+        multiply_relinearize_rescale_rns_ckks(lhs, rhs, &multiplication_keys[0], chain);
+
+    for (operand, key) in remaining_operands.iter().zip(&multiplication_keys[1..]) {
+        accumulator = multiply_relinearize_rescale_rns_ckks(&accumulator, operand, key, chain);
+    }
+
+    accumulator
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;
@@ -733,5 +772,185 @@ mod tests {
                 (actual - expected).abs()
             );
         }
+    }
+
+    fn depth_chain() -> ModulusChain {
+        ModulusChain::from_top_basis(ModulusBasis::new(vec![
+            Modulus::new(12_289),
+            Modulus::new(40_961),
+            Modulus::new(65_537),
+            Modulus::new(114_689),
+            Modulus::new(147_457),
+        ]))
+    }
+
+    fn multiplication_key_for_level(
+        chain: &ModulusChain,
+        level: usize,
+        degree: usize,
+        secret: &[i8],
+        seed: u64,
+    ) -> RnsMultiplicationKey {
+        let basis = chain.level(level);
+
+        /*
+         * A single block spanning the complete active basis is
+         * sufficient for this depth-generalization campaign.
+         */
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![basis.len()]);
+
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        RnsMultiplicationKey::generate_with_rng(degree, 2, 0, secret, layout, &mut rng)
+    }
+
+    #[test]
+    fn depth_parametric_encrypted_ckks_campaign() {
+        let chain = depth_chain();
+
+        let degree = 8;
+
+        let secret = ternary(degree);
+
+        assert_eq!(chain.max_level(), 4);
+
+        /*
+         * Small sparse coefficient vectors keep the depth-4
+         * plaintext comfortably inside the final centered modulus.
+         */
+        let lhs_values = [0.125, -0.0625, 0.03125, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        let rhs_values = [0.0625, 0.03125, -0.0625, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        let continuation_values = [0.125, -0.0625, 0.03125, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        /*
+         * The first dropped modulus is also the initial scale:
+         *
+         *     Delta^2 / q_drop = Delta.
+         */
+        let stable_scale = chain.dropped_modulus(0).unwrap().value() as f64;
+
+        for depth in 1_usize..=4 {
+            let lhs = encrypt_rns_values(
+                &chain,
+                0,
+                &lhs_values,
+                stable_scale,
+                &secret,
+                0xE000 + depth as u64,
+            );
+
+            let rhs = encrypt_rns_values(
+                &chain,
+                0,
+                &rhs_values,
+                stable_scale,
+                &secret,
+                0xE100 + depth as u64,
+            );
+
+            let mut operands = Vec::with_capacity(depth.saturating_sub(1));
+
+            /*
+             * After the first multiplication, the accumulator is
+             * at level 1. At each later level choose the new
+             * operand scale equal to that level's dropped modulus:
+             *
+             *     stable_scale * q_drop / q_drop
+             *       = stable_scale.
+             */
+            for level in 1..depth {
+                let operand_scale = chain.dropped_modulus(level).unwrap().value() as f64;
+
+                operands.push(encrypt_rns_values(
+                    &chain,
+                    level,
+                    &continuation_values,
+                    operand_scale,
+                    &secret,
+                    0xE200 + (depth as u64 * 16) + level as u64,
+                ));
+            }
+
+            let keys: Vec<_> = (0..depth)
+                .map(|level| {
+                    multiplication_key_for_level(
+                        &chain,
+                        level,
+                        degree,
+                        &secret,
+                        0xE300 + (depth as u64 * 16) + level as u64,
+                    )
+                })
+                .collect();
+
+            let result = evaluate_rns_ckks_product_chain(&lhs, &rhs, &operands, &keys, &chain);
+
+            assert_eq!(
+                result.level(),
+                depth,
+                "depth {depth} ended at wrong chain level"
+            );
+
+            assert_eq!(
+                result.basis(),
+                chain.level(depth),
+                "depth {depth} ended on wrong RNS basis"
+            );
+
+            assert!(
+                (result.scale() - stable_scale).abs() < 1.0e-9,
+                "depth {depth}: unexpected scale {}",
+                result.scale()
+            );
+
+            let mut expected = reference_negacyclic_product(&lhs_values, &rhs_values);
+
+            for _ in 1..depth {
+                expected = reference_negacyclic_product(&expected, &continuation_values);
+            }
+
+            let actual = decrypt_decode_rns(&result, &secret);
+
+            /*
+             * Errors remain very small for these validation
+             * parameters, but allow accumulation with depth.
+             */
+            let tolerance = 0.0005 * depth as f64;
+
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "depth={depth}, \
+                     coefficient={index}, \
+                     actual={actual}, \
+                     expected={expected}, \
+                     error={}, \
+                     tolerance={tolerance}",
+                    (actual - expected).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS CKKS multiply-rescale requires a next chain level")]
+    fn depth_parametric_execution_rejects_chain_exhaustion() {
+        let chain = depth_chain();
+
+        let degree = 8;
+
+        let secret = ternary(degree);
+
+        let level = chain.max_level();
+
+        let lhs = zero_ciphertext(&chain, level, degree, 1.0);
+
+        let rhs = zero_ciphertext(&chain, level, degree, 1.0);
+
+        let key = multiplication_key_for_level(&chain, level, degree, &secret, 0xEFFF);
+
+        let _ = multiply_relinearize_rescale_rns_ckks(&lhs, &rhs, &key, &chain);
     }
 }

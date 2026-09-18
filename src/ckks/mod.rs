@@ -5,7 +5,7 @@ mod rns_rescale;
 
 pub use chain::CkksChainState;
 pub use rns_ciphertext::RnsCkksCiphertext;
-pub use rns_multiply::multiply_relinearize_rescale_rns_ckks;
+pub use rns_multiply::{evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks};
 pub use rns_rescale::rescale_rns_ckks_to_next;
 
 use rand::{CryptoRng, RngCore};
