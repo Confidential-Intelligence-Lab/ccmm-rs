@@ -30,3 +30,6 @@ pub use basis_conversion::convert_basis;
 
 pub mod basis_transition;
 pub use basis_transition::{drop_basis_prefix, extend_basis_prefix};
+
+#[cfg(test)]
+mod basis_differential;
