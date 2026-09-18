@@ -15,3 +15,6 @@ pub use ntt_polynomial::NttPolynomial;
 
 pub mod rns;
 pub use rns::RnsPolynomial;
+
+pub mod rns_ntt;
+pub use rns_ntt::{RnsNttPlan, RnsNttPolynomial};
