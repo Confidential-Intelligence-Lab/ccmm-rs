@@ -98,7 +98,7 @@ pub struct CkksCiphertext {
 }
 
 impl CkksCiphertext {
-    fn new(inner: RlweCiphertext, level: usize, scale: f64) -> Self {
+    pub(crate) fn new(inner: RlweCiphertext, level: usize, scale: f64) -> Self {
         assert!(scale.is_finite() && scale > 0.0);
         Self {
             inner,
