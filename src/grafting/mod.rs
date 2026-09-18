@@ -1,3 +1,5 @@
+pub use helper_prime::HelperPrimeNttPlan;
+pub mod helper_prime;
 pub use pow2::Pow2Polynomial;
 pub mod pow2;
 pub use universal_sprout::{UniversalSprout, UniversalSproutPolicy};
