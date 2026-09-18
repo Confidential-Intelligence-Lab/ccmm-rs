@@ -1,3 +1,18 @@
+pub use hybrid_rlwe::{
+    decrypt_pow2_raw, encrypt_pow2_raw_with_rng, project_ternary_secret_pow2,
+    reconstruct_hybrid_plaintext, HybridRlweCiphertext, Pow2RlweCiphertext,
+};
+pub mod hybrid_rlwe;
+pub use pow2_transition_apply::{
+    apply_pow2_sprout_transition, pow2_transition_reference_coefficients,
+};
+pub mod pow2_transition_apply;
+pub use odd_rescale::{odd_rescale_nutrient, odd_rescale_target_basis, rescale_odd_nutrient};
+pub mod odd_rescale;
+pub use pow2_transition::{Pow2GraftedBasis, Pow2SproutTransition};
+pub mod pow2_transition;
+pub use prime_resurrection::PrimeSproutKeySwitchPlan;
+pub mod prime_resurrection;
 pub use rns_key_switch::{
     decrypt_rns_quadratic_raw, decrypt_rns_raw, rns_relinearize, ternary_secret_coefficients,
     RnsMultiplicationKey, RnsQuadraticCiphertext, RnsRlweCiphertext,
