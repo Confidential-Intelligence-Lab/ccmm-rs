@@ -2075,3 +2075,473 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod r3_evaluation_key_noise_diagnostics {
+    use super::*;
+
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use crate::ckks::research_profile_4096;
+    use crate::rlwe::ErrorDistribution;
+
+    fn centered_u64(value: u64, modulus: u64) -> i128 {
+        if value <= modulus / 2 {
+            value as i128
+        } else {
+            value as i128 - modulus as i128
+        }
+    }
+
+    fn bit_length_u128(value: u128) -> u32 {
+        if value == 0 {
+            0
+        } else {
+            128 - value.leading_zeros()
+        }
+    }
+
+    #[test]
+    fn r3_1a_gaussian_evaluation_key_noise_accounting_is_exact() {
+        let profile = research_profile_4096();
+        let chain = profile.modulus_chain();
+        let degree = profile.degree();
+        let basis = chain.top().clone();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        assert_eq!(degree, 4096);
+        assert_eq!(basis.len(), 3);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let zero = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &vec![0_u128; degree]);
+
+        /*
+         * Zero ciphertext error deliberately isolates evaluation-key noise.
+         * The random RLWE `a` components still produce a realistic, large c2
+         * after tensoring.
+         */
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x31A0_0001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x31A0_0002);
+
+        let lhs = encrypt_rns_raw_with_ntt_rng(&zero, 2, 0, &secret, &plan, &mut lhs_rng);
+        let rhs = encrypt_rns_raw_with_ntt_rng(&zero, 2, 0, &secret, &plan, &mut rhs_rng);
+
+        let quadratic = rns_tensor_with_ntt(&lhs, &rhs, &plan);
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+        let decomposition = layout.decompose(quadratic.c2());
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x31A0_0003);
+        let key = RnsMultiplicationKey::generate_with_distribution_ntt_rng(
+            RnsKeygenConfig {
+                degree,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: layout.clone(),
+                plan: &plan,
+            },
+            &secret,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &mut key_rng,
+        );
+
+        println!("R3_1A_PROFILE={}", profile.name());
+        println!("R3_1A_RING_DEGREE={degree}");
+        println!("R3_1A_BLOCK_COUNT={}", layout.block_count());
+
+        for block_index in 0..layout.block_count() {
+            let block_modulus = layout.blocks()[block_index].composite_modulus();
+            let max_digit = decomposition
+                .digit(block_index)
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
+
+            println!(
+                "R3_1A_BLOCK_{block_index}_MODULUS_BITS={}",
+                bit_length_u128(block_modulus)
+            );
+            println!(
+                "R3_1A_BLOCK_{block_index}_MAX_DIGIT_BITS={}",
+                bit_length_u128(max_digit)
+            );
+            println!("R3_1A_BLOCK_{block_index}_MAX_DIGIT={max_digit}");
+        }
+
+        /*
+         * Recover each key-entry error:
+         *
+         *   e_i = Dec(EK_i) - E_i*s^2
+         *
+         * Then predict the relinearization error:
+         *
+         *   e_ks = sum_i d_i * e_i.
+         */
+        let mut predicted_noise_residues = Vec::with_capacity(basis.len());
+
+        for limb_index in 0..basis.len() {
+            let modulus = basis.modulus(limb_index);
+            let limb_plan = plan.plan(limb_index);
+            let projected_secret = project_secret(modulus, &secret);
+            let s = projected_secret.polynomial();
+            let s_squared = limb_plan.negacyclic_mul(s, s);
+
+            let mut predicted = Polynomial::zero(modulus, degree);
+
+            for block_index in 0..layout.block_count() {
+                let idempotent = layout.crt_idempotent(block_index);
+                let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                let expected_target = s_squared.scalar_mul(factor);
+                let evaluation_key = key.entry(block_index).limb(limb_index);
+
+                let decrypted_entry = evaluation_key
+                    .b()
+                    .add(&limb_plan.negacyclic_mul(evaluation_key.a(), s));
+
+                let entry_error = decrypted_entry.sub(&expected_target);
+
+                let digit = Polynomial::new(
+                    modulus,
+                    decomposition
+                        .digit(block_index)
+                        .iter()
+                        .map(|&value| (value % u128::from(modulus.value())) as u64)
+                        .collect(),
+                );
+
+                let contribution = limb_plan.negacyclic_mul(&digit, &entry_error);
+
+                predicted = predicted.add(&contribution);
+
+                let max_entry_error = entry_error
+                    .coefficients()
+                    .iter()
+                    .map(|&value| centered_u64(value, modulus.value()).abs())
+                    .max()
+                    .unwrap_or(0);
+
+                let max_contribution = contribution
+                    .coefficients()
+                    .iter()
+                    .map(|&value| centered_u64(value, modulus.value()).abs())
+                    .max()
+                    .unwrap_or(0);
+
+                println!(
+                    "R3_1A_LIMB_{limb_index}_BLOCK_{block_index}_MAX_KEY_ERROR={max_entry_error}"
+                );
+                println!(
+                    "R3_1A_LIMB_{limb_index}_BLOCK_{block_index}_MAX_NOISE_CONTRIBUTION={max_contribution}"
+                );
+            }
+
+            let max_predicted = predicted
+                .coefficients()
+                .iter()
+                .map(|&value| centered_u64(value, modulus.value()).abs())
+                .max()
+                .unwrap_or(0);
+
+            println!("R3_1A_LIMB_{limb_index}_MAX_PREDICTED_KS_NOISE={max_predicted}");
+
+            predicted_noise_residues.push(predicted);
+        }
+
+        let predicted_noise = RnsPolynomial::from_residues(predicted_noise_residues);
+
+        /*
+         * Actual relinearization delta:
+         *
+         *   Dec(relinearized) - Dec(quadratic).
+         */
+        let relinearized = rns_relinearize_with_ntt(&quadratic, &key, &plan);
+
+        let actual_linear = decrypt_rns_raw_with_ntt(&relinearized, &secret, &plan);
+
+        let expected_quadratic = decrypt_rns_quadratic_raw(&quadratic, &secret);
+
+        let actual_delta_residues = basis
+            .moduli()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(limb_index, _)| {
+                actual_linear
+                    .residue(limb_index)
+                    .sub(expected_quadratic.residue(limb_index))
+            })
+            .collect();
+
+        let actual_delta = RnsPolynomial::from_residues(actual_delta_residues);
+
+        assert_eq!(
+            actual_delta, predicted_noise,
+            "predicted sum(d_i * e_i) does not equal actual relinearization noise"
+        );
+
+        let q = predicted_noise.composite_modulus();
+
+        let reconstructed = predicted_noise.reconstruct_coefficients();
+
+        let max_centered = reconstructed
+            .iter()
+            .map(|&value| {
+                let centered = if value <= q / 2 {
+                    value as i128
+                } else {
+                    value as i128 - q as i128
+                };
+                centered.abs()
+            })
+            .max()
+            .unwrap_or(0);
+
+        println!("R3_1A_COMPOSITE_MODULUS={q}");
+        println!("R3_1A_MAX_CENTERED_KS_NOISE={max_centered}");
+        println!("R3_1A_NOISE_IDENTITY=PASS");
+    }
+
+    #[test]
+    fn r3_1a_crt_gadget_layout_noise_amplification_sweep() {
+        let profile = research_profile_4096();
+        let chain = profile.modulus_chain();
+        let degree = profile.degree();
+        let basis = chain.top().clone();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let zero = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &vec![0_u128; degree]);
+
+        /*
+         * Freeze the quadratic ciphertext across all layouts so the only
+         * experimental variable is the gadget partition.
+         */
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x31A1_0001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x31A1_0002);
+
+        let lhs = encrypt_rns_raw_with_ntt_rng(&zero, 2, 0, &secret, &plan, &mut lhs_rng);
+        let rhs = encrypt_rns_raw_with_ntt_rng(&zero, 2, 0, &secret, &plan, &mut rhs_rng);
+
+        let quadratic = rns_tensor_with_ntt(&lhs, &rhs, &plan);
+        let expected_quadratic = decrypt_rns_quadratic_raw(&quadratic, &secret);
+
+        let layouts = [
+            ("3", vec![3]),
+            ("1_2", vec![1, 2]),
+            ("2_1", vec![2, 1]),
+            ("1_1_1", vec![1, 1, 1]),
+        ];
+
+        println!("R3_1A_SWEEP_PROFILE={}", profile.name());
+        println!("R3_1A_SWEEP_RING_DEGREE={degree}");
+        println!(
+            "R3_1A_SWEEP_COMPOSITE_MODULUS={}",
+            basis.composite_modulus()
+        );
+
+        for (layout_name, block_sizes) in layouts {
+            let layout = RnsGadgetLayout::new(basis.clone(), block_sizes);
+
+            let decomposition = layout.decompose(quadratic.c2());
+
+            /*
+             * Use the same key seed for every layout. The number of entries
+             * differs, so this does not make the sampled keys identical; it
+             * simply makes every layout experiment deterministic.
+             */
+            let mut key_rng = ChaCha20Rng::seed_from_u64(0x31A1_1000);
+
+            let key = RnsMultiplicationKey::generate_with_distribution_ntt_rng(
+                RnsKeygenConfig {
+                    degree,
+                    plaintext_modulus: 2,
+                    noise_bound: 0,
+                    layout: layout.clone(),
+                    plan: &plan,
+                },
+                &secret,
+                ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                &mut key_rng,
+            );
+
+            println!("R3_1A_LAYOUT={layout_name}");
+            println!(
+                "R3_1A_LAYOUT_{layout_name}_BLOCK_COUNT={}",
+                layout.block_count()
+            );
+
+            for block_index in 0..layout.block_count() {
+                let block_modulus = layout.blocks()[block_index].composite_modulus();
+
+                let max_digit = decomposition
+                    .digit(block_index)
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+
+                println!(
+                    "R3_1A_LAYOUT_{layout_name}_BLOCK_{block_index}_MODULUS_BITS={}",
+                    bit_length_u128(block_modulus)
+                );
+
+                println!(
+                    "R3_1A_LAYOUT_{layout_name}_BLOCK_{block_index}_MAX_DIGIT_BITS={}",
+                    bit_length_u128(max_digit)
+                );
+            }
+
+            let mut predicted_residues = Vec::with_capacity(basis.len());
+
+            let mut global_max_key_error = 0_i128;
+            let mut global_max_contribution = 0_i128;
+            let mut global_max_limb_noise = 0_i128;
+
+            for limb_index in 0..basis.len() {
+                let modulus = basis.modulus(limb_index);
+                let limb_plan = plan.plan(limb_index);
+
+                let projected_secret = project_secret(modulus, &secret);
+                let s = projected_secret.polynomial();
+
+                let s_squared = limb_plan.negacyclic_mul(s, s);
+
+                let mut predicted = Polynomial::zero(modulus, degree);
+
+                for block_index in 0..layout.block_count() {
+                    let idempotent = layout.crt_idempotent(block_index);
+
+                    let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                    let target = s_squared.scalar_mul(factor);
+
+                    let evaluation_key = key.entry(block_index).limb(limb_index);
+
+                    let decrypted_entry = evaluation_key
+                        .b()
+                        .add(&limb_plan.negacyclic_mul(evaluation_key.a(), s));
+
+                    let entry_error = decrypted_entry.sub(&target);
+
+                    let digit = Polynomial::new(
+                        modulus,
+                        decomposition
+                            .digit(block_index)
+                            .iter()
+                            .map(|&value| (value % u128::from(modulus.value())) as u64)
+                            .collect(),
+                    );
+
+                    let contribution = limb_plan.negacyclic_mul(&digit, &entry_error);
+
+                    predicted = predicted.add(&contribution);
+
+                    let max_key_error = entry_error
+                        .coefficients()
+                        .iter()
+                        .map(|&value| centered_u64(value, modulus.value()).abs())
+                        .max()
+                        .unwrap_or(0);
+
+                    let max_contribution = contribution
+                        .coefficients()
+                        .iter()
+                        .map(|&value| centered_u64(value, modulus.value()).abs())
+                        .max()
+                        .unwrap_or(0);
+
+                    global_max_key_error = global_max_key_error.max(max_key_error);
+
+                    global_max_contribution = global_max_contribution.max(max_contribution);
+                }
+
+                let max_limb_noise = predicted
+                    .coefficients()
+                    .iter()
+                    .map(|&value| centered_u64(value, modulus.value()).abs())
+                    .max()
+                    .unwrap_or(0);
+
+                global_max_limb_noise = global_max_limb_noise.max(max_limb_noise);
+
+                predicted_residues.push(predicted);
+            }
+
+            let predicted = RnsPolynomial::from_residues(predicted_residues);
+
+            /*
+             * Verify the accounting identity independently for every layout.
+             */
+            let relinearized = rns_relinearize_with_ntt(&quadratic, &key, &plan);
+
+            let actual = decrypt_rns_raw_with_ntt(&relinearized, &secret, &plan);
+
+            let delta_residues = basis
+                .moduli()
+                .iter()
+                .enumerate()
+                .map(|(limb_index, _)| {
+                    actual
+                        .residue(limb_index)
+                        .sub(expected_quadratic.residue(limb_index))
+                })
+                .collect();
+
+            let delta = RnsPolynomial::from_residues(delta_residues);
+
+            assert_eq!(
+                delta, predicted,
+                "noise accounting mismatch for layout {layout_name}"
+            );
+
+            let q = predicted.composite_modulus();
+
+            let max_composite_noise = predicted
+                .reconstruct_coefficients()
+                .iter()
+                .map(|&value| {
+                    if value <= q / 2 {
+                        value as i128
+                    } else {
+                        value as i128 - q as i128
+                    }
+                    .abs()
+                })
+                .max()
+                .unwrap_or(0);
+
+            println!("R3_1A_LAYOUT_{layout_name}_MAX_KEY_ERROR={global_max_key_error}");
+
+            println!(
+                "R3_1A_LAYOUT_{layout_name}_MAX_SINGLE_CONTRIBUTION={global_max_contribution}"
+            );
+
+            println!("R3_1A_LAYOUT_{layout_name}_MAX_LIMB_NOISE={global_max_limb_noise}");
+
+            println!("R3_1A_LAYOUT_{layout_name}_MAX_COMPOSITE_NOISE={max_composite_noise}");
+
+            println!("R3_1A_LAYOUT_{layout_name}_IDENTITY=PASS");
+        }
+
+        println!("R3_1A_LAYOUT_SWEEP_STATUS=PASS");
+    }
+}
