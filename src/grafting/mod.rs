@@ -1,3 +1,10 @@
+pub use hybrid_key_switch::{
+    decrypt_hybrid_quadratic_raw, decrypt_hybrid_raw, hybrid_relinearize, HybridEvaluationKeyEntry,
+    HybridMultiplicationKey, HybridQuadraticCiphertext,
+};
+pub mod hybrid_key_switch;
+pub use mixed_gadget::{MixedGadgetDecomposition, MixedGadgetLayout};
+pub mod mixed_gadget;
 pub use hybrid_rlwe::{
     decrypt_pow2_raw, encrypt_pow2_raw_with_rng, project_ternary_secret_pow2,
     reconstruct_hybrid_plaintext, HybridRlweCiphertext, Pow2RlweCiphertext,
