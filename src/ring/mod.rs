@@ -21,3 +21,6 @@ pub use rns_ntt::{RnsNttPlan, RnsNttPolynomial};
 
 pub mod modulus_basis;
 pub use modulus_basis::ModulusBasis;
+
+pub mod modulus_chain;
+pub use modulus_chain::ModulusChain;
