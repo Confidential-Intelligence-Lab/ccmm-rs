@@ -1,3 +1,5 @@
+pub use universal_sprout::{UniversalSprout, UniversalSproutPolicy};
+pub mod universal_sprout;
 pub use rescale::{grafted_q_rescale, q_rescale_reference};
 pub mod rescale;
 pub use transition::{ResurrectionPool, SproutTransition};
