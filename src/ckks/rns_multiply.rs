@@ -2202,4 +2202,215 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn research_4096_bounded_gaussian_multiply_rescale_slot_sweep() {
+        use std::time::Instant;
+
+        use crate::ckks::research_profile_4096;
+        use crate::grafting::decrypt_rns_raw_with_ntt;
+
+        use crate::grafting::{
+            bounded_rns_relinearize_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+            rns_tensor_with_ntt, BoundedGadgetLayout, BoundedRnsKeygenConfig,
+            BoundedRnsMultiplicationKey,
+        };
+        use crate::rlwe::ErrorDistribution;
+
+        let profile = research_profile_4096();
+        let chain = profile.modulus_chain();
+        let degree = profile.degree();
+        let scale = 34_359_738_368.0_f64;
+        let basis = chain.top().clone();
+        let top_plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let embedding = CkksCanonicalEmbedding::new(degree);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let slot_count = degree / 2;
+
+        let lhs_slots: Vec<Complex64> = (0..slot_count)
+            .map(|index| {
+                let x = index as f64;
+                Complex64::new(0.10 + 0.00002 * x, -0.08 + 0.00001 * x)
+            })
+            .collect();
+
+        let rhs_slots: Vec<Complex64> = (0..slot_count)
+            .map(|index| {
+                let x = index as f64;
+                Complex64::new(-0.15 + 0.000015 * x, 0.12 - 0.000008 * x)
+            })
+            .collect();
+
+        let encode_rns = |slots: &[Complex64]| {
+            let coefficients = embedding.slots_to_coefficients(slots);
+
+            let residues = basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    let q = i128::from(modulus.value());
+
+                    Polynomial::new(
+                        modulus,
+                        coefficients
+                            .iter()
+                            .map(|&value| {
+                                let signed = (value * scale).round() as i128;
+
+                                signed.rem_euclid(q) as u64
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            RnsPolynomial::from_residues(residues)
+        };
+
+        let lhs_plaintext = encode_rns(&lhs_slots);
+        let rhs_plaintext = encode_rns(&rhs_slots);
+
+        let mut lhs_rng = ChaCha20Rng::seed_from_u64(0x31B3_0001);
+        let mut rhs_rng = ChaCha20Rng::seed_from_u64(0x31B3_0002);
+
+        let lhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &lhs_plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &top_plan,
+            &mut lhs_rng,
+        );
+
+        let rhs_rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &rhs_plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &top_plan,
+            &mut rhs_rng,
+        );
+
+        let lhs = RnsCkksCiphertext::new(lhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let rhs = RnsCkksCiphertext::new(rhs_rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let quadratic = rns_tensor_with_ntt(lhs.rlwe(), rhs.rlwe(), &top_plan);
+
+        let expected = reference_slot_product(&lhs_slots, &rhs_slots);
+
+        let tolerance = 1.0e-3_f64;
+
+        println!("R3_1B3_PROFILE={}", profile.name());
+        println!("R3_1B3_RING_DEGREE={degree}");
+        println!("R3_1B3_SLOT_COUNT={slot_count}");
+        println!("R3_1B3_INPUT_SCALE={scale:.17e}");
+        println!("R3_1B3_TOLERANCE={tolerance:.12e}");
+
+        for base_log in [4_u32, 8, 12, 16, 20] {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+
+            let key_start = Instant::now();
+
+            let mut key_rng = ChaCha20Rng::seed_from_u64(0x31B3_1000 + u64::from(base_log));
+
+            let multiplication_key =
+                BoundedRnsMultiplicationKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: layout.clone(),
+                        plan: &top_plan,
+                    },
+                    &secret,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    &mut key_rng,
+                );
+
+            let keygen_us = key_start.elapsed().as_secs_f64() * 1.0e6;
+
+            let relin_start = Instant::now();
+
+            let relinearized =
+                bounded_rns_relinearize_with_ntt(&quadratic, &multiplication_key, &top_plan);
+
+            let relinearize_us = relin_start.elapsed().as_secs_f64() * 1.0e6;
+
+            let product_state = lhs.state().after_multiply(rhs.state(), &chain);
+
+            let product = RnsCkksCiphertext::new(relinearized, product_state, &chain);
+
+            let rescaled = rescale_rns_ckks_to_next(&product, &chain);
+
+            let result_plan = RnsNttPlan::new(rescaled.rlwe().basis().moduli().to_vec(), degree);
+
+            let decrypted = decrypt_rns_raw_with_ntt(rescaled.rlwe(), &secret, &result_plan);
+
+            let modulus = decrypted.composite_modulus();
+            let output_scale = rescaled.scale();
+
+            let decoded_coefficients: Vec<f64> = decrypted
+                .reconstruct_coefficients()
+                .into_iter()
+                .map(|value| centered(value, modulus) as f64 / output_scale)
+                .collect();
+
+            let observed = embedding.coefficients_to_slots(&decoded_coefficients);
+
+            let mut max_error = 0.0_f64;
+            let mut sum_error = 0.0_f64;
+            let mut sum_squared_error = 0.0_f64;
+
+            for (&actual, &reference) in observed.iter().zip(&expected) {
+                let error = (actual - reference).norm();
+
+                max_error = max_error.max(error);
+                sum_error += error;
+                sum_squared_error += error * error;
+            }
+
+            let mean_error = sum_error / observed.len() as f64;
+
+            let rms_error = (sum_squared_error / observed.len() as f64).sqrt();
+
+            let status = if max_error <= tolerance {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+
+            println!(
+                "R3_1B3_BASE_LOG={base_log} \
+                 BASE={} \
+                 DIGITS={} \
+                 KEYGEN_US={keygen_us:.3} \
+                 RELINEARIZE_US={relinearize_us:.3} \
+                 OUTPUT_SCALE={output_scale:.17e} \
+                 MAX_SLOT_ERROR={max_error:.12e} \
+                 MEAN_SLOT_ERROR={mean_error:.12e} \
+                 RMS_SLOT_ERROR={rms_error:.12e} \
+                 STATUS={status}",
+                layout.base(),
+                layout.digit_count(),
+            );
+
+            assert!(
+                max_error <= tolerance,
+                "bounded Gaussian CKKS multiplication exceeded \
+                 tolerance for base_log={base_log}: \
+                 error={max_error:e}"
+            );
+        }
+
+        println!("R3_1B3_BOUNDED_GAUSSIAN_CKKS_SWEEP=PASS");
+    }
 }
