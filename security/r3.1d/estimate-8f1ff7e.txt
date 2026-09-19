@@ -1,0 +1,159 @@
+================================================================================
+LEVEL=0
+N=4096
+Q=40564045502413384804664457166849
+SIGMA=3.19
+SECRET=uniform-ternary
+OBSERVED_RLWE_EVALUATION_KEY_SAMPLES=6
+ESTIMATOR_M=oo
+COST_MODEL=RC.MATZOV
+NOTE=RLWE evaluation-key sample count is recorded but is not mapped directly to scalar LWE m
+================================================================================
+
+--- primal_usvp ---
+         rop: ≈2^130.8
+         red: ≈2^130.8
+           δ: 1.004399
+           β:      346
+           d:     7853
+         tag:     usvp
+
+--- primal_bdd ---
+         rop: ≈2^130.3
+         red: ≈2^130.0
+         svp: ≈2^127.7
+           β:      343
+           η:      381
+           d:     8046
+         tag:      bdd
+
+--- dual_hybrid ---
+         rop: ≈2^130.8
+         red: ≈2^130.8
+       guess: ≈2^117.7
+           β:      342
+           p:        3
+           ζ:       10
+           t:       50
+          β':      361
+           N: ≈2^73.5
+           m: ≈2^12.0
+
+--- primal_hybrid ---
+         rop: ≈2^189.0
+         red: ≈2^188.0
+         svp: ≈2^187.9
+           β:      345
+           η:        2
+           ζ:      132
+         |S|: ≈2^209.2
+           d:     8102
+        prob: ≈2^-55.2
+           ↻: ≈2^57.4
+         tag:   hybrid
+================================================================================
+LEVEL=1
+N=4096
+Q=1180580361798806077441
+SIGMA=3.19
+SECRET=uniform-ternary
+OBSERVED_RLWE_EVALUATION_KEY_SAMPLES=4
+ESTIMATOR_M=oo
+COST_MODEL=RC.MATZOV
+NOTE=RLWE evaluation-key sample count is recorded but is not mapped directly to scalar LWE m
+================================================================================
+
+--- primal_usvp ---
+         rop: ≈2^204.0
+         red: ≈2^204.0
+           δ: 1.002954
+           β:      609
+           d:     8022
+         tag:     usvp
+
+--- primal_bdd ---
+         rop: ≈2^203.2
+         red: ≈2^203.1
+         svp: ≈2^199.2
+           β:      606
+           η:      638
+           d:     7932
+         tag:      bdd
+
+--- dual_hybrid ---
+         rop: ≈2^202.0
+         red: ≈2^201.9
+       guess: ≈2^198.0
+           β:      598
+           p:        3
+           ζ:       10
+           t:      100
+          β':      601
+           N: ≈2^124.7
+           m: ≈2^12.0
+
+--- primal_hybrid ---
+         rop: ≈2^301.3
+         red: ≈2^300.5
+         svp: ≈2^300.0
+           β:      609
+           η:        2
+           ζ:      224
+         |S|: ≈2^355.0
+           d:     7986
+        prob: ≈2^-94.4
+           ↻: ≈2^96.6
+         tag:   hybrid
+================================================================================
+LEVEL=2
+N=4096
+Q=34359697409
+SIGMA=3.19
+SECRET=uniform-ternary
+OBSERVED_RLWE_EVALUATION_KEY_SAMPLES=2
+ESTIMATOR_M=oo
+COST_MODEL=RC.MATZOV
+NOTE=RLWE evaluation-key sample count is recorded but is not mapped directly to scalar LWE m
+================================================================================
+
+--- primal_usvp ---
+         rop: ≈2^443.4
+         red: ≈2^443.4
+           δ: 1.001524
+           β:     1464
+           d:     7665
+         tag:     usvp
+
+--- primal_bdd ---
+         rop: ≈2^441.3
+         red: ≈2^441.2
+         svp: ≈2^437.3
+           β:     1456
+           η:     1487
+           d:     7800
+         tag:      bdd
+
+--- dual_hybrid ---
+         rop: ≈2^428.5
+         red: ≈2^428.3
+       guess: ≈2^425.6
+           β:     1406
+           p:        3
+           ζ:       20
+           t:      230
+          β':     1366
+           N: ≈2^282.0
+           m: ≈2^12.0
+
+--- primal_hybrid ---
+         rop: ≈2^676.0
+         red: ≈2^675.2
+         svp: ≈2^674.9
+           β:     1465
+           η:        2
+           ζ:      527
+         |S|: ≈2^835.3
+           d:     7554
+        prob: ≈2^-229.3
+           ↻: ≈2^231.5
+         tag:   hybrid
