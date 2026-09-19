@@ -459,6 +459,56 @@ target/release/rns_ccmm_bench 4
 Additional validation and characterization tooling is available under
 `tools/`, `scripts/`, `security/`, and `results/`.
 
+## R3.2 Applications
+
+The realistic N=4096 CKKS substrate now supports both ciphertext-plaintext and
+ciphertext-ciphertext matrix workloads.
+
+| Application | Primitive | Private operands | Evaluation key | Reference |
+|---|---|---|---|---|
+| Private linear inference | CPMM | encrypted input, plaintext weights | no | `src/bin/private_linear_inference.rs` |
+| Private two-party matrix product | CCMM | both matrices encrypted | yes | `src/bin/private_two_party_matrix_product.rs` |
+
+### Private linear inference
+
+The CPMM application evaluates an encrypted feature vector against plaintext
+model weights. Since plaintext multiplication preserves degree-one RLWE, the
+path requires neither relinearization nor an evaluation key.
+
+```text
+cargo run --release --bin private_linear_inference
+```
+
+### Private two-party matrix product
+
+The CCMM application evaluates a matrix product with both operands encrypted.
+It uses the R3.1 bounded-base Gaussian relinearization path:
+
+```text
+BOUNDED_BASE_LOG=20
+CIPHERTEXT_ERROR_SIGMA=3.19
+EVALUATION_KEY_ERROR_SIGMA=3.19
+```
+
+```text
+cargo run --release --bin private_two_party_matrix_product
+```
+
+The final 2x2 validation reports maximum matrix error below `1e-9`, well inside
+the current `2e-3` numerical acceptance threshold.
+
+Application evidence is retained under:
+
+```text
+results/r3.2a/
+results/r3.2b/
+results/r3.2c/
+results/r3.2d/
+```
+
+See `docs/APPLICATIONS.md` for the application-facing summary and
+`docs/SECURITY_AND_PARAMETERS.md` for the security claim boundary.
+
 ## Repository Organization
 
 The principal source areas are:
