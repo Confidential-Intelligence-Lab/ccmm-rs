@@ -142,6 +142,50 @@ where
             .collect()
     }
 
+    /// Correctness/reference path for consuming one logical composite level.
+    ///
+    /// `drop_count` trailing physical RNS limbs are treated as one logical
+    /// divisor. The exact canonical coefficients are reconstructed with
+    /// arbitrary precision, divided by the product of the complete trailing
+    /// group, and re-encoded in the surviving physical basis.
+    ///
+    /// This deliberately favors semantic validation over performance. A future
+    /// optimized path can implement the same transition residue-natively.
+    pub fn rescale_drop_trailing_reference(&self, drop_count: usize) -> Self
+    where
+        A: Clone,
+    {
+        assert!(
+            drop_count > 0,
+            "logical composite rescale must drop at least one physical limb"
+        );
+        assert!(
+            drop_count < self.limb_count(),
+            "logical composite rescale must retain at least one physical limb"
+        );
+
+        let keep_count = self.limb_count() - drop_count;
+        let divisor =
+            self.residues[keep_count..]
+                .iter()
+                .fold(BigUint::one(), |product, residue| {
+                    product * BigUint::from(A::word_to_u128(residue.arithmetic().modulus()))
+                });
+
+        let coefficients = self
+            .reconstruct_coefficients_big()
+            .into_iter()
+            .map(|value| value / &divisor)
+            .collect::<Vec<_>>();
+
+        let arithmetic = self.residues[..keep_count]
+            .iter()
+            .map(|residue| residue.arithmetic().clone())
+            .collect();
+
+        Self::from_big_coefficients(arithmetic, &coefficients)
+    }
+
     pub fn add(&self, rhs: &Self) -> Self {
         self.assert_compatible(rhs);
 
