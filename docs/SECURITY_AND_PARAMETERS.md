@@ -1,385 +1,365 @@
 # Security and Parameter Model
 
-This document defines the security and parameter-claim boundary for the
-current `ccmm-rs` Roadmap-2 research implementation.
+This document defines the current security and parameter-claim boundary for
+`ccmm-rs`.
 
-`ccmm-rs` is a correctness-first research artifact. The presence of
-realistic ring dimensions, RNS modulus chains, discrete-Gaussian
-ciphertext error, and security-analysis tooling does **not** by itself
-imply that the current parameter profiles are production-security
-parameter sets.
+`ccmm-rs` is a correctness-first research implementation. Security claims are
+therefore separated into:
 
-## Parameter Classes
+1. parameter-security evidence for the underlying RLWE problem;
+2. numerical validation of the concrete CKKS evaluation path; and
+3. implementation-security properties required for production deployment.
 
-The CKKS parameter infrastructure distinguishes correctness-oriented and
-research-oriented configurations.
+Evidence in one category does not automatically establish the others.
 
-The current realistic research profiles are:
+## Research Parameter Profiles
 
-  ---------------------------------------------------------------------------------
-  Profile               Ring degree  Initial scale   Modulus-chain        Published
-                                                             shape          128-bit
-                                                                          classical
-                                                                     modulus-budget
-                                                                          reference
-  ------------------ -------------- -------------- --------------- ----------------
-  `research-4096`              4096         `2^35`    3 × \~35-bit       \~106 bits
-                                                            primes 
+The realistic CKKS profiles are:
 
-  `research-8192`              8192         `2^40`    5 × \~40-bit       \~214 bits
-                                                            primes 
+| Profile | Ring degree | Initial scale | Modulus chain | Published 128-bit classical budget reference |
+|---|---:|---:|---:|---:|
+| `research-4096` | 4096 | `2^35` | 3 x ~35-bit primes | ~106 bits |
+| `research-8192` | 8192 | `2^40` | 5 x ~40-bit primes | ~214 bits |
+| `research-16384` | 16384 | `2^45` | 9 x ~45-bit primes | ~430 bits |
 
-  `research-16384`            16384         `2^45`    9 × \~45-bit       \~430 bits
-                                                            primes 
-  ---------------------------------------------------------------------------------
+The published budget values are engineering references under their stated
+secret, error, and estimator assumptions. They are not independent proofs of
+the complete `ccmm-rs` cryptosystem.
 
-The modulus-budget reference values above correspond to the published
-FHE security-guideline methodology used during Roadmap R2.9 under the
-stated uniform-ternary-secret assumptions.
+R3.1 performs direct security analysis only for `research-4096`. The larger
+profiles remain unvalidated by the equivalent R3.1 workflow.
 
-They are **budget references**, not independent security proofs for the
-complete `ccmm-rs` cryptosystem.
+## Research-4096 Security Model
 
-The current profiles remain:
+The validated parameter-security model for `research-4096` is:
 
-``` text
-SECURITY_BEARING=false
-```
-
-and their `security_model` is intentionally unset.
-
-## Current Research-4096 Profile
-
-The N=4096 profile used for realistic encrypted matrix-multiplication
-characterization has:
-
-``` text
+```text
 PROFILE=research-4096
 RING_DEGREE=4096
 SLOT_COUNT=2048
 CHAIN_LEVELS=3
-TOTAL_MODULUS_BITS=105
-INPUT_SCALE=2^35
-PARAMETER_CLASS=Research
-SECURITY_BEARING=false
+TOP_LEVEL_Q_BITS=105
+INITIAL_SCALE=2^35
+SECRET_DISTRIBUTION=uniform-ternary
+ERROR_DISTRIBUTION=discrete-Gaussian
+ERROR_SIGMA=3.19
+TARGET_CLASSICAL_SECURITY_BITS=128
+ESTIMATOR=Lattice Estimator
+REDUCTION_COST_MODEL=RC.MATZOV
 ```
 
-Its modulus chain is constructed from three approximately 35-bit
-NTT-friendly primes.
+The corresponding `CkksSecurityModel` records these assumptions explicitly.
 
-The aggregate top-chain modulus is approximately 105 bits, leaving only
-a small margin relative to the published 128-bit classical
-modulus-budget reference used in the R2.9 methodology.
+The security model describes the underlying RLWE parameterization. It must not
+be interpreted as a blanket statement that every execution path using the
+profile has equivalent security properties.
 
-This comparison is useful for parameter engineering, but it must not be
-presented as a blanket 128-bit security claim.
+## Secret and Error Distributions
 
-## Security-Model Representation
+The security analysis assumes a uniform ternary secret with coefficients in:
 
-The Roadmap-2 parameter model can represent security assumptions
-explicitly through:
-
-``` rust
-pub enum CkksSecretDistribution {
-    UniformTernary,
-}
-
-pub enum CkksErrorDistribution {
-    DiscreteGaussian { sigma: f64 },
-}
-
-pub struct CkksSecurityModel {
-    pub classical_security_bits: u32,
-    pub secret_distribution: CkksSecretDistribution,
-    pub error_distribution: CkksErrorDistribution,
-    pub estimator: &'static str,
-    pub reduction_cost_model: &'static str,
-}
-```
-
-A parameter profile is considered security-bearing only when an explicit
-security model is attached to it.
-
-The current realistic profiles deliberately do not attach one.
-
-## Secret Distribution
-
-The research implementation uses ternary secrets with coefficients in:
-
-``` text
+```text
 {-1, 0, +1}
 ```
 
-with all-zero secrets rejected in the normal secret-generation path.
+and discrete-Gaussian error with:
 
-The security-guideline comparison used during R2.9 was based on the
-published uniform-ternary-secret model.
-
-Deterministic ternary secrets used in tests, examples, and
-reproducibility benchmarks are functional test fixtures. They are
-**not** evidence that those deterministic secrets instantiate the
-assumed security distribution.
-
-## Error Distributions
-
-The RLWE infrastructure supports an explicit error-distribution
-abstraction:
-
-``` rust
-pub enum ErrorDistribution {
-    BoundedUniform { bound: i64 },
-    DiscreteGaussian { sigma: f64 },
-}
+```text
+sigma = 3.19
 ```
 
-The older `noise_bound` mechanism remains available as a
-correctness/reference substrate.
+Deterministic secrets used in tests and reproducibility benchmarks are
+functional fixtures and are not evidence that those fixtures instantiate the
+assumed secret distribution.
 
-For the current realistic ciphertext validation, the research
-configuration uses:
+RNS encryption samples one logical integer error coefficient and projects that
+same error into every residue limb. This preserves the interpretation of a
+single small RLWE error under CRT reconstruction.
 
-``` text
-DiscreteGaussian { sigma: 3.19 }
+The current Gaussian sampler uses floating-point probability calculations and
+data-dependent sampling behavior. It is research infrastructure and is not
+presented as a hardened constant-time production sampler.
+
+## R3.1 Evaluation-Key Architecture
+
+Roadmap R2.9 localized a major numerical failure in the original CRT-residue
+evaluation-key path:
+
+```text
+Gaussian ciphertext + zero-noise evaluation key    -> stable
+zero-noise ciphertext + Gaussian evaluation key    -> unstable
 ```
 
-The Gaussian sampler is intended for research validation. It currently
-uses floating-point probability calculations and data-dependent sampling
-behavior and is not presented as a hardened constant-time production
-sampler.
+R3.1a subsequently quantified the source of the amplification. Canonical CRT
+residue digits remain close to the size of the RNS primes even when the CRT
+partition is made finer, causing evaluation-key error to be multiplied by
+large gadget digits.
 
-## Shared RNS Error Semantics
+R3.1 therefore retains the original CRT gadget as a correctness and
+differential-testing path but does not use it as the current noisy
+security-oriented reference.
 
-RNS encryption samples one logical integer error coefficient and
-projects that same error into every RNS limb.
+## Bounded-Base Key Switching
 
-This is important: independently sampling unrelated error values in each
-residue limb would not represent a single small RLWE error under CRT
-reconstruction.
+R3.1b introduced balanced signed bounded-base decomposition:
 
-Uniform `a` values may be sampled independently in each RNS limb because
-the resulting residues represent a uniform value in the CRT product
-ring.
+```text
+B = 2^w
+x = sum_j d_j B^j
+|d_j| <= B/2
+```
 
-## Gaussian Ciphertext Validation
+For `research-4096`, the characterized candidate radices were:
 
-Roadmap R2.9 validated Gaussian ciphertext encryption on the realistic
-N=4096 CKKS path.
+| base_log | Digit count | Statistical trials | Result |
+|---:|---:|---:|---|
+| 8 | 14 | 10 | PASS |
+| 12 | 9 | 10 | PASS |
+| 16 | 7 | 10 | PASS |
+| 20 | 6 | 10 | PASS |
 
-The validated scope includes:
+All 40 end-to-end CKKS executions passed the `1e-3` numerical tolerance with
+Gaussian ciphertext error and Gaussian evaluation-key error at `sigma=3.19`.
 
-``` text
+The selected N=4096 reference operating point is:
+
+```text
+BOUNDED_BASE_LOG=20
+BOUNDED_BASE=1048576
+TOP_LEVEL_BOUNDED_DIGITS=6
+```
+
+This selection minimizes measured key-generation and relinearization cost
+among the characterized candidates while retaining substantial numerical
+margin. It is an engineering choice, not by itself a security proof.
+
+## Modulus and Public-Sample Exposure
+
+The bounded-base reference construction operates directly over the active CKKS
+`Q` basis. It introduces no auxiliary special modulus `P`.
+
+Exact exposure accounting is:
+
+| Level | Composite Q | Q bits | Evaluation-key RLWE samples |
+|---:|---:|---:|---:|
+| 0 | 40564045502413384804664457166849 | 105 | 6 |
+| 1 | 1180580361798806077441 | 70 | 4 |
+| 2 | 34359697409 | 35 | 2 |
+
+Therefore:
+
+```text
+AUXILIARY_MODULUS_PRESENT=false
+```
+
+No `P/Q` term is omitted from this bounded-base construction because no `P`
+exists in this path.
+
+A future special-modulus or hybrid key-switch implementation would require
+fresh accounting for every additional exposed modulus.
+
+## Lattice Estimator Validation
+
+R3.1d evaluates the exact `research-4096` active moduli using:
+
+```text
+Lattice Estimator revision:
+8f1ff7e20a4d3391e3badff1d76825314db225bc
+
+reduction cost model:
+RC.MATZOV
+
+dimension:
+n = 4096
+
+secret:
+uniform ternary
+
+error:
+discrete Gaussian, sigma = 3.19
+
+estimator sample model:
+m = oo
+```
+
+The number of exposed RLWE evaluation-key ciphertexts is recorded separately.
+It is not incorrectly mapped to the estimator's scalar-LWE `m` parameter.
+
+Observed estimates are:
+
+| Level | Primal USVP | Primal BDD | Dual hybrid | Primal hybrid |
+|---:|---:|---:|---:|---:|
+| 0 | 130.8 | 130.3 | 130.8 | 189.0 |
+| 1 | 204.0 | 203.2 | 202.0 | 301.3 |
+| 2 | 443.4 | 441.3 | 428.5 | 676.0 |
+
+The binding result is:
+
+```text
+TARGET_BITS=128
+BINDING_LEVEL=0
+BINDING_ATTACK=primal_bdd
+BINDING_ESTIMATE_BITS=130.3
+SECURITY_MARGIN_BITS=2.3
+R3_1D_ESTIMATOR_GATE=PASS
+```
+
+Accordingly, the underlying uniform-ternary-secret RLWE parameterization meets
+the targeted 128-bit classical-security gate under the documented Lattice
+Estimator methodology and MATZOV reduction-cost model.
+
+This is the precise parameter-security claim.
+
+## Circular/KDM Claim Boundary
+
+The bounded multiplication key contains RLWE encryptions of secret-dependent
+values of the form:
+
+```text
+B^j * s^2
+```
+
+The Lattice Estimator analysis characterizes the underlying RLWE hardness. It
+does not independently prove circular/KDM security for these secret-dependent
+evaluation-key messages.
+
+The bounded-base evaluation-key construction is supported separately by the
+R3.1 correctness, decomposition, noise, and end-to-end numerical evidence.
+
+Consequently, `ccmm-rs` does not claim an independent proof of circular/KDM
+security for the evaluation-key construction.
+
+## End-to-End Bounded Gaussian CKKS
+
+R3.1 validates the following realistic pipeline at N=4096:
+
+```text
 canonical CKKS encode
--> Gaussian-noise RNS encryption
--> NTT-backed ciphertext multiplication
--> relinearization with a zero-noise evaluation key
--> rescale
+-> Gaussian RNS encryption
+-> NTT ciphertext multiplication
+-> bounded-base Gaussian relinearization
+-> CKKS rescale
 -> RNS decryption
 -> canonical CKKS decode
 ```
 
-A representative validated run used:
+Both ciphertext and evaluation-key errors use:
 
-``` text
+```text
+DiscreteGaussian { sigma: 3.19 }
+```
+
+The bounded-base path passes the numerical validation gates across the
+characterized radices and randomized trials.
+
+## Realistic N=4096 CCMM
+
+R3.1e extends the bounded-Gaussian path to direct encrypted
+ciphertext-ciphertext matrix multiplication.
+
+The validated 2x2 experiment uses:
+
+```text
 PROFILE=research-4096
-GAUSSIAN_ENCRYPTION_SIGMA=3.19
-INPUT_SCALE=34359738368
-OUTPUT_SCALE≈34360066050.125
-MAX_SLOT_ERROR≈1.36e-6
-STATUS=PASS
+RING_DEGREE=4096
+SLOT_COUNT=2048
+BOUNDED_BASE_LOG=20
+CIPHERTEXT_ERROR_SIGMA=3.19
+EVALUATION_KEY_ERROR_SIGMA=3.19
+SCALAR_CKKS_MULTIPLIES=8
+CIPHERTEXT_ADDITIONS=4
 ```
 
-R2.10 subsequently used Gaussian ciphertext encryption with `sigma=3.19`
-for realistic N=4096 encrypted matrix multiplication.
+A representative final run reports:
 
-## Evaluation-Key Limitation
-
-The current security-bearing limitation is concentrated in the
-evaluation-key/relinearization path.
-
-R2.9 performed an A/B localization experiment:
-
-``` text
-Case A:
-Gaussian-noise ciphertexts
-+ zero-noise multiplication key
--> numerically stable
-
-Case B:
-zero-noise ciphertexts
-+ Gaussian-noise multiplication key
--> unacceptable numerical amplification
+```text
+MAX_MATRIX_ERROR=8.555989805537e-10
+MAX_IMAGINARY_RESIDUAL=2.512294996312e-7
+TOLERANCE=2.000000000000e-3
+R3_1E3_BOUNDED_CCMM_STATUS=PASS
 ```
 
-Case A produced slot error on the order of `1e-6`.
+The executable deliberately reports:
 
-Case B produced error on the order of `1e5`.
-
-The experiment therefore localized the current numerical failure to the
-noisy evaluation-key/relinearization path.
-
-The evidence is consistent with excessive noise amplification in the
-current evaluation-key/gadget construction, but `ccmm-rs` does not claim
-a more specific root cause without a complete decomposition analysis.
-
-For this reason, current realistic examples and characterization use:
-
-``` text
-EVALUATION_KEY_NOISE_BOUND=0
+```text
+UNDERLYING_RLWE_TARGET_SECURITY_BITS=128
+CIRCULAR_KDM_ASSUMPTION=required
+HARDENED_SAMPLER=false
 ```
 
-This is an explicit documented limitation.
+rather than describing the complete execution as unconditionally
+"128-bit secure."
 
-## Deferred Evaluation-Key Work
+## Current Claim
 
-A security-bearing evaluation-key path remains future work.
+The supported R3.1 statement is:
 
-Likely design directions include a conventional bounded-base
-decomposition or a hybrid/special-modulus key-switch construction.
+> The `research-4096` underlying uniform-ternary-secret RLWE parameterization
+> meets the targeted 128-bit classical-security gate under the documented
+> Lattice Estimator methodology and MATZOV cost model. The N=4096 bounded-base
+> CKKS evaluation path has been validated end-to-end with discrete-Gaussian
+> ciphertext and evaluation-key error at sigma 3.19, including realistic
+> ciphertext-ciphertext matrix multiplication.
 
-Any such design must include:
-
--   explicit gadget/decomposition semantics;
--   evaluation-key noise analysis;
--   complete auxiliary-modulus accounting;
--   correct `P/Q` treatment where a special modulus is used;
--   numerical validation across supported levels;
--   security-estimator accounting for the complete modulus exposure;
--   regression against the current correctness/reference path.
-
-No current documentation should imply that this work has already been
-completed.
-
-## Auxiliary-Modulus Accounting
-
-Security estimates must account for every modulus exposed by the
-cryptographic construction.
-
-The current R2.9 security work explicitly leaves complete auxiliary
-`P/Q` accounting deferred until the evaluation-key/key-switch
-architecture is finalized.
-
-Therefore, the top CKKS ciphertext modulus `Q` alone must not be treated
-as sufficient evidence for a production security designation if future
-key switching introduces additional modulus exposure.
-
-## Published Security-Guideline Methodology
-
-The primary parameter-budget methodology used during R2.9 follows the
-FHE security-guideline work supplied with the project.
-
-The relevant methodology uses the Lattice Estimator with:
-
-``` text
-reduction cost model: RC.MATZOV
-estimator commit: 8f1ff7e
-```
-
-and evaluates attacks including primal and dual families under the
-assumptions specified by the guideline methodology.
-
-For a uniform ternary secret, the published 128-bit classical maximum
-`log2(q)` reference values used during R2.9 were approximately:
-
-``` text
-N=4096   -> 106 bits
-N=8192   -> 214 bits
-N=16384  -> 430 bits
-```
-
-These values are meaningful only under their associated assumptions and
-methodology.
-
-They should not be detached from those assumptions and presented as
-universal security thresholds.
-
-## Lattice Estimator Tooling
-
-The repository security workflow supports direct Lattice Estimator
-evaluation for experimental or alternative parameter sets.
-
-The intended wording for the current artifact is:
-
-> Standard parameter profiles are selected against published FHE
-> security guidelines under their stated assumptions. The `ccmm-rs`
-> security-analysis tooling additionally supports direct Lattice
-> Estimator evaluation for experimental or alternative parameter sets.
-
-Direct estimator runs are analysis evidence. They do not replace the
-need to specify the complete cryptographic construction, secret/error
-distributions, modulus exposure, attack model, and estimator provenance.
-
-## What Is Validated
-
-The current Roadmap-2 evidence supports the following statements:
-
--   realistic N=4096/8192/16384 research parameter profiles exist;
--   their modulus-chain sizes can be compared with published
-    security-guideline budgets;
--   canonical CKKS encoding/decoding works at realistic N;
--   optimized RNS/NTT arithmetic works at realistic N;
--   Gaussian ciphertext error with `sigma=3.19` is numerically viable on
-    the validated N=4096 path;
--   one logical Gaussian error is consistently projected across RNS
-    limbs;
--   NTT-backed multiply/relinearize/rescale works with the current
-    zero-noise evaluation-key path;
--   realistic N=4096 2x2 and 4x4 encrypted matrix multiplication passes
-    the current numerical validation gates;
--   the noisy evaluation-key failure has been experimentally localized.
+This statement is intentionally narrower than a production-security claim.
 
 ## What Is Not Claimed
 
 The current artifact does **not** claim:
 
--   a production-ready 128-bit-secure CKKS instantiation;
--   that `research-4096`, `research-8192`, or `research-16384` are
-    security-bearing profiles;
--   a hardened or constant-time Gaussian sampler;
--   security-valid noisy evaluation keys;
--   complete special-modulus or auxiliary-modulus security accounting;
--   resistance to implementation-level side channels;
--   third-party cryptographic or security audit;
--   production deployment readiness.
+- an independent proof of circular/KDM security for evaluation keys encrypting
+  secret-dependent messages;
+- a hardened or constant-time Gaussian sampler;
+- implementation-level side-channel resistance;
+- that the R3.1 analysis automatically applies to `research-8192` or
+  `research-16384`;
+- that every legacy/reference evaluation path has the same security properties
+  as the bounded-base path;
+- third-party cryptographic or implementation audit;
+- production deployment readiness.
 
-## Evidence and Reproducibility
+## Evidence and Provenance
 
-Security/noise evidence and tooling are retained under:
+The principal R3.1 evidence is retained under:
 
-``` text
+```text
+results/r3.1a/
+results/r3.1b/
+security/r3.1c/
+security/r3.1d/
+results/r3.1e/
+```
+
+Historical R2.9 and R2.10 artifacts remain unchanged. Statements such as
+`SECURITY_BEARING=false` and zero-noise evaluation-key measurements in those
+artifacts describe the implementation state at the time those experiments
+were frozen; they are retained as provenance rather than rewritten
+retroactively.
+
+The original R2.9 evidence remains under:
+
+```text
 security/r2.9b/
 ```
 
-Important artifacts include the R2.9 security/noise validation summary,
-parameter inventory and analysis tooling, and the A/B evaluation-key
-diagnostics.
+and the original realistic matrix characterization remains under:
 
-Realistic matrix-characterization evidence is retained under:
-
-``` text
+```text
 results/r2.10/
 ```
 
-The public README intentionally mirrors the claim boundaries defined
-here.
+## Implementation Status
 
-## Release Gate for a Future Security-Bearing Profile
+R3.1 status is:
 
-A future profile should not be designated security-bearing until, at
-minimum:
+```text
+R3.1a  CRT evaluation-key noise localization          DONE
+R3.1b  bounded-base Gaussian key switching             DONE
+R3.1c  exact security-exposure accounting              DONE
+R3.1d  Lattice Estimator validation                    DONE
+R3.1e  security model + bounded execution + N4096 CCMM DONE
+```
 
-1.  the complete encryption and evaluation-key distributions are
-    specified;
-2.  the evaluation-key/key-switch construction is noise viable;
-3.  all ciphertext and auxiliary moduli are included in security
-    accounting;
-4.  the full parameter set is evaluated under a documented estimator
-    version and cost model;
-5.  the assumptions match the intended secret and error distributions;
-6.  realistic end-to-end numerical tests pass with those
-    security-bearing distributions;
-7.  implementation-level sampler and secret-handling requirements are
-    addressed;
-8.  the security claim is independently reviewed.
-
-Until those conditions are met, the realistic profiles remain research
-profiles and `SECURITY_BEARING=false` remains the correct designation.
+R3.1 establishes a quantitatively characterized bounded-base reference path.
+Further hardening, additional parameter profiles, alternative key-switch
+architectures, and independent review remain separate work.

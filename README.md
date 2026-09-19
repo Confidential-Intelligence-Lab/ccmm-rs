@@ -223,56 +223,39 @@ claim.
 
 ## Security Model and Current Security Scope
 
-`ccmm-rs` distinguishes correctness/research parameters from
-security-bearing parameter sets.
+`ccmm-rs` separates underlying RLWE parameter security from the security
+properties of a complete execution path.
 
-The security-analysis work uses published FHE security-guideline
-methodology as the primary parameter-selection reference and provides
-tooling for direct Lattice Estimator evaluation of experimental or
-alternative parameter sets.
+For `research-4096`, R3.1 validates the underlying uniform-ternary-secret RLWE
+parameterization against a 128-bit classical target using Lattice Estimator
+revision `8f1ff7e` and the `RC.MATZOV` reduction-cost model. The binding
+estimated work factor is approximately `2^130.3`.
 
-The current realistic CCMM benchmark deliberately reports:
+R3.1 also introduces a bounded-base evaluation-key path with `base_log=20`.
+At N=4096, discrete-Gaussian ciphertext and evaluation-key errors with
+`sigma=3.19` pass end-to-end multiply/relinearize/rescale validation and a
+realistic 2x2 ciphertext-ciphertext matrix-multiplication experiment.
 
-``` text
-PARAMETER_CLASS=Research
-SECURITY_BEARING=false
-```
+The current claim boundary remains explicit:
 
-Ciphertext encryption in the R2.10 N=4096 characterization uses:
+- the estimator result characterizes the underlying RLWE parameterization;
+- evaluation keys encrypt secret-dependent values and therefore retain an
+  explicit circular/KDM assumption;
+- the Gaussian sampler is research infrastructure and is not hardened or
+  constant-time;
+- the equivalent R3.1 security workflow has not yet been applied to the
+  N=8192 and N=16384 research profiles;
+- legacy CRT-gadget and historical zero-noise evaluation-key paths remain
+  correctness/provenance paths rather than the bounded security-oriented
+  reference;
+- no third-party security audit has been performed.
 
-``` text
-ErrorDistribution::DiscreteGaussian { sigma: 3.19 }
-```
+Historical R2.9/R2.10 artifacts retain the security designations and
+zero-noise evaluation-key measurements that were correct when those
+experiments were frozen.
 
-However, the current evaluation-key path is generated with:
-
-``` text
-EVALUATION_KEY_NOISE_BOUND=0
-```
-
-This is an explicit limitation, not an implicit security claim.
-
-During Roadmap R2.9, Gaussian ciphertext encryption was validated
-independently, while Gaussian noise in the current
-evaluation-key/relinearization construction produced unacceptable
-numerical amplification. That behavior was localized to the
-evaluation-key/relinearization path. A production-style bounded-base or
-hybrid/special-modulus key-switch construction, together with complete
-auxiliary-modulus accounting, remains future work.
-
-Consequently:
-
--   the realistic profiles remain research profiles;
--   `security_bearing()` remains false for the current characterized
-    profiles;
--   the repository does not claim a production-ready 128-bit-secure CKKS
-    instantiation;
--   the current Gaussian sampler is research infrastructure rather than
-    a hardened constant-time sampler;
--   no third-party security audit has been performed.
-
-See `security/r2.9b/` for the security/noise validation evidence and
-provenance.
+See `docs/SECURITY_AND_PARAMETERS.md`, `security/r3.1d/`, and
+`results/r3.1e/` for the current claim boundary and supporting evidence.
 
 ## Reference End-to-End Correctness
 
@@ -507,10 +490,11 @@ Important current limitations include:
 
 -   current realistic profiles are research profiles and are not
     designated security-bearing;
--   Gaussian evaluation-key noise is deferred pending a more appropriate
-    key-switch construction;
--   auxiliary-modulus accounting must be completed before a production
-    security designation;
+-   the bounded-base Gaussian evaluation-key path is validated at N=4096,
+    but its secret-dependent evaluation-key messages retain an explicit
+    circular/KDM assumption;
+-   the bounded-base reference introduces no auxiliary special modulus; any
+    future special-modulus/hybrid path requires fresh modulus accounting;
 -   the Gaussian research sampler is not a hardened constant-time
     sampler;
 -   the canonical CKKS embedding is currently `O(N^2)`;
