@@ -60,3 +60,7 @@ pub use composite_rescale::{
     composite_rescale_reference_coefficients, composite_rescale_reference_polynomial,
     rescale_composite_level_to_next,
 };
+
+pub mod limb_polynomial;
+
+pub use limb_polynomial::LimbPolynomial;
