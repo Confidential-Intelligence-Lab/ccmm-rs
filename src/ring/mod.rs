@@ -64,3 +64,7 @@ pub use composite_rescale::{
 pub mod limb_polynomial;
 
 pub use limb_polynomial::LimbPolynomial;
+
+pub mod limb_ntt;
+
+pub use limb_ntt::{LimbNttPlan, NttLimbArithmetic};
