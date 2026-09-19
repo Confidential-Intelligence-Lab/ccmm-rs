@@ -7,6 +7,8 @@ description = "Native Rust research implementation of encrypted matrix multiplic
 repository = "https://github.com/Confidential-Intelligence-Lab/ccmm-rs"
 
 [dependencies]
+num-traits = "0.2"
+num-bigint = "0.4"
 rand = "0.8"
 rand_chacha = "0.3"
 num-complex = "0.4"

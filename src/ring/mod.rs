@@ -38,3 +38,10 @@ pub use basis_transition::{drop_basis_prefix, extend_basis_prefix};
 
 #[cfg(test)]
 mod basis_differential;
+
+pub mod wide_crt;
+
+pub use wide_crt::{
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+    rns_from_big_coefficients,
+};
