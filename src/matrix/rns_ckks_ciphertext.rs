@@ -185,6 +185,134 @@ impl RnsCkksCiphertextMatrix {
 
         Self::from_vec_column_major(self.rows, rhs.cols, data)
     }
+    /// Multiplies two encrypted CKKS matrices using the bounded-base
+    /// Gaussian-capable R3.1 multiplication path.
+    pub fn matmul_bounded_with_ntt(
+        &self,
+        rhs: &Self,
+        multiplication_key: &crate::grafting::BoundedRnsMultiplicationKey,
+        chain: &crate::ring::ModulusChain,
+        plan: &RnsNttPlan,
+    ) -> Self {
+        assert_eq!(
+            self.cols, rhs.rows,
+            "RNS CKKS matrix dimensions must be compatible"
+        );
+        assert_eq!(
+            self.level(),
+            rhs.level(),
+            "RNS CKKS matrix operands must have matching levels"
+        );
+        assert_eq!(
+            self.data[0].basis(),
+            rhs.data[0].basis(),
+            "RNS CKKS matrix operands must have matching bases"
+        );
+        assert_eq!(
+            self.scale(),
+            rhs.scale(),
+            "RNS CKKS matrix operands must have matching scales"
+        );
+        assert_eq!(
+            self.ring_degree(),
+            rhs.ring_degree(),
+            "RNS CKKS matrix operands must have matching ring degrees"
+        );
+        assert_eq!(
+            multiplication_key.layout().full_basis(),
+            self.data[0].basis(),
+            "bounded multiplication-key basis must match matrix ciphertext basis"
+        );
+        assert_eq!(
+            plan.degree(),
+            self.ring_degree(),
+            "RNS NTT plan degree must match matrix ciphertext degree"
+        );
+        assert_eq!(
+            plan.moduli(),
+            self.data[0].basis().moduli(),
+            "RNS NTT plan basis must match matrix ciphertext basis"
+        );
+
+        fn add_ciphertexts(
+            lhs: &RnsCkksCiphertext,
+            rhs: &RnsCkksCiphertext,
+            chain: &crate::ring::ModulusChain,
+        ) -> RnsCkksCiphertext {
+            use crate::grafting::RnsRlweCiphertext;
+            use crate::rlwe::RlweCiphertext;
+
+            lhs.assert_matches_chain(chain);
+            rhs.assert_matches_chain(chain);
+
+            assert_eq!(
+                lhs.level(),
+                rhs.level(),
+                "RNS CKKS addition requires matching levels"
+            );
+            assert_eq!(
+                lhs.basis(),
+                rhs.basis(),
+                "RNS CKKS addition requires matching bases"
+            );
+            assert_eq!(
+                lhs.scale(),
+                rhs.scale(),
+                "RNS CKKS addition requires matching scales"
+            );
+
+            let limbs = lhs
+                .rlwe()
+                .limbs()
+                .iter()
+                .zip(rhs.rlwe().limbs())
+                .map(|(lhs_limb, rhs_limb)| {
+                    RlweCiphertext::new(
+                        lhs_limb.b().add(rhs_limb.b()),
+                        lhs_limb.a().add(rhs_limb.a()),
+                    )
+                })
+                .collect();
+
+            RnsCkksCiphertext::new(
+                RnsRlweCiphertext::from_limbs(limbs),
+                lhs.state().clone(),
+                chain,
+            )
+        }
+
+        let mut data = Vec::with_capacity(self.rows * rhs.cols);
+
+        for col in 0..rhs.cols {
+            for row in 0..self.rows {
+                let mut accumulator =
+                    crate::ckks::multiply_relinearize_rescale_rns_ckks_bounded_with_ntt(
+                        self.get(row, 0),
+                        rhs.get(0, col),
+                        multiplication_key,
+                        chain,
+                        plan,
+                    );
+
+                for inner in 1..self.cols {
+                    let product =
+                        crate::ckks::multiply_relinearize_rescale_rns_ckks_bounded_with_ntt(
+                            self.get(row, inner),
+                            rhs.get(inner, col),
+                            multiplication_key,
+                            chain,
+                            plan,
+                        );
+
+                    accumulator = add_ciphertexts(&accumulator, &product, chain);
+                }
+
+                data.push(accumulator);
+            }
+        }
+
+        Self::from_vec_column_major(self.rows, rhs.cols, data)
+    }
 }
 
 #[cfg(test)]
