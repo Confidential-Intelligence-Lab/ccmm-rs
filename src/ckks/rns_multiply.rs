@@ -2220,7 +2220,7 @@ mod tests {
         let profile = research_profile_4096();
         let chain = profile.modulus_chain();
         let degree = profile.degree();
-        let scale = 34_359_738_368.0_f64;
+        let scale = profile.initial_scale();
         let basis = chain.top().clone();
         let top_plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
         let embedding = CkksCanonicalEmbedding::new(degree);
@@ -2465,12 +2465,10 @@ mod tests {
         let degree = profile.degree();
 
         /*
-         * research-4096 uses Delta = 2^35.
-         *
-         * R3.1b.3 uses the same value. Keep the statistical campaign
-         * identical except for randomized encryption/key seeds.
+         * Keep the statistical campaign on the profile-defined initial scale.
+         * This is 2^35 for research-4096.
          */
-        let scale = 34_359_738_368.0_f64;
+        let scale = profile.initial_scale();
 
         let basis = chain.top().clone();
         let top_plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);

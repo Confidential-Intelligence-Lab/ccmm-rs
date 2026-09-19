@@ -226,6 +226,26 @@ pub fn correctness_profile_8() -> CkksParameterProfile {
 ///
 /// The profile remains non-security-bearing until the implementation
 /// provides the corresponding security-bearing error sampler.
+/// Security-analysis model validated for the `research-4096` modulus chain.
+///
+/// R3.1d evaluates the exact active moduli using Lattice Estimator revision
+/// `8f1ff7e20a4d3391e3badff1d76825314db225bc`, uniform-ternary secrets,
+/// discrete-Gaussian error with sigma 3.19, and the MATZOV reduction-cost
+/// model. The binding level-0 estimate clears the 128-bit classical target.
+///
+/// This model characterizes the underlying RLWE parameterization. It does not
+/// independently establish circular/KDM security for evaluation keys that
+/// encrypt secret-dependent values such as `B^j * s^2`.
+pub fn research_4096_security_model() -> CkksSecurityModel {
+    CkksSecurityModel {
+        classical_security_bits: 128,
+        secret_distribution: CkksSecretDistribution::UniformTernary,
+        error_distribution: CkksErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+        estimator: "Lattice Estimator 8f1ff7e20a4d3391e3badff1d76825314db225bc",
+        reduction_cost_model: "RC.MATZOV",
+    }
+}
+
 pub fn research_profile_4096() -> CkksParameterProfile {
     CkksParameterProfile::new(
         "research-4096",
@@ -376,6 +396,26 @@ mod tests {
             assert!(!profile.security_bearing());
             assert_eq!(profile.security_model(), None);
         }
+    }
+
+    #[test]
+    fn research_4096_security_model_matches_r3_1d_validation() {
+        let model = research_4096_security_model();
+
+        assert_eq!(model.classical_security_bits, 128);
+        assert_eq!(
+            model.secret_distribution,
+            CkksSecretDistribution::UniformTernary
+        );
+        assert_eq!(
+            model.error_distribution,
+            CkksErrorDistribution::DiscreteGaussian { sigma: 3.19 }
+        );
+        assert_eq!(
+            model.estimator,
+            "Lattice Estimator 8f1ff7e20a4d3391e3badff1d76825314db225bc"
+        );
+        assert_eq!(model.reduction_cost_model, "RC.MATZOV");
     }
 
     #[test]
