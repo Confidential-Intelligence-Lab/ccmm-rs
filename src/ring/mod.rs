@@ -76,3 +76,11 @@ pub use limb_rns::{LimbRnsNttPlan, LimbRnsPolynomial};
 pub mod ntt_prime;
 
 pub use ntt_prime::{find_ntt_prime_below_bits, is_ntt_compatible, is_ntt_prime_candidate};
+
+pub mod ntt_parameter_sets;
+
+pub use ntt_parameter_sets::{
+    validate_canonical_ntt_parameters, CanonicalNttParameter, CanonicalNttWidth,
+    CANONICAL_NTT_DEGREE, CANONICAL_NTT_PARAMETERS, NTT128_MODULUS, NTT128_PSI, NTT32_MODULUS,
+    NTT32_PSI, NTT64_MODULUS, NTT64_PSI,
+};
