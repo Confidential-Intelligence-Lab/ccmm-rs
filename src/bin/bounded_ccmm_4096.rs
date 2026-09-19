@@ -49,6 +49,7 @@ fn centered(value: u128, modulus: u128) -> i128 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn encrypt_scalar(
     value: f64,
     seed: u64,
@@ -224,7 +225,7 @@ fn main() {
     println!("RING_DEGREE={degree}");
     println!("SLOT_COUNT={}", profile.slot_count());
     println!(
-        "VALIDATED_SECURITY_MODEL_BITS={}",
+        "UNDERLYING_RLWE_TARGET_SECURITY_BITS={}",
         security_model.classical_security_bits
     );
     println!("MATRIX_ROWS=2");
