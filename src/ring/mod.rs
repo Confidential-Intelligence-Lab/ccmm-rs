@@ -68,3 +68,7 @@ pub use limb_polynomial::LimbPolynomial;
 pub mod limb_ntt;
 
 pub use limb_ntt::{LimbNttPlan, NttLimbArithmetic};
+
+pub mod limb_rns;
+
+pub use limb_rns::{LimbRnsNttPlan, LimbRnsPolynomial};
