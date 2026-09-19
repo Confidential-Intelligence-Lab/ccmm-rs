@@ -18,6 +18,7 @@ mod rns_automorphism;
 mod rns_ciphertext;
 mod rns_galois_key;
 mod rns_multiply;
+mod rns_plain_multiply;
 mod rns_rescale;
 mod slot_encoder;
 mod slot_layout;
@@ -61,6 +62,7 @@ pub use rns_multiply::{
     multiply_relinearize_rescale_rns_ckks_bounded_with_ntt,
     multiply_relinearize_rescale_rns_ckks_with_ntt,
 };
+pub use rns_plain_multiply::multiply_plain_rns_ckks_with_ntt;
 pub use rns_rescale::rescale_rns_ckks_to_next;
 pub use slot_encoder::CkksSlotEncoder;
 pub use slot_layout::CkksSlotLayout;

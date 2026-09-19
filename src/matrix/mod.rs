@@ -16,4 +16,6 @@ pub mod polynomial;
 pub use polynomial::PolynomialMatrix;
 
 pub mod rns_ckks_ciphertext;
+pub mod rns_ckks_plaintext;
 pub use rns_ckks_ciphertext::RnsCkksCiphertextMatrix;
+pub use rns_ckks_plaintext::RnsCkksPlaintextMatrix;
