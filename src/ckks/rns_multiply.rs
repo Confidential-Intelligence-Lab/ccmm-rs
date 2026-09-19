@@ -189,6 +189,51 @@ pub fn evaluate_rns_ckks_product_chain(
     accumulator
 }
 
+/// Multiplies two same-level RNS CKKS ciphertexts, relinearizes with the
+/// bounded signed power-of-two multiplication key, and rescales once.
+///
+/// This is the public R3.1 bounded-base evaluation path. The `research-4096`
+/// validated reference uses `base_log=20` and discrete-Gaussian error with
+/// sigma 3.19 for ciphertext and evaluation-key generation.
+pub fn multiply_relinearize_rescale_rns_ckks_bounded_with_ntt(
+    lhs: &RnsCkksCiphertext,
+    rhs: &RnsCkksCiphertext,
+    multiplication_key: &crate::grafting::BoundedRnsMultiplicationKey,
+    chain: &crate::ring::ModulusChain,
+    plan: &crate::ring::RnsNttPlan,
+) -> RnsCkksCiphertext {
+    assert_eq!(
+        lhs.level(),
+        rhs.level(),
+        "bounded CKKS multiplication requires matching levels"
+    );
+    assert_eq!(
+        lhs.basis(),
+        rhs.basis(),
+        "bounded CKKS multiplication requires matching bases"
+    );
+    assert_eq!(
+        lhs.basis(),
+        multiplication_key.layout().full_basis(),
+        "bounded multiplication-key basis must match ciphertext basis"
+    );
+    assert_eq!(
+        plan.moduli(),
+        lhs.basis().moduli(),
+        "NTT plan basis must match bounded CKKS ciphertext basis"
+    );
+
+    let quadratic = crate::grafting::rns_tensor_with_ntt(lhs.rlwe(), rhs.rlwe(), plan);
+
+    let relinearized =
+        crate::grafting::bounded_rns_relinearize_with_ntt(&quadratic, multiplication_key, plan);
+
+    let product_state = lhs.state().after_multiply(rhs.state(), chain);
+    let product = RnsCkksCiphertext::new(relinearized, product_state, chain);
+
+    super::rescale_rns_ckks_to_next(&product, chain)
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;

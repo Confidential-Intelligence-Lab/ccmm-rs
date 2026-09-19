@@ -58,6 +58,7 @@ pub use rns_galois_key::{
 };
 pub use rns_multiply::{
     evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks,
+    multiply_relinearize_rescale_rns_ckks_bounded_with_ntt,
     multiply_relinearize_rescale_rns_ckks_with_ntt,
 };
 pub use rns_rescale::rescale_rns_ckks_to_next;
