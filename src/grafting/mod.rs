@@ -60,6 +60,8 @@ pub use rescale::{grafted_q_rescale, q_rescale_reference};
 pub mod rescale;
 pub use transition::{ResurrectionPool, SproutTransition};
 pub mod transition;
+pub use composite_transition::CompositeSproutTransition;
+pub mod composite_transition;
 
 use crate::ring::{Modulus, ModulusBasis, RnsPolynomial};
 
