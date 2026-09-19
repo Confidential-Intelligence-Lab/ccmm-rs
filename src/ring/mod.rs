@@ -72,3 +72,7 @@ pub use limb_ntt::{LimbNttPlan, NttLimbArithmetic};
 pub mod limb_rns;
 
 pub use limb_rns::{LimbRnsNttPlan, LimbRnsPolynomial};
+
+pub mod ntt_prime;
+
+pub use ntt_prime::{find_ntt_prime_below_bits, is_ntt_compatible, is_ntt_prime_candidate};
