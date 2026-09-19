@@ -1,6 +1,6 @@
 use crate::grafting::{
-    HybridMultiplicationKey, PreparedHybridMultiplicationKey, RnsKeySwitchKey,
-    RnsMultiplicationKey, RnsRlweCiphertext,
+    BoundedRnsMultiplicationKey, HybridMultiplicationKey, PreparedHybridMultiplicationKey,
+    RnsKeySwitchKey, RnsMultiplicationKey, RnsRlweCiphertext,
 };
 use crate::rlwe::RlweCiphertext;
 
@@ -42,6 +42,15 @@ impl LogicalPayloadBytes for RnsKeySwitchKey {
 }
 
 impl LogicalPayloadBytes for RnsMultiplicationKey {
+    fn logical_payload_bytes(&self) -> usize {
+        self.entries()
+            .iter()
+            .map(LogicalPayloadBytes::logical_payload_bytes)
+            .sum()
+    }
+}
+
+impl LogicalPayloadBytes for BoundedRnsMultiplicationKey {
     fn logical_payload_bytes(&self) -> usize {
         self.entries()
             .iter()
@@ -98,6 +107,7 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     use crate::grafting::{
+        BoundedGadgetLayout, BoundedRnsKeygenConfig, BoundedRnsMultiplicationKey,
         HelperPrimeNttPlan, HybridMultiplicationKey, MixedGadgetLayout,
         PreparedHybridMultiplicationKey, RnsGadgetLayout, RnsMultiplicationKey,
     };
@@ -136,6 +146,33 @@ mod tests {
 
         let expected = 2 * basis.len() * 2 * degree * COEFFICIENT_BYTES;
 
+        assert_eq!(key.logical_payload_bytes(), expected);
+    }
+
+    #[test]
+    fn bounded_multiplication_key_payload_matches_closed_form() {
+        let degree = 8;
+        let basis = ModulusBasis::new(vec![Modulus::new(12_289), Modulus::new(40_961)]);
+        let plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let layout = BoundedGadgetLayout::new(basis.clone(), 8);
+        let digit_count = layout.digit_count();
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0xAC03);
+
+        let key = BoundedRnsMultiplicationKey::generate_with_distribution_ntt_rng(
+            BoundedRnsKeygenConfig {
+                plaintext_modulus: 2,
+                layout,
+                plan: &plan,
+            },
+            &secret(degree),
+            crate::rlwe::ErrorDistribution::BoundedUniform { bound: 0 },
+            &mut rng,
+        );
+
+        let expected = digit_count * basis.len() * 2 * degree * COEFFICIENT_BYTES;
+
+        assert_eq!(key.entries().len(), digit_count);
         assert_eq!(key.logical_payload_bytes(), expected);
     }
 

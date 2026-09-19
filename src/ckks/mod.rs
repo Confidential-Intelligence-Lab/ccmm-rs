@@ -13,6 +13,7 @@ mod hybrid_ciphertext;
 mod hybrid_multiply;
 mod key_accounting;
 mod parameters;
+pub use parameters::{CkksErrorDistribution, CkksSecretDistribution};
 mod rns_automorphism;
 mod rns_ciphertext;
 mod rns_galois_key;
@@ -601,3 +602,6 @@ mod tests {
         }
     }
 }
+
+pub mod security_exposure;
+pub use security_exposure::CkksSecurityExposure;
