@@ -49,3 +49,14 @@ pub use wide_crt::{
 pub mod limb_arithmetic;
 
 pub use limb_arithmetic::{Limb128, Limb32, Limb64, PhysicalLimbArithmetic};
+
+pub mod composite_modulus_chain;
+
+pub use composite_modulus_chain::{CompositeModulusChain, LogicalModulusLevel};
+
+pub mod composite_rescale;
+
+pub use composite_rescale::{
+    composite_rescale_reference_coefficients, composite_rescale_reference_polynomial,
+    rescale_composite_level_to_next,
+};
