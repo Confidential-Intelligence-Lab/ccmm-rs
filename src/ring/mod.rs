@@ -45,3 +45,7 @@ pub use wide_crt::{
     centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
     rns_from_big_coefficients,
 };
+
+pub mod limb_arithmetic;
+
+pub use limb_arithmetic::{Limb128, Limb32, Limb64, PhysicalLimbArithmetic};
