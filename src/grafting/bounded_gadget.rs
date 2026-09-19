@@ -1,4 +1,10 @@
-use crate::ring::{ModulusBasis, RnsPolynomial};
+use num_bigint::{BigInt, BigUint, Sign};
+use num_traits::{ToPrimitive, Zero};
+
+use crate::ring::{
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusBasis,
+    Polynomial, RnsPolynomial,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedGadgetLayout {
@@ -15,15 +21,8 @@ impl BoundedGadgetLayout {
             "bounded gadget base_log must be in 1..=63"
         );
 
-        let q = full_basis.composite_modulus();
-
-        assert!(
-            q <= i128::MAX as u128,
-            "bounded gadget composite modulus must fit in i128"
-        );
-
-        let modulus_bits = u128::BITS - q.leading_zeros();
-        let digit_count = modulus_bits.div_ceil(base_log) as usize;
+        let modulus_bits = composite_modulus_big(&full_basis).bits();
+        let digit_count = modulus_bits.div_ceil(u64::from(base_log)) as usize;
 
         Self {
             full_basis,
@@ -60,30 +59,40 @@ impl BoundedGadgetLayout {
             "polynomial basis must match bounded gadget layout"
         );
 
-        let q = self.full_basis.composite_modulus();
-        let base = self.base as i128;
-        let half_base = base / 2;
-        let canonical = polynomial.reconstruct_coefficients();
+        let modulus = composite_modulus_big(&self.full_basis);
+        let base = BigInt::from(self.base);
+        let half_base = BigInt::from(self.base / 2);
+
+        let canonical = reconstruct_coefficients_big(polynomial);
         let degree = canonical.len();
         let mut digits = vec![vec![0_i128; degree]; self.digit_count];
 
-        for (coefficient_index, coefficient) in canonical.into_iter().enumerate() {
-            let mut value = center(coefficient, q);
+        for (coefficient_index, coefficient) in canonical.iter().enumerate() {
+            let mut value = centered_representative_big(coefficient, &modulus);
 
             for digit_row in digits.iter_mut().take(self.digit_count) {
-                let residue = value.rem_euclid(base);
-                let digit = if residue >= half_base {
-                    residue - base
+                let mut residue = &value % &base;
+
+                if residue.sign() == Sign::Minus {
+                    residue += &base;
+                }
+
+                let digit_big = if residue >= half_base {
+                    residue - &base
                 } else {
                     residue
                 };
 
+                let digit = digit_big
+                    .to_i128()
+                    .expect("bounded gadget digit must fit in i128");
+
                 digit_row[coefficient_index] = digit;
-                value = (value - digit) / base;
+                value = (value - BigInt::from(digit)) / &base;
             }
 
-            assert_eq!(
-                value, 0,
+            assert!(
+                value.is_zero(),
                 "bounded gadget digit count is insufficient for centered coefficient"
             );
         }
@@ -114,28 +123,20 @@ impl BoundedGadgetDecomposition {
         &self.digits[index]
     }
 
-    pub fn reconstruct_centered_coefficients(&self) -> Vec<i128> {
+    pub fn reconstruct_centered_coefficients_big(&self) -> Vec<BigInt> {
         let degree = self.digits[0].len();
-        let base = self.layout.base as i128;
-        let mut output = vec![0_i128; degree];
+        let base = BigInt::from(self.layout.base);
+        let mut output = vec![BigInt::zero(); degree];
 
         for (coefficient_index, output_value) in output.iter_mut().enumerate() {
-            let mut power = 1_i128;
-            let mut value = 0_i128;
+            let mut power = BigInt::from(1_u8);
+            let mut value = BigInt::zero();
 
             for digit_index in 0..self.digits.len() {
-                let term = self.digits[digit_index][coefficient_index]
-                    .checked_mul(power)
-                    .expect("bounded gadget reconstruction term exceeds i128");
-
-                value = value
-                    .checked_add(term)
-                    .expect("bounded gadget reconstruction exceeds i128");
+                value += BigInt::from(self.digits[digit_index][coefficient_index]) * &power;
 
                 if digit_index + 1 < self.digits.len() {
-                    power = power
-                        .checked_mul(base)
-                        .expect("bounded gadget radix power exceeds i128");
+                    power *= &base;
                 }
             }
 
@@ -145,25 +146,71 @@ impl BoundedGadgetDecomposition {
         output
     }
 
-    pub fn reconstruct_coefficients(&self) -> Vec<u128> {
-        let q = self.layout.full_basis.composite_modulus();
-
-        self.reconstruct_centered_coefficients()
+    pub fn reconstruct_centered_coefficients(&self) -> Vec<i128> {
+        self.reconstruct_centered_coefficients_big()
             .into_iter()
-            .map(|value| canonicalize(value, q))
+            .map(|value| {
+                value
+                    .to_i128()
+                    .expect("centered coefficient does not fit in legacy i128 API")
+            })
+            .collect()
+    }
+
+    pub fn reconstruct_coefficients_big(&self) -> Vec<BigUint> {
+        let modulus = composite_modulus_big(&self.layout.full_basis);
+
+        self.reconstruct_centered_coefficients_big()
+            .into_iter()
+            .map(|value| match value.sign() {
+                Sign::Minus => {
+                    let magnitude = value.magnitude();
+
+                    assert!(
+                        magnitude <= &modulus,
+                        "centered coefficient magnitude exceeds composite modulus"
+                    );
+
+                    &modulus - magnitude
+                }
+                _ => value
+                    .to_biguint()
+                    .expect("nonnegative centered coefficient must convert to BigUint"),
+            })
+            .collect()
+    }
+
+    pub fn reconstruct_coefficients(&self) -> Vec<u128> {
+        self.reconstruct_coefficients_big()
+            .into_iter()
+            .map(|value| {
+                value
+                    .to_u128()
+                    .expect("coefficient does not fit in legacy u128 API")
+            })
             .collect()
     }
 
     pub fn lift_digit(&self, index: usize) -> RnsPolynomial {
-        let q = self.layout.full_basis.composite_modulus();
-
-        let coefficients: Vec<u128> = self.digits[index]
+        let residues = self
+            .layout
+            .full_basis
+            .moduli()
             .iter()
             .copied()
-            .map(|value| canonicalize(value, q))
+            .map(|modulus| {
+                let q = i128::from(modulus.value());
+
+                let coefficients = self.digits[index]
+                    .iter()
+                    .map(|&value| value.rem_euclid(q) as u64)
+                    .collect();
+
+                Polynomial::new(modulus, coefficients)
+            })
             .collect();
 
-        RnsPolynomial::from_coefficients(self.layout.full_basis.moduli().to_vec(), &coefficients)
+        RnsPolynomial::from_residues(residues)
     }
 
     pub fn maximum_observed_digit_magnitude(&self) -> u128 {
@@ -174,19 +221,6 @@ impl BoundedGadgetDecomposition {
             .max()
             .unwrap_or(0)
     }
-}
-
-fn center(value: u128, modulus: u128) -> i128 {
-    if value > modulus / 2 {
-        value as i128 - modulus as i128
-    } else {
-        value as i128
-    }
-}
-
-fn canonicalize(value: i128, modulus: u128) -> u128 {
-    let modulus = modulus as i128;
-    value.rem_euclid(modulus) as u128
 }
 
 #[cfg(test)]
@@ -346,5 +380,51 @@ mod tests {
     #[should_panic(expected = "base_log must be in 1..=63")]
     fn rejects_zero_base_log() {
         let _ = BoundedGadgetLayout::new(basis(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wide_modulus_tests {
+    use num_bigint::BigUint;
+    use num_traits::One;
+
+    use crate::ckks::research_profile_8192;
+    use crate::ring::{composite_modulus_big, rns_from_big_coefficients};
+
+    use super::BoundedGadgetLayout;
+
+    #[test]
+    fn research_8192_bounded_decomposition_roundtrips_above_u128() {
+        let profile = research_profile_8192();
+        let basis = profile.modulus_basis();
+        let modulus = composite_modulus_big(&basis);
+
+        let large = (BigUint::one() << 150_usize) + BigUint::from(0x1234_5678_u64);
+        assert!(large < modulus);
+
+        let coefficients = vec![
+            BigUint::from(0_u64),
+            BigUint::from(1_u64),
+            large,
+            &modulus - BigUint::from(1_u64),
+            &modulus - BigUint::from(17_u64),
+        ];
+
+        let polynomial = rns_from_big_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        let layout = BoundedGadgetLayout::new(basis.clone(), 20);
+        assert_eq!(layout.digit_count(), 10);
+
+        let decomposition = layout.decompose(&polynomial);
+
+        assert_eq!(decomposition.reconstruct_coefficients_big(), coefficients);
+
+        assert!(
+            decomposition.maximum_observed_digit_magnitude() <= layout.maximum_digit_magnitude()
+        );
+
+        for digit_index in 0..layout.digit_count() {
+            assert_eq!(decomposition.lift_digit(digit_index).basis(), &basis);
+        }
     }
 }
