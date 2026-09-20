@@ -10,17 +10,24 @@
 //! cryptographic kernels are wired behind these contracts in later work
 //! packages.
 
+pub mod backend_policy;
+
 pub mod batched_gemm;
 
 pub mod gemm;
+pub use backend_policy::select_cc_backend;
+
 pub use batched_gemm::{
-    batched_gemm_cc, batched_gemm_cp, batched_gemm_pc, batched_gemm_pp, BatchedGemmOperationCount,
-    BatchedGemmShape, BatchedGemmSpec,
+    batched_gemm_cc, batched_gemm_cc_auto, batched_gemm_cp, batched_gemm_pc, batched_gemm_pp,
+    BatchedGemmOperationCount, BatchedGemmShape, BatchedGemmSpec,
 };
 
-pub use gemm::{gemm_cc, gemm_cp, gemm_pc, gemm_pp};
+pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
-pub use gemv::{dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemvShape};
+pub use gemv::{
+    dot_cc, dot_cc_auto, dot_cp, dot_pp, gemv_cc, gemv_cc_auto, gemv_cp, gemv_pp, DotShape,
+    GemvShape,
+};
 
 pub mod level1;
 

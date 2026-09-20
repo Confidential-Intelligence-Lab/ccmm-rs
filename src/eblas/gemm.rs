@@ -134,6 +134,21 @@ pub fn gemm_cc(
     }
 }
 
+/// Executes ciphertext/ciphertext GEMM using the frozen R3.5 backend policy.
+///
+/// Explicit `gemm_cc` selection remains available for reproducible experiments.
+pub fn gemm_cc_auto(
+    spec: GemmSpec,
+    lhs: &RnsCkksCiphertextMatrix,
+    rhs: &RnsCkksCiphertextMatrix,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    let backend = crate::eblas::select_cc_backend(spec);
+    gemm_cc(spec, backend, lhs, rhs, multiplication_key, chain, plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::gemm_pp;

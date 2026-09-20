@@ -5,7 +5,8 @@
 //! arithmetic. Specialized kernels may replace these reductions later.
 
 use crate::eblas::{
-    gemm_cc, gemm_cp, gemm_pp, GemmBackend, GemmShape, GemmSpec, MatrixShape, PrivacyMode,
+    gemm_cc, gemm_cc_auto, gemm_cp, gemm_pp, GemmBackend, GemmShape, GemmSpec, MatrixShape,
+    PrivacyMode,
 };
 use crate::grafting::BoundedRnsMultiplicationKey;
 use crate::matrix::{BatchMatrix, RnsCkksCiphertextMatrix, RnsCkksPlaintextMatrix};
@@ -128,6 +129,25 @@ pub fn gemv_cc(
     )
 }
 
+/// Executes ciphertext/ciphertext GEMV using the frozen R3.5 backend policy.
+pub fn gemv_cc_auto(
+    shape: GemvShape,
+    matrix: &RnsCkksCiphertextMatrix,
+    vector: &RnsCkksCiphertextMatrix,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    gemm_cc_auto(
+        shape.as_gemm(PrivacyMode::Cc),
+        matrix,
+        vector,
+        multiplication_key,
+        chain,
+        plan,
+    )
+}
+
 pub fn dot_pp(shape: DotShape, lhs: &BatchMatrix<f64>, rhs: &BatchMatrix<f64>) -> BatchMatrix<f64> {
     gemm_pp(shape.as_gemm(PrivacyMode::Pp), lhs, rhs)
 }
@@ -154,6 +174,25 @@ pub fn dot_cc(
     gemm_cc(
         shape.as_gemm(PrivacyMode::Cc),
         backend,
+        lhs,
+        rhs,
+        multiplication_key,
+        chain,
+        plan,
+    )
+}
+
+/// Executes ciphertext/ciphertext DOT using the frozen R3.5 backend policy.
+pub fn dot_cc_auto(
+    shape: DotShape,
+    lhs: &RnsCkksCiphertextMatrix,
+    rhs: &RnsCkksCiphertextMatrix,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    gemm_cc_auto(
+        shape.as_gemm(PrivacyMode::Cc),
         lhs,
         rhs,
         multiplication_key,
