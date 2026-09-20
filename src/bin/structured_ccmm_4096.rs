@@ -1,3 +1,4 @@
+use std::env;
 use std::time::Instant;
 
 use ccmm_rs::ckks::{
@@ -27,33 +28,68 @@ struct Workload {
     n: usize,
 }
 
-fn workloads() -> Vec<Workload> {
-    vec![
-        Workload {
-            name: "square-1",
-            m: 1,
-            k: 1,
-            n: 1,
-        },
-        Workload {
-            name: "square-2",
-            m: 2,
-            k: 2,
-            n: 2,
-        },
-        Workload {
-            name: "gemv-1x4-by-4x1",
-            m: 1,
-            k: 4,
-            n: 1,
-        },
-        Workload {
-            name: "rect-2x4-by-4x2",
-            m: 2,
-            k: 4,
-            n: 2,
-        },
-    ]
+fn workloads(profile: &str) -> Vec<Workload> {
+    match profile {
+        "small" => vec![
+            Workload {
+                name: "square-1",
+                m: 1,
+                k: 1,
+                n: 1,
+            },
+            Workload {
+                name: "square-2",
+                m: 2,
+                k: 2,
+                n: 2,
+            },
+            Workload {
+                name: "gemv-1x4-by-4x1",
+                m: 1,
+                k: 4,
+                n: 1,
+            },
+            Workload {
+                name: "rect-2x4-by-4x2",
+                m: 2,
+                k: 4,
+                n: 2,
+            },
+        ],
+        "frontier" => vec![
+            Workload {
+                name: "square-4",
+                m: 4,
+                k: 4,
+                n: 4,
+            },
+            Workload {
+                name: "gemv-1x8-by-8x1",
+                m: 1,
+                k: 8,
+                n: 1,
+            },
+            Workload {
+                name: "mlp-1x8-by-8x4",
+                m: 1,
+                k: 8,
+                n: 4,
+            },
+            Workload {
+                name: "mlp-1x16-by-16x8",
+                m: 1,
+                k: 16,
+                n: 8,
+            },
+            Workload {
+                name: "square-8",
+                m: 8,
+                k: 8,
+                n: 8,
+            },
+        ],
+        other => panic!("unknown profile {other}; expected small or frontier"),
+    }
 }
 
 fn deterministic_value(index: usize, salt: u64) -> f64 {
@@ -186,6 +222,12 @@ fn max_error(actual: &[f64], expected: &[f64]) -> f64 {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let workload_profile = args
+        .windows(2)
+        .find(|pair| pair[0] == "--profile")
+        .map(|pair| pair[1].as_str())
+        .unwrap_or("small");
     let profile = research_profile_4096();
     let security_model = research_4096_security_model();
     let chain = profile.modulus_chain();
@@ -228,8 +270,9 @@ fn main() {
     println!("EVALUATION_KEY_ERROR_SIGMA={SIGMA}");
     println!("BOUNDED_BASE_LOG={BASE_LOG}");
     println!("BOOTSTRAPPING=none");
+    println!("WORKLOAD_PROFILE={workload_profile}");
 
-    for workload in workloads() {
+    for workload in workloads(workload_profile) {
         let lhs_values = cleartext_values(workload.m, workload.k, 0x34D1_2001);
         let rhs_values = cleartext_values(workload.k, workload.n, 0x34D1_3002);
         let expected =
