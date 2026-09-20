@@ -30,7 +30,7 @@ Batch Matrix Multiplication in Ciphertexts," CRYPTO 2026**.
 
 Jung Hee Cheon, Minsik Kang, and Junho Lee, **"Fast Batch Matrix
 Multiplication in Ciphertexts,"** *Advances in Cryptology --- CRYPTO
-2026*, Lecture Notes in Computer Science, vol. 16801, pp. 558--590,
+2026*, Lecture Notes in Computer Science, vol. 16801, pp. 558--590,
 Springer, 2026.
 
 -   DOI: `10.1007/978-3-032-35374-0_18`
