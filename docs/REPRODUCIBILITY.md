@@ -1,5 +1,32 @@
 # Reproducibility and Characterization
 
+## Current R3.5 checkpoint
+
+Later R3.1–R3.5 evidence supersedes older Roadmap-2 configurations when
+describing the current implementation. Historical sections below remain for
+reproducing earlier checkpoints.
+
+Current research-4096 security-oriented evaluation uses ciphertext and
+evaluation-key error sigma 3.19 with bounded `base_log=20`. The underlying
+uniform-ternary-secret RLWE parameterization passes the documented targeted
+128-bit classical-security gate under Lattice Estimator/MATZOV methodology;
+this is not a blanket production-security statement.
+
+Current eBLAS evidence is under `results/r3.5/`, including backend, batch/PC,
+and backend-policy artifacts. The frozen policy is `K=1 -> CcScalar`,
+`K>=2 -> CcStructured`; explicit selection remains available.
+
+Current standard gate:
+
+```bash
+cargo fmt --all -- --check
+cargo test --all
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+git diff --check
+```
+
+
 This document provides a compact reproduction guide for the principal
 correctness, interoperability, and performance evidence in `ccmm-rs`.
 

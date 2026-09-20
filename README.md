@@ -1,9 +1,41 @@
-# ccmm-rs
+# ccmm-rs — evolving toward FHE-rs
 
-`ccmm-rs` is a correctness-first native Rust research implementation of
-ciphertext-plaintext matrix multiplication (CPMM) and
-ciphertext-ciphertext matrix multiplication (CCMM) for RLWE/CKKS-style
-encrypted matrices.
+> **Project direction.** The repository and Cargo package remain named
+> `ccmm-rs` at the R3.5 checkpoint to preserve history and reproducibility.
+> The cryptographic stack developed here is evolving into **FHE-rs**, a
+> native-Rust research framework for homomorphic encryption. CCMM remains an
+> implemented and characterized execution technique, but no longer defines
+> the scope of the software.
+
+`ccmm-rs` now contains a correctness-first leveled RNS/NTT CKKS stack,
+encrypted linear algebra through **eBLAS**, CPMM, scalar CC execution, and
+structured CCMM. The current stack supports realistic N=4096 encrypted
+computation, bounded-base Gaussian relinearization, composite RNS scaling,
+multiple physical limb widths, PP/CP/PC/CC linear-algebra semantics, batching,
+tensor-to-GEMM mappings, and measurement-driven CC backend selection.
+
+```text
+applications
+    |
+    v
+eBLAS: operation semantics + operand privacy + backend policy
+    |
+    +-- CP direct / CPMM-equivalent execution
+    +-- scalar CC baseline
+    `-- structured CCMM
+    |
+    v
+FHE-rs cryptographic substrate
+    |
+    +-- leveled CKKS
+    +-- key switching / relinearization / rescaling
+    +-- SIMD / Galois operations
+    +-- RNS / NTT / modular arithmetic
+    `-- future resilience and additional HE capabilities
+```
+
+Applications should depend on eBLAS or stable evaluator interfaces rather than
+reimplementing cryptographic schedules.
 
 The repository contains two complementary execution paths:
 
@@ -25,6 +57,39 @@ Batch Matrix Multiplication in Ciphertexts," CRYPTO 2026**.
 > provides an independent native-Rust implementation, correctness
 > infrastructure, RNS/NTT CKKS research stack, characterization, and
 > external cross-validation.
+
+## Start Here
+
+| Need | Document |
+|---|---|
+| Build and run a first encrypted computation | [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) |
+| Understand eBLAS and its privacy/backend model | [`docs/EBLAS.md`](docs/EBLAS.md) |
+| See demonstrated applications | [`docs/APPLICATIONS.md`](docs/APPLICATIONS.md) |
+| Understand evidence, assurance, and claim boundaries | [`docs/ASSURANCE.md`](docs/ASSURANCE.md) |
+| Inspect security parameters and the precise security claim | [`docs/SECURITY_AND_PARAMETERS.md`](docs/SECURITY_AND_PARAMETERS.md) |
+| Understand RNS/composite-scaling architecture | [`docs/RNS_ARCHITECTURE.md`](docs/RNS_ARCHITECTURE.md) |
+| Reproduce principal results | [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) |
+| Add an application, backend, profile, or future scheme | [`docs/EXTENDING_FHE_RS.md`](docs/EXTENDING_FHE_RS.md) |
+
+### R3.5 capability and evidence snapshot
+
+| Capability | Status | Evidence / boundary |
+|---|---|---|
+| Leveled RNS/NTT CKKS | Implemented + validated | Native Rust tests and realistic N=4096 campaigns |
+| Bounded-base Gaussian relinearization | Implemented + validated | sigma=3.19 ciphertext/evaluation-key error; `base_log=20` |
+| Underlying `research-4096` RLWE parameterization | Security-parameter gate passed | ~130.3-bit binding classical estimate under documented Lattice Estimator + MATZOV methodology; not a blanket implementation-security claim |
+| Composite RNS scaling / 32-, 64-, 128-bit physical limbs | Implemented + validated | Semantic-invariance and composite-rescale campaigns |
+| eBLAS PP / CP / PC / CC | Implemented + validated | GEMM, GEMV, DOT, ADD, SCALE, AXPY, transpose |
+| Batched GEMM | Implemented + validated | Independent per-batch semantics; no SIMD/parallel acceleration claim |
+| Tensor GEMM mapping | Implemented + validated | Rank-3 tensor semantics mapped to batched GEMM |
+| Structured CCMM | Implemented + characterized | 2.3–3.45x measured kernel speedup with 4–16x fewer relin/rescale operations over the tested frontier |
+| Measurement-driven CC policy | Implemented + validated | K=1 scalar canonical baseline; K>=2 structured under current research-4096 implementation |
+| Bootstrapping | Planned | Not implemented |
+| Integer/discrete CKKS | Planned | Not implemented |
+| Production hardening / side-channel assurance | Not claimed | Research sampler; no third-party security audit |
+
+See [`docs/ASSURANCE.md`](docs/ASSURANCE.md) before reusing a security or
+performance statement.
 
 ## Original Paper
 
@@ -548,10 +613,17 @@ Important current limitations include:
 -   the Gaussian research sampler is not a hardened constant-time
     sampler;
 -   the canonical CKKS embedding is currently `O(N^2)`;
--   matrix multiplication currently performs the direct encrypted `d^3`
-    dot-product schedule;
--   the realistic matrix characterization currently covers 2x2 and 4x4
-    matrices at N=4096;
+-   scalar CC GEMM remains available as a reproducible baseline, while
+    structured CCMM amortizes relinearization/rescaling across the reduction
+    dimension; neither path should be interpreted as a universally optimal
+    packed or accelerator implementation;
+
+-   current eBLAS batching is semantic aggregation of independent GEMMs, not
+    CKKS SIMD batching or parallel execution;
+
+-   the current PC implementation reuses CP through transpose under the
+    scalar-per-entry representation; its measured transpose overhead should
+    not be generalized to future packed layouts;
 -   HEaaN cross-validation applies to the reference construction rather
     than constituting blanket validation of the entire Roadmap-2 stack;
 -   no third-party security audit has been performed.
@@ -568,9 +640,13 @@ realistic RNS/NTT CKKS execution, canonical SIMD semantics, leveled
 evaluation, Galois operations, level-aware evaluation keys, security/noise
 characterization, and realistic encrypted matrix multiplication at N=4096.
 
-The realistic parameter profiles remain research profiles and are explicitly
-not designated security-bearing. See `docs/SECURITY_AND_PARAMETERS.md` for
-the current security-claim boundary.
+The realistic parameter profiles remain research profiles. For
+`research-4096`, the **underlying uniform-ternary-secret RLWE
+parameterization** meets the targeted 128-bit classical-security gate under
+the documented Lattice Estimator methodology and MATZOV cost model. This is
+a parameter-security statement, not a blanket claim of production security,
+circular/KDM security, side-channel resistance, or audit. See
+`docs/SECURITY_AND_PARAMETERS.md` for the precise claim boundary.
 
 ## Citation
 

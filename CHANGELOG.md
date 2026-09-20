@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — R3.5 closeout / FHE-rs direction
+
+### Added
+
+- eBLAS PP/CP/PC/CC model and Level 1/2/3 operations;
+- batched GEMM and tensor-to-batched-GEMM mapping;
+- structured CCMM backend and measurement-driven CC policy;
+- backend, batching, and PC characterization;
+- FHE-rs architecture, getting-started, extension, and assurance docs.
+
+### Characterization
+
+Across the tested frontier, structured CCMM measured about 2.3–3.45x kernel
+speedup over scalar CC with 4–16x fewer relinearizations/rescales. Current
+batching is semantic aggregation rather than acceleration. PC transpose
+reduction measured about 0.30–0.46% overhead in the current representation.
+
+### Project direction
+
+The repository/Cargo package retain `ccmm-rs` for history and reproducibility.
+The broader leveled HE stack is evolving toward **FHE-rs**, with CCMM as one
+characterized execution technique beneath eBLAS. Bootstrapping and integer/
+discrete CKKS are planned, not current capabilities.
+
+
 ## v2.0.0 — 2026-09-18
 
 `v2.0.0` completes the Roadmap-2 redesign of `ccmm-rs`.
