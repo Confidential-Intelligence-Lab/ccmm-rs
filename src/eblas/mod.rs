@@ -10,7 +10,14 @@
 //! cryptographic kernels are wired behind these contracts in later work
 //! packages.
 
+pub mod batched_gemm;
+
 pub mod gemm;
+pub use batched_gemm::{
+    batched_gemm_cc, batched_gemm_cp, batched_gemm_pc, batched_gemm_pp, BatchedGemmOperationCount,
+    BatchedGemmShape, BatchedGemmSpec,
+};
+
 pub use gemm::{gemm_cc, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
 pub use gemv::{dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemvShape};
