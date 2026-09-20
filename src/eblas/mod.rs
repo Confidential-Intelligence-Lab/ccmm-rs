@@ -12,6 +12,8 @@
 
 pub mod gemm;
 pub use gemm::{gemm_cc, gemm_cp, gemm_pp};
+pub mod gemv;
+pub use gemv::{dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemvShape};
 
 /// Operand privacy for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
