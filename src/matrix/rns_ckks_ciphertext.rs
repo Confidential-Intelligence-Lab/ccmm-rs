@@ -185,6 +185,103 @@ impl RnsCkksCiphertextMatrix {
 
         Self::from_vec_column_major(self.rows, rhs.cols, data)
     }
+
+    /// Matrix-structured bounded-Gaussian CCMM.
+    ///
+    /// Accumulates each degree-2 RLWE dot product before relinearization
+    /// and rescaling, so those expensive operations occur once per output.
+    pub fn matmul_structured_bounded_with_ntt(
+        &self,
+        rhs: &Self,
+        multiplication_key: &crate::grafting::BoundedRnsMultiplicationKey,
+        chain: &crate::ring::ModulusChain,
+        plan: &RnsNttPlan,
+    ) -> Self {
+        assert_eq!(
+            self.cols, rhs.rows,
+            "RNS CKKS matrix dimensions must be compatible"
+        );
+        assert_eq!(
+            self.level(),
+            rhs.level(),
+            "RNS CKKS matrix operands must have matching levels"
+        );
+        assert_eq!(
+            self.data[0].basis(),
+            rhs.data[0].basis(),
+            "RNS CKKS matrix operands must have matching bases"
+        );
+        assert_eq!(
+            self.scale(),
+            rhs.scale(),
+            "RNS CKKS matrix operands must have matching scales"
+        );
+        assert_eq!(
+            self.ring_degree(),
+            rhs.ring_degree(),
+            "RNS CKKS matrix operands must have matching ring degrees"
+        );
+        assert_eq!(
+            multiplication_key.layout().full_basis(),
+            self.data[0].basis(),
+            "bounded multiplication-key basis must match matrix ciphertext basis"
+        );
+        assert_eq!(
+            plan.degree(),
+            self.ring_degree(),
+            "RNS NTT plan degree must match matrix ciphertext degree"
+        );
+        assert_eq!(
+            plan.moduli(),
+            self.data[0].basis().moduli(),
+            "RNS NTT plan basis must match matrix ciphertext basis"
+        );
+
+        let mut data = Vec::with_capacity(self.rows * rhs.cols);
+
+        for col in 0..rhs.cols {
+            for row in 0..self.rows {
+                let mut quadratic = crate::grafting::rns_tensor_with_ntt(
+                    self.get(row, 0).rlwe(),
+                    rhs.get(0, col).rlwe(),
+                    plan,
+                );
+
+                for inner in 1..self.cols {
+                    let product = crate::grafting::rns_tensor_with_ntt(
+                        self.get(row, inner).rlwe(),
+                        rhs.get(inner, col).rlwe(),
+                        plan,
+                    );
+
+                    quadratic = crate::grafting::RnsQuadraticCiphertext::from_rns_polynomials(
+                        quadratic.c0().add(product.c0()),
+                        quadratic.c1().add(product.c1()),
+                        quadratic.c2().add(product.c2()),
+                    );
+                }
+
+                let relinearized = crate::grafting::bounded_rns_relinearize_with_ntt(
+                    &quadratic,
+                    multiplication_key,
+                    plan,
+                );
+
+                let product_state = self
+                    .get(row, 0)
+                    .state()
+                    .after_multiply(rhs.get(0, col).state(), chain);
+
+                let product =
+                    crate::ckks::RnsCkksCiphertext::new(relinearized, product_state, chain);
+
+                data.push(crate::ckks::rescale_rns_ckks_to_next(&product, chain));
+            }
+        }
+
+        Self::from_vec_column_major(self.rows, rhs.cols, data)
+    }
+
     /// Multiplies two encrypted CKKS matrices using the bounded-base
     /// Gaussian-capable R3.1 multiplication path.
     pub fn matmul_bounded_with_ntt(
