@@ -1,6 +1,7 @@
 # Getting Started with FHE-rs
 
-FHE-rs is currently developed inside `ccmm-rs`; repository and Cargo package
+FHE-rs is a Rust library for building applications that compute on encrypted data.
+The project is currently developed inside `ccmm-rs`; the repository and Cargo package
 names remain unchanged at R3.5 for history/reproducibility.
 
 ## Build and validate
@@ -30,7 +31,7 @@ Use eBLAS for linear algebra. Choose PP, CP, PC, or CC according to which
 operands are private. Do not manually reconstruct CPMM/CCMM schedules in
 application code.
 
-## Parameters and CKKS state
+## Choose Parameters and Track CKKS State
 
 Current realistic work primarily uses `research-4096`. Read
 `SECURITY_AND_PARAMETERS.md` before making security statements. Track level

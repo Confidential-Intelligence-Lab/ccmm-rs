@@ -33,10 +33,9 @@ bounded-base Gaussian relinearization with `research-4096`. Historical
 evidence is in `results/r3.2c/`. See `SECURITY_AND_PARAMETERS.md` and
 `ASSURANCE.md` before making a security claim.
 
-## R3.6 direction
+## Applications Being Added Next
 
-R3.6 expands the application layer while keeping scope finite enough to return
-promptly to resilience research. Target application classes are:
+The next application set expands the library with representative private-computing workloads:
 
 1. private linear/logistic inference through eBLAS;
 2. a small private MLP with explicit depth/level accounting;

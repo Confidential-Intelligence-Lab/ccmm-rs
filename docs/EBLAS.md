@@ -13,12 +13,12 @@ Applications specify the mathematical operation and privacy relationship.
 Concrete cryptographic schedules remain explicit and reproducible, while a
 policy layer may select among characterized backends.
 
-## Operand privacy
+## Public and Encrypted Operands
 
-- **PP** — plaintext × plaintext
-- **CP** — ciphertext × plaintext
-- **PC** — plaintext × ciphertext
-- **CC** — ciphertext × ciphertext
+- **PP** — both operands are public/plaintext;
+- **CP** — the left operand is encrypted and the right operand is plaintext;
+- **PC** — the left operand is plaintext and the right operand is encrypted;
+- **CC** — both operands are encrypted.
 
 All four modes are implemented for the applicable current GEMM paths.
 
