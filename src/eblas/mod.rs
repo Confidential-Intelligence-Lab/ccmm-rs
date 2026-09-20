@@ -10,6 +10,9 @@
 //! cryptographic kernels are wired behind these contracts in later work
 //! packages.
 
+pub mod gemm;
+pub use gemm::{gemm_cc, gemm_cp, gemm_pp};
+
 /// Operand privacy for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperandPrivacy {
