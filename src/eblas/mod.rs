@@ -15,6 +15,10 @@ pub use gemm::{gemm_cc, gemm_cp, gemm_pp};
 pub mod gemv;
 pub use gemv::{dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemvShape};
 
+pub mod level1;
+
+pub use level1::{add_cc, scale_cp};
+
 /// Operand privacy for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperandPrivacy {
@@ -74,6 +78,10 @@ pub enum EblasOperation {
     Gemv,
     /// Vector dot product.
     Dot,
+    /// Element-wise addition.
+    Add,
+    /// Public-scalar scaling.
+    Scale,
     /// `y <- alpha * x + y`.
     Axpy,
     /// Matrix transpose/layout operation.
