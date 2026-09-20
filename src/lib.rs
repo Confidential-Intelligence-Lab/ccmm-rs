@@ -44,6 +44,7 @@
 
 pub mod ccmm;
 pub mod ckks;
+pub mod eblas;
 pub mod eval;
 pub mod grafting;
 pub mod matrix;
