@@ -1,6 +1,6 @@
 use crate::ckks::{
-    multiply_plain_rns_ckks_with_ntt, rescale_rns_ckks_to_next, CkksCanonicalEmbedding,
-    RnsCkksEvaluator,
+    mod_switch_rns_ckks_to_next, multiply_plain_rns_ckks_with_ntt, rescale_rns_ckks_to_next,
+    CkksCanonicalEmbedding, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
@@ -148,4 +148,60 @@ pub fn scale_cp(
     }
 
     RnsCkksCiphertextMatrix::from_vec_column_major(input.rows(), input.cols(), data)
+}
+
+/// Computes `alpha * x + y` for encrypted matrices and a public real scalar.
+///
+/// Both encrypted operands must have identical shapes and CKKS states on input.
+/// `SCALE(alpha, x)` consumes one CKKS level while restoring the incoming scale.
+/// `y` is modulus-switched to the same next level without changing its scale,
+/// after which the aligned ciphertexts are added.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn axpy_cp(
+    evaluator: &RnsCkksEvaluator<'_>,
+    alpha: f64,
+    x: &RnsCkksCiphertextMatrix,
+    y: &RnsCkksCiphertextMatrix,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    assert_eq!(
+        x.rows(),
+        y.rows(),
+        "eBLAS AXPY operand row counts must match"
+    );
+    assert_eq!(
+        x.cols(),
+        y.cols(),
+        "eBLAS AXPY operand column counts must match"
+    );
+    assert_eq!(
+        x.level(),
+        y.level(),
+        "eBLAS AXPY operands must have matching levels"
+    );
+    assert_eq!(
+        x.scale(),
+        y.scale(),
+        "eBLAS AXPY operands must have matching scales"
+    );
+    assert_eq!(
+        x.get(0, 0).basis(),
+        y.get(0, 0).basis(),
+        "eBLAS AXPY operands must have matching bases"
+    );
+
+    let scaled_x = scale_cp(x, alpha, embedding, chain, plan);
+
+    let mut y_data = Vec::with_capacity(y.rows() * y.cols());
+    for col in 0..y.cols() {
+        for row in 0..y.rows() {
+            y_data.push(mod_switch_rns_ckks_to_next(y.get(row, col), chain));
+        }
+    }
+    let aligned_y = RnsCkksCiphertextMatrix::from_vec_column_major(y.rows(), y.cols(), y_data);
+
+    add_cc(evaluator, &scaled_x, &aligned_y)
 }

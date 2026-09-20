@@ -2,7 +2,7 @@ use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
     RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
-use ccmm_rs::eblas::{add_cc, scale_cp};
+use ccmm_rs::eblas::{add_cc, axpy_cp, scale_cp};
 use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::RnsCkksCiphertextMatrix;
 use ccmm_rs::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
@@ -22,7 +22,6 @@ fn encode_rns(
 ) -> RnsPolynomial {
     let slots = vec![Complex64::new(value, 0.0); embedding.slot_count()];
     let coefficients = embedding.slots_to_coefficients(&slots);
-
     let residues = basis
         .moduli()
         .iter()
@@ -38,7 +37,6 @@ fn encode_rns(
             )
         })
         .collect();
-
     RnsPolynomial::from_residues(residues)
 }
 
@@ -104,7 +102,6 @@ fn encrypt_vector(
             )
         })
         .collect();
-
     RnsCkksCiphertextMatrix::from_vec_column_major(values.len(), 1, data)
 }
 
@@ -119,13 +116,11 @@ fn decode_scalar(
     );
     let plaintext = decrypt_rns_raw_with_ntt(ciphertext.rlwe(), secret, &plan);
     let modulus = plaintext.composite_modulus();
-
     let coefficients: Vec<f64> = plaintext
         .reconstruct_coefficients()
         .into_iter()
         .map(|x| centered(x, modulus) as f64 / ciphertext.scale())
         .collect();
-
     let slots = embedding.coefficients_to_slots(&coefficients);
     slots.iter().map(|slot| slot.re).sum::<f64>() / slots.len() as f64
 }
@@ -198,23 +193,34 @@ fn main() {
 
     let added = add_cc(&evaluator, &x_ct, &y_ct);
     let scaled = scale_cp(&x_ct, alpha, &embedding, &chain, &plan);
+    let axpy = axpy_cp(&evaluator, alpha, &x_ct, &y_ct, &embedding, &chain, &plan);
 
     let add_expected: Vec<f64> = x.iter().zip(y).map(|(&a, b)| a + b).collect();
     let scale_expected: Vec<f64> = x.iter().map(|&value| alpha * value).collect();
+    let axpy_expected: Vec<f64> = x
+        .iter()
+        .zip(y)
+        .map(|(&x_value, y_value)| alpha * x_value + y_value)
+        .collect();
 
     let add_actual = decode_vector(&added, &secret, &embedding);
     let scale_actual = decode_vector(&scaled, &secret, &embedding);
+    let axpy_actual = decode_vector(&axpy, &secret, &embedding);
 
     let add_error = max_error(&add_actual, &add_expected);
     let scale_error = max_error(&scale_actual, &scale_expected);
+    let axpy_error = max_error(&axpy_actual, &axpy_expected);
 
     let input_level = x_ct.get(0, 0).level();
     let add_level = added.get(0, 0).level();
     let scale_level = scaled.get(0, 0).level();
+    let axpy_level = axpy.get(0, 0).level();
 
     let input_scale = x_ct.get(0, 0).scale();
     let add_scale = added.get(0, 0).scale();
     let scale_scale = scaled.get(0, 0).scale();
+    let axpy_scale = axpy.get(0, 0).scale();
+
     let dropped = chain
         .dropped_modulus(input_level)
         .expect("top level must have a dropped modulus")
@@ -222,13 +228,17 @@ fn main() {
     let expected_scale_after_scale = input_scale * dropped / dropped;
     let scale_relative_error =
         ((scale_scale - expected_scale_after_scale) / expected_scale_after_scale).abs();
+    let axpy_scale_relative_error = ((axpy_scale - input_scale) / input_scale).abs();
 
     let add_pass = add_error <= TOLERANCE && add_level == input_level && add_scale == input_scale;
     let scale_pass = scale_error <= TOLERANCE
         && scale_level == input_level + 1
         && scale_relative_error <= 1.0e-12;
+    let axpy_pass = axpy_error <= TOLERANCE
+        && axpy_level == input_level + 1
+        && axpy_scale_relative_error <= 1.0e-12;
 
-    println!("R3_5D1_EBLAS_LEVEL1_VERSION=1");
+    println!("R3_5D_EBLAS_LEVEL1_VERSION=2");
     println!("PROFILE=research-4096");
     println!("VECTOR_LENGTH={}", x.len());
     println!("ALPHA={alpha:.12}");
@@ -243,9 +253,14 @@ fn main() {
     println!("SCALE_RELATIVE_SCALE_ERROR={scale_relative_error:.12e}");
     println!("SCALE_MAX_ERROR={scale_error:.12e}");
     println!("SCALE_STATUS={}", if scale_pass { "PASS" } else { "FAIL" });
+    println!("AXPY_LEVEL={axpy_level}");
+    println!("AXPY_SCALE={axpy_scale:.12e}");
+    println!("AXPY_RELATIVE_SCALE_ERROR={axpy_scale_relative_error:.12e}");
+    println!("AXPY_MAX_ERROR={axpy_error:.12e}");
+    println!("AXPY_STATUS={}", if axpy_pass { "PASS" } else { "FAIL" });
     println!(
-        "R3_5D1_EBLAS_LEVEL1_STATUS={}",
-        if add_pass && scale_pass {
+        "R3_5D_EBLAS_LEVEL1_STATUS={}",
+        if add_pass && scale_pass && axpy_pass {
             "PASS"
         } else {
             "FAIL"
@@ -254,4 +269,5 @@ fn main() {
 
     assert!(add_pass, "eBLAS ADD validation failed");
     assert!(scale_pass, "eBLAS SCALE validation failed");
+    assert!(axpy_pass, "eBLAS AXPY validation failed");
 }

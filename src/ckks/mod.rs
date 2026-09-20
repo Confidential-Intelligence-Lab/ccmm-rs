@@ -23,6 +23,8 @@ mod rns_rescale;
 mod slot_encoder;
 mod slot_layout;
 
+mod rns_mod_switch;
+
 pub use automorphism::{
     apply_automorphism, canonical_slot_automorphism, conjugation_exponent,
     inverse_automorphism_exponent, rotation_exponent_left, rotation_exponent_right,
@@ -66,6 +68,8 @@ pub use rns_plain_multiply::multiply_plain_rns_ckks_with_ntt;
 pub use rns_rescale::rescale_rns_ckks_to_next;
 pub use slot_encoder::CkksSlotEncoder;
 pub use slot_layout::CkksSlotLayout;
+
+pub use rns_mod_switch::mod_switch_rns_ckks_to_next;
 
 use rand::{CryptoRng, RngCore};
 
