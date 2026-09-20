@@ -27,7 +27,14 @@ pub mod level1;
 pub use level1::{add_cc, axpy_cp, scale_cp};
 
 pub mod transpose;
+
+pub mod tensor_mapping;
 pub use transpose::{transpose_cipher, transpose_plain, transpose_pp};
+
+pub use tensor_mapping::{
+    batch_matrix_to_tensor3, flatten_nhwc_to_matrix, tensor3_to_batch_matrix,
+    unflatten_matrix_to_nhwc, Im2ColShape, NhwcShape, TensorBatchShape,
+};
 
 /// Operand privacy for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
