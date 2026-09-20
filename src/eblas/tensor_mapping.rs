@@ -110,6 +110,69 @@ impl NhwcShape {
     }
 }
 
+/// Logical tensor GEMM shape
+/// `[B,M,K] x [B,K,N] -> [B,M,N]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorGemmShape {
+    lhs: TensorBatchShape,
+    rhs: TensorBatchShape,
+    output: TensorBatchShape,
+}
+
+impl TensorGemmShape {
+    /// Creates a tensor GEMM shape with pairwise batch semantics.
+    pub fn new(lhs: TensorBatchShape, rhs: TensorBatchShape) -> Self {
+        assert_eq!(
+            lhs.batches(),
+            rhs.batches(),
+            "tensor GEMM batch counts must match"
+        );
+        assert_eq!(
+            lhs.cols(),
+            rhs.rows(),
+            "tensor GEMM inner dimensions must match"
+        );
+
+        Self {
+            lhs,
+            rhs,
+            output: TensorBatchShape::new(lhs.batches(), lhs.rows(), rhs.cols()),
+        }
+    }
+
+    pub const fn lhs(self) -> TensorBatchShape {
+        self.lhs
+    }
+
+    pub const fn rhs(self) -> TensorBatchShape {
+        self.rhs
+    }
+
+    pub const fn output(self) -> TensorBatchShape {
+        self.output
+    }
+
+    /// Converts the tensor contraction to the existing batched GEMM contract.
+    pub fn as_batched_gemm(self) -> crate::eblas::BatchedGemmShape {
+        crate::eblas::BatchedGemmShape::new(
+            self.lhs.batches(),
+            crate::eblas::GemmShape::new(
+                crate::eblas::MatrixShape::new(self.lhs.rows(), self.lhs.cols()),
+                crate::eblas::MatrixShape::new(self.rhs.rows(), self.rhs.cols()),
+            ),
+        )
+    }
+}
+
+/// Creates the eBLAS batched-GEMM execution contract corresponding to a
+/// logical tensor GEMM.
+pub fn tensor_gemm_spec(
+    shape: TensorGemmShape,
+    privacy: crate::eblas::PrivacyMode,
+) -> crate::eblas::BatchedGemmSpec {
+    crate::eblas::BatchedGemmSpec::new(shape.as_batched_gemm(), privacy)
+}
+
 /// Shape descriptor for same-shape im2col lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Im2ColShape {
@@ -264,6 +327,33 @@ pub fn unflatten_matrix_to_nhwc<T: Clone>(shape: NhwcShape, matrix: &BatchMatrix
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tensor_gemm_maps_exactly_to_batched_gemm() {
+        let shape = TensorGemmShape::new(
+            TensorBatchShape::new(3, 2, 3),
+            TensorBatchShape::new(3, 3, 4),
+        );
+        assert_eq!(shape.output(), TensorBatchShape::new(3, 2, 4));
+
+        let batched = shape.as_batched_gemm();
+        assert_eq!(batched.batches(), 3);
+        assert_eq!(batched.gemm().lhs(), crate::eblas::MatrixShape::new(2, 3));
+        assert_eq!(batched.gemm().rhs(), crate::eblas::MatrixShape::new(3, 4));
+        assert_eq!(
+            batched.gemm().output(),
+            crate::eblas::MatrixShape::new(2, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "batch counts must match")]
+    fn tensor_gemm_rejects_mismatched_batches() {
+        let _ = TensorGemmShape::new(
+            TensorBatchShape::new(2, 2, 3),
+            TensorBatchShape::new(3, 3, 4),
+        );
+    }
 
     #[test]
     fn tensor3_roundtrip_preserves_shape_and_storage() {

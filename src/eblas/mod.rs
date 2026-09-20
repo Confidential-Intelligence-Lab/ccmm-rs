@@ -32,8 +32,8 @@ pub mod tensor_mapping;
 pub use transpose::{transpose_cipher, transpose_plain, transpose_pp};
 
 pub use tensor_mapping::{
-    batch_matrix_to_tensor3, flatten_nhwc_to_matrix, tensor3_to_batch_matrix,
-    unflatten_matrix_to_nhwc, Im2ColShape, NhwcShape, TensorBatchShape,
+    batch_matrix_to_tensor3, flatten_nhwc_to_matrix, tensor3_to_batch_matrix, tensor_gemm_spec,
+    unflatten_matrix_to_nhwc, Im2ColShape, NhwcShape, TensorBatchShape, TensorGemmShape,
 };
 
 /// Operand privacy for one matrix.
