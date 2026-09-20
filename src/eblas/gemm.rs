@@ -81,6 +81,24 @@ pub fn gemm_cp(
     lhs.matmul_plain_with_ntt(rhs, chain, plan)
 }
 
+/// Executes plaintext/ciphertext GEMM by reducing it to the validated CP path.
+///
+/// Uses `A B = (B^T A^T)^T`; transposes are representation permutations.
+pub fn gemm_pc(
+    spec: GemmSpec,
+    lhs: &RnsCkksPlaintextMatrix,
+    rhs: &RnsCkksCiphertextMatrix,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    assert_eq!(spec.privacy(), PrivacyMode::Pc);
+    assert!(spec.supports_backend(GemmBackend::CpDirect));
+    assert_reference_shapes(spec, lhs.rows(), lhs.cols(), rhs.rows(), rhs.cols());
+    rhs.transpose()
+        .matmul_plain_with_ntt(&lhs.transpose(), chain, plan)
+        .transpose()
+}
+
 /// Executes ciphertext/ciphertext GEMM through an explicitly selected backend.
 ///
 /// R3.5b supports:

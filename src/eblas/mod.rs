@@ -11,13 +11,16 @@
 //! packages.
 
 pub mod gemm;
-pub use gemm::{gemm_cc, gemm_cp, gemm_pp};
+pub use gemm::{gemm_cc, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
 pub use gemv::{dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemvShape};
 
 pub mod level1;
 
 pub use level1::{add_cc, axpy_cp, scale_cp};
+
+pub mod transpose;
+pub use transpose::{transpose_cipher, transpose_plain, transpose_pp};
 
 /// Operand privacy for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,13 +250,13 @@ impl GemmSpec {
     /// - CC + CcScalar
     /// - CC + CcStructured
     ///
-    /// PC is part of the semantic contract but intentionally has no execution
-    /// backend yet.
+    /// PC reuses the CP direct backend through transpose reduction.
     pub const fn supports_backend(self, backend: GemmBackend) -> bool {
         matches!(
             (self.privacy, backend),
             (PrivacyMode::Pp, GemmBackend::Reference)
                 | (PrivacyMode::Cp, GemmBackend::CpDirect)
+                | (PrivacyMode::Pc, GemmBackend::CpDirect)
                 | (PrivacyMode::Cc, GemmBackend::CcScalar)
                 | (PrivacyMode::Cc, GemmBackend::CcStructured)
         )
@@ -377,14 +380,10 @@ mod tests {
         assert!(GemmSpec::new(shape, PrivacyMode::Cc).supports_backend(GemmBackend::CcScalar));
         assert!(GemmSpec::new(shape, PrivacyMode::Cc).supports_backend(GemmBackend::CcStructured));
 
-        for backend in [
-            GemmBackend::Reference,
-            GemmBackend::CpDirect,
-            GemmBackend::CcScalar,
-            GemmBackend::CcStructured,
-        ] {
-            assert!(!GemmSpec::new(shape, PrivacyMode::Pc).supports_backend(backend));
-        }
+        assert!(!GemmSpec::new(shape, PrivacyMode::Pc).supports_backend(GemmBackend::Reference));
+        assert!(GemmSpec::new(shape, PrivacyMode::Pc).supports_backend(GemmBackend::CpDirect));
+        assert!(!GemmSpec::new(shape, PrivacyMode::Pc).supports_backend(GemmBackend::CcScalar));
+        assert!(!GemmSpec::new(shape, PrivacyMode::Pc).supports_backend(GemmBackend::CcStructured));
     }
 
     #[test]

@@ -84,6 +84,17 @@ impl RnsCkksCiphertextMatrix {
         &self.data[self.index(row, col)]
     }
 
+    /// Returns the mathematical transpose without homomorphic arithmetic.
+    pub fn transpose(&self) -> Self {
+        let mut data = Vec::with_capacity(self.data.len());
+        for col in 0..self.rows {
+            for row in 0..self.cols {
+                data.push(self.get(col, row).clone());
+            }
+        }
+        Self::from_vec_column_major(self.cols, self.rows, data)
+    }
+
     pub fn level(&self) -> usize {
         self.data[0].level()
     }

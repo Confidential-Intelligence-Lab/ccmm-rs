@@ -87,6 +87,17 @@ impl RnsCkksPlaintextMatrix {
         self.data[0].degree()
     }
 
+    /// Returns the mathematical transpose while preserving column-major storage.
+    pub fn transpose(&self) -> Self {
+        let mut data = Vec::with_capacity(self.data.len());
+        for col in 0..self.rows {
+            for row in 0..self.cols {
+                data.push(self.get(col, row).clone());
+            }
+        }
+        Self::from_vec_column_major(self.cols, self.rows, self.scale, data)
+    }
+
     pub fn get(&self, row: usize, col: usize) -> &RnsPolynomial {
         assert!(
             row < self.rows,

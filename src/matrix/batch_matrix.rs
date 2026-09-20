@@ -78,6 +78,22 @@ impl<T> BatchMatrix<T> {
         self.data[index] = value;
     }
 
+    /// Returns the mathematical transpose while preserving column-major storage.
+    pub fn transpose(&self) -> Self
+    where
+        T: Clone,
+    {
+        let mut data = Vec::with_capacity(self.data.len());
+        for batch in 0..self.batches {
+            for col in 0..self.rows {
+                for row in 0..self.cols {
+                    data.push(self.get(batch, col, row).clone());
+                }
+            }
+        }
+        Self::from_vec_column_major(self.cols, self.rows, self.batches, data)
+    }
+
     pub fn raw(&self) -> &[T] {
         &self.data
     }
