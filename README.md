@@ -45,7 +45,12 @@ FHE-rs currently provides:
 
 ### Encrypted linear algebra
 
-The eBLAS layer provides a common interface for encrypted linear algebra:
+The **eBLAS (encrypted Basic Linear Algebra Subprograms)** interface was
+developed as part of FHE-rs to provide a common API for encrypted linear algebra.
+It defines linear-algebra operations, operand-privacy semantics, execution
+backends, batching and tensor mappings, and backend-selection policies.
+
+eBLAS currently provides:
 
 - GEMM;
 - GEMV;
@@ -230,8 +235,13 @@ the constructions of Jung Hee Cheon, Minsik Kang, and Junho Lee:
 > **Fast Batch Matrix Multiplication in Ciphertexts**, CRYPTO 2026.
 
 FHE-rs does not claim authorship of the CPMM or CCMM algorithms. The repository
-provides an independent native-Rust implementation together with CKKS, RNS/NTT,
-eBLAS, validation, characterization, and application infrastructure.
+provides an independent native-Rust implementation of those constructions.
+
+Building on that foundation, the **eBLAS interface and its implementation in
+FHE-rs are developed as part of this project**. eBLAS organizes encrypted
+linear algebra around common operations, explicit public/encrypted operand
+semantics, multiple execution backends, batching and tensor mappings, and
+measurement-driven backend selection.
 
 For detailed citation information, see [`CITATION.cff`](CITATION.cff).
 
