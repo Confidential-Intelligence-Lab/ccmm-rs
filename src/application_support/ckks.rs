@@ -5,8 +5,14 @@
 //! parameter-profile selection, key generation, workload semantics, and eBLAS
 //! dispatch remain explicit in the applications.
 
-use crate::ckks::{CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext};
-use crate::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
+use crate::ckks::{
+    multiply_relinearize_rescale_rns_ckks_bounded_with_ntt, CkksCanonicalEmbedding, CkksChainState,
+    RnsCkksCiphertext,
+};
+use crate::grafting::{
+    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+    BoundedRnsMultiplicationKey,
+};
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
 use crate::rlwe::ErrorDistribution;
@@ -148,4 +154,64 @@ pub fn decode_matrix(
     }
 
     (values, max_imag)
+}
+
+/// Applies the polynomial activation `x -> x^2` element-wise to an encrypted
+/// matrix using the bounded CKKS multiplication path.
+///
+/// Every entry must be at the same CKKS level and basis. The supplied
+/// multiplication key and NTT plan must correspond to that active basis.
+/// Squaring consumes exactly one CKKS level.
+pub fn square_matrix_bounded_with_ntt(
+    matrix: &RnsCkksCiphertextMatrix,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    let first = matrix.get(0, 0);
+
+    assert_eq!(
+        first.basis(),
+        multiplication_key.layout().full_basis(),
+        "square activation multiplication-key basis must match ciphertext basis"
+    );
+    assert_eq!(
+        plan.moduli(),
+        first.basis().moduli(),
+        "square activation NTT plan basis must match ciphertext basis"
+    );
+
+    let mut data = Vec::with_capacity(matrix.rows() * matrix.cols());
+
+    for col in 0..matrix.cols() {
+        for row in 0..matrix.rows() {
+            let ciphertext = matrix.get(row, col);
+
+            assert_eq!(
+                ciphertext.level(),
+                first.level(),
+                "square activation matrix entries must have matching levels"
+            );
+            assert_eq!(
+                ciphertext.basis(),
+                first.basis(),
+                "square activation matrix entries must have matching bases"
+            );
+            assert_eq!(
+                ciphertext.scale(),
+                first.scale(),
+                "square activation matrix entries must have matching scales"
+            );
+
+            data.push(multiply_relinearize_rescale_rns_ckks_bounded_with_ntt(
+                ciphertext,
+                ciphertext,
+                multiplication_key,
+                chain,
+                plan,
+            ));
+        }
+    }
+
+    RnsCkksCiphertextMatrix::from_vec_column_major(matrix.rows(), matrix.cols(), data)
 }
