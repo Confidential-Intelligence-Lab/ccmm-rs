@@ -1,46 +1,95 @@
-//! Native Rust research implementation of encrypted matrix multiplication
-//! over RLWE/CKKS-style ciphertexts.
+//! FHE-rs: homomorphic encryption and encrypted linear algebra in Rust.
+//!
+//! FHE-rs is a native Rust research library for building applications that
+//! compute directly on encrypted data. The current implementation provides
+//! leveled CKKS for approximate numerical computation together with encrypted
+//! vector, matrix, batched, and tensor operations through eBLAS.
+//!
+//! The project is currently developed in the `ccmm-rs` repository. The
+//! repository and Cargo package names are retained for now to preserve the
+//! history and reproducibility of the original encrypted matrix-multiplication
+//! work.
+//!
+//! # What the library provides
+//!
+//! - CKKS encoding, encryption, decryption, addition, and multiplication;
+//! - relinearization, rescaling, modulus switching, rotations, and conjugation;
+//! - RNS/NTT arithmetic and configurable modulus chains;
+//! - encrypted linear algebra through [`eblas`];
+//! - plaintext/encrypted and encrypted/encrypted operand combinations;
+//! - automatic selection between characterized encrypted GEMM backends;
+//! - batched GEMM and tensor-to-GEMM mappings;
+//! - shared CKKS support for application examples through
+//!   [`application_support`].
 //!
 //! # Architecture
 //!
-//! `ccmm-rs` intentionally contains two complementary paths:
+//! Applications should use eBLAS or stable evaluator interfaces rather than
+//! reconstructing low-level cryptographic schedules.
 //!
-//! - a small-parameter reference/correctness path for transparent CPMM/CCMM
-//!   validation; and
-//! - a Roadmap-2 RNS/NTT CKKS path for realistic ring dimensions, canonical
-//!   CKKS SIMD semantics, leveled evaluation, Galois operations, and encrypted
-//!   matrix multiplication.
+//! ```text
+//! Applications
+//!     |
+//!     v
+//! eBLAS and evaluator APIs
+//!     |
+//!     v
+//! CKKS evaluation
+//!     |
+//!     v
+//! RNS / NTT / modular arithmetic
+//! ```
+//!
+//! The original CPMM/CCMM work remains part of the implementation as one set
+//! of encrypted matrix-multiplication mechanisms. The eBLAS abstraction and
+//! its implementation are developed as part of FHE-rs; CPMM and CCMM are
+//! attributed to Cheon, Kang, and Lee.
 //!
 //! # Public modules
 //!
-//! - [`ccmm`] — reference CPMM/CCMM orchestration and matrix encryption helpers.
-//! - [`ckks`] — CKKS parameters, canonical embedding, leveled ciphertext state,
-//!   evaluation, rotations, conjugation, and RNS/NTT multiplication.
-//! - [`eval`] — reference evaluation-key and relinearization infrastructure.
-//! - [`grafting`] — RNS evaluation-key, key-switch, and grafting infrastructure.
-//! - [`matrix`] — batch, polynomial, and ciphertext matrix representations.
-//! - [`ring`] — polynomial arithmetic, moduli, RNS representation, and NTTs.
-//! - [`rlwe`] — RLWE ciphertexts, keys, encryption, decryption, and error models.
+//! - [`application_support`] — shared helpers for application examples;
+//! - [`ckks`] — CKKS parameters, encoding, ciphertext state, evaluation,
+//!   rotations, conjugation, and RNS/NTT multiplication;
+//! - [`eblas`] — encrypted Basic Linear Algebra Subprograms;
+//! - [`eval`] — key-switch and relinearization infrastructure;
+//! - [`grafting`] — RNS evaluation-key and modulus-transition infrastructure;
+//! - [`matrix`] — plaintext and ciphertext matrix representations;
+//! - [`ring`] — modular arithmetic, polynomial arithmetic, RNS, and NTTs;
+//! - [`rlwe`] — RLWE ciphertexts, keys, encryption, and error distributions;
+//! - [`ccmm`] — reference CPMM/CCMM orchestration retained for attribution,
+//!   validation, and reproducibility.
 //!
-//! # Security status
+//! # Security and maturity
 //!
-//! The realistic parameter profiles are currently research profiles and are
-//! not designated security-bearing. In particular, the validated Roadmap-2
-//! configuration uses discrete-Gaussian ciphertext error while retaining a
-//! zero-noise evaluation-key path.
+//! The `research-4096` parameter set has been evaluated against a 128-bit
+//! classical-security target for its underlying RLWE problem using the
+//! documented Lattice Estimator methodology and MATZOV reduction-cost model.
 //!
-//! See `docs/SECURITY_AND_PARAMETERS.md` for the security and parameter claim
-//! boundary, and `docs/REPRODUCIBILITY.md` for reproducibility guidance.
+//! FHE-rs remains research software. The current implementation has not
+//! undergone a third-party security audit, does not claim production
+//! side-channel hardening, uses a research Gaussian sampler, and retains an
+//! explicit circular/KDM assumption for the current secret-dependent
+//! evaluation-key construction.
 //!
-//! # Examples
+//! See `docs/SECURITY_AND_PARAMETERS.md` and `docs/ASSURANCE.md` for the exact
+//! claim boundaries.
 //!
-//! Realistic Roadmap-2 examples are available under `examples/`:
+//! # Applications
 //!
-//! - `ckks_simd_4096.rs`
-//! - `rns_ccmm_4096.rs`
+//! Current runnable applications include:
 //!
-//! The legacy/reference oracle and characterization binaries remain available
-//! under `src/bin/`.
+//! - private linear inference with encrypted inputs and public model weights;
+//! - encrypted two-party matrix multiplication;
+//! - eBLAS validation and characterization workloads.
+//!
+//! See `docs/APPLICATIONS.md` and `docs/GETTING_STARTED.md` for application
+//! development guidance.
+//!
+//! # Current scope
+//!
+//! FHE-rs currently provides leveled CKKS. Bootstrapping, integer/discrete
+//! CKKS, additional HE schemes, accelerator backends, and production hardening
+//! are future extensions.
 
 pub mod application_support;
 pub mod ccmm;
