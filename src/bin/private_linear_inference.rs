@@ -1,129 +1,15 @@
 use std::time::Instant;
 
-use ccmm_rs::ckks::{
-    research_4096_security_model, research_profile_4096, CkksCanonicalEmbedding, CkksChainState,
-    RnsCkksCiphertext,
+use ccmm_rs::application_support::ckks::{
+    decode_scalar, encode_plain_scalar, encrypt_scalar, EncryptionContext,
 };
+use ccmm_rs::ckks::{research_4096_security_model, research_profile_4096, CkksCanonicalEmbedding};
 use ccmm_rs::eblas::{gemm_cp, GemmShape, GemmSpec, MatrixShape, PrivacyMode};
-use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::{RnsCkksCiphertextMatrix, RnsCkksPlaintextMatrix};
-use ccmm_rs::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
+use ccmm_rs::ring::RnsNttPlan;
 use ccmm_rs::rlwe::ErrorDistribution;
-use num_complex::Complex64;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-
-fn encode_rns(
-    slots: &[Complex64],
-    embedding: &CkksCanonicalEmbedding,
-    basis: &ModulusBasis,
-    scale: f64,
-) -> RnsPolynomial {
-    let coefficients = embedding.slots_to_coefficients(slots);
-
-    let residues = basis
-        .moduli()
-        .iter()
-        .copied()
-        .map(|modulus| {
-            let q = i128::from(modulus.value());
-
-            Polynomial::new(
-                modulus,
-                coefficients
-                    .iter()
-                    .map(|&value| {
-                        let signed = (value * scale).round() as i128;
-                        signed.rem_euclid(q) as u64
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
-
-    RnsPolynomial::from_residues(residues)
-}
-
-fn centered(value: u128, modulus: u128) -> i128 {
-    if value > modulus / 2 {
-        value as i128 - modulus as i128
-    } else {
-        value as i128
-    }
-}
-
-struct EncryptionContext<'a> {
-    embedding: &'a CkksCanonicalEmbedding,
-    basis: &'a ModulusBasis,
-    scale: f64,
-    secret: &'a [i8],
-    plan: &'a RnsNttPlan,
-    chain: &'a ccmm_rs::ring::ModulusChain,
-    distribution: ErrorDistribution,
-}
-
-fn encrypt_scalar(value: f64, seed: u64, context: &EncryptionContext<'_>) -> RnsCkksCiphertext {
-    let slots = vec![Complex64::new(value, 0.0); context.secret.len() / 2];
-
-    let plaintext = encode_rns(&slots, context.embedding, context.basis, context.scale);
-
-    let mut rng = ChaCha20Rng::seed_from_u64(seed);
-
-    let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
-        &plaintext,
-        2,
-        context.distribution,
-        context.secret,
-        context.plan,
-        &mut rng,
-    );
-
-    RnsCkksCiphertext::new(
-        rlwe,
-        CkksChainState::top(context.chain, context.scale),
-        context.chain,
-    )
-}
-
-fn encode_plain_scalar(
-    value: f64,
-    embedding: &CkksCanonicalEmbedding,
-    basis: &ModulusBasis,
-    scale: f64,
-) -> RnsPolynomial {
-    let slots = vec![Complex64::new(value, 0.0); embedding.slot_count()];
-    encode_rns(&slots, embedding, basis, scale)
-}
-
-fn decode_scalar(
-    ciphertext: &RnsCkksCiphertext,
-    secret: &[i8],
-    embedding: &CkksCanonicalEmbedding,
-) -> (f64, f64) {
-    let plan = RnsNttPlan::new(
-        ciphertext.basis().moduli().to_vec(),
-        ciphertext.rlwe().degree(),
-    );
-
-    let plaintext = decrypt_rns_raw_with_ntt(ciphertext.rlwe(), secret, &plan);
-    let modulus = plaintext.composite_modulus();
-
-    let coefficients: Vec<f64> = plaintext
-        .reconstruct_coefficients()
-        .into_iter()
-        .map(|value| centered(value, modulus) as f64 / ciphertext.scale())
-        .collect();
-
-    let slots = embedding.coefficients_to_slots(&coefficients);
-
-    let mean = slots.iter().map(|slot| slot.re).sum::<f64>() / slots.len() as f64;
-    let max_imag = slots
-        .iter()
-        .map(|slot| slot.im.abs())
-        .fold(0.0_f64, f64::max);
-
-    (mean, max_imag)
-}
 
 fn main() {
     const SIGMA: f64 = 3.19;

@@ -42,6 +42,7 @@
 //! The legacy/reference oracle and characterization binaries remain available
 //! under `src/bin/`.
 
+pub mod application_support;
 pub mod ccmm;
 pub mod ckks;
 pub mod eblas;
