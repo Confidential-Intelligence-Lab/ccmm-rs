@@ -4,6 +4,7 @@ use ccmm_rs::ckks::{
     research_4096_security_model, research_profile_4096, CkksCanonicalEmbedding, CkksChainState,
     RnsCkksCiphertext,
 };
+use ccmm_rs::eblas::{gemm_cp, GemmShape, GemmSpec, MatrixShape, PrivacyMode};
 use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::{RnsCkksCiphertextMatrix, RnsCkksPlaintextMatrix};
 use ccmm_rs::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
@@ -207,10 +208,19 @@ fn main() {
 
     let weight_encoding_us = encoding_start.elapsed().as_secs_f64() * 1.0e6;
 
+    let gemm_spec = GemmSpec::new(
+        GemmShape::new(MatrixShape::new(1, 4), MatrixShape::new(4, 3)),
+        PrivacyMode::Cp,
+    );
+
     let inference_start = Instant::now();
-
-    let encrypted_output = encrypted_input.matmul_plain_with_ntt(&plaintext_weights, &chain, &plan);
-
+    let encrypted_output = gemm_cp(
+        gemm_spec,
+        &encrypted_input,
+        &plaintext_weights,
+        &chain,
+        &plan,
+    );
     let inference_us = inference_start.elapsed().as_secs_f64() * 1.0e6;
 
     assert_eq!(encrypted_output.rows(), 1);
@@ -235,6 +245,9 @@ fn main() {
 
     println!("R3_2B_PRIVATE_LINEAR_INFERENCE_VERSION=1");
     println!("APPLICATION=private-linear-inference");
+    println!("EBLAS_OPERATION=GEMM");
+    println!("EBLAS_PRIVACY_MODE=CP");
+    println!("EBLAS_BACKEND=CpDirect");
     println!("PROFILE={}", profile.name());
     println!("RING_DEGREE={degree}");
     println!("SLOT_COUNT={}", profile.slot_count());

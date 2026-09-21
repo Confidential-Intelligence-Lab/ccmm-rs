@@ -4,6 +4,10 @@ use ccmm_rs::ckks::{
     research_4096_security_model, research_profile_4096, CkksCanonicalEmbedding, CkksChainState,
     RnsCkksCiphertext,
 };
+use ccmm_rs::eblas::{
+    gemm_cc_auto, select_cc_backend, GemmOperationCount, GemmShape, GemmSpec, MatrixShape,
+    PrivacyMode,
+};
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
     BoundedRnsKeygenConfig, BoundedRnsMultiplicationKey,
@@ -212,11 +216,22 @@ fn main() {
 
     let encryption_us = encryption_start.elapsed().as_secs_f64() * 1.0e6;
 
+    let gemm_spec = GemmSpec::new(
+        GemmShape::new(MatrixShape::new(2, 2), MatrixShape::new(2, 2)),
+        PrivacyMode::Cc,
+    );
+    let backend = select_cc_backend(gemm_spec);
+    let operation_count = GemmOperationCount::for_backend(gemm_spec, backend);
+
     let evaluation_start = Instant::now();
-
-    let encrypted_product =
-        encrypted_a.matmul_bounded_with_ntt(&encrypted_b, &multiplication_key, &chain, &plan);
-
+    let encrypted_product = gemm_cc_auto(
+        gemm_spec,
+        &encrypted_a,
+        &encrypted_b,
+        &multiplication_key,
+        &chain,
+        &plan,
+    );
     let evaluation_us = evaluation_start.elapsed().as_secs_f64() * 1.0e6;
 
     assert_eq!(encrypted_product.rows(), 2);
@@ -244,6 +259,9 @@ fn main() {
 
     println!("R3_2C_PRIVATE_TWO_PARTY_MATRIX_PRODUCT_VERSION=1");
     println!("APPLICATION=private-two-party-matrix-product");
+    println!("EBLAS_OPERATION=GEMM");
+    println!("EBLAS_PRIVACY_MODE=CC");
+    println!("EBLAS_BACKEND={backend:?}");
     println!("PROFILE={}", profile.name());
     println!("RING_DEGREE={degree}");
     println!("SLOT_COUNT={}", profile.slot_count());
@@ -253,8 +271,13 @@ fn main() {
     );
     println!("PARTY_A_ENCRYPTED_VALUES=4");
     println!("PARTY_B_ENCRYPTED_VALUES=4");
-    println!("SCALAR_CKKS_MULTIPLIES=8");
-    println!("CIPHERTEXT_ADDITIONS=4");
+    println!("EBLAS_SCALAR_PRODUCTS={}", operation_count.scalar_products);
+    println!("EBLAS_SCALAR_ADDITIONS={}", operation_count.additions);
+    println!(
+        "EBLAS_RELINEARIZATIONS={}",
+        operation_count.relinearizations
+    );
+    println!("EBLAS_RESCALES={}", operation_count.rescales);
     println!("EVALUATION_KEY_REQUIRED=true");
     println!("BOUNDED_BASE_LOG={BASE_LOG}");
     println!("BOUNDED_BASE={}", layout.base());
