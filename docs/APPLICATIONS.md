@@ -71,8 +71,7 @@ The retained validation output is available in
 
 The remaining application set focuses on:
 
-1. tensor / pointwise-convolution workloads using tensor-to-batched-GEMM;
-2. proxy re-encryption as a cryptographic service.
+1. proxy re-encryption as a cryptographic service.
 
 These additions are intentionally bounded so the project can return to resilience integration after the application layer is complete.
 4. proxy re-encryption as a security-service application exercising
