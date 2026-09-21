@@ -303,6 +303,32 @@ The supported R3.1 statement is:
 
 This statement is intentionally narrower than a production-security claim.
 
+## Proxy Re-Encryption Prototype Claim Boundary
+
+The R3.6 proxy re-encryption application is a correctness prototype built from
+the generic RNS source-to-target key-switch primitive. It demonstrates that a
+ciphertext under a source secret can be transformed by a proxy and subsequently
+decrypted under a target secret while preserving the encoded plaintext.
+
+The current generic CRT-block key-switch path is retained primarily as a
+correctness and differential-testing mechanism. In the PRE experiment, adding
+Gaussian error to the re-encryption key at the `research-4096` parameter point
+caused unacceptable numerical error amplification. The retained passing
+prototype therefore uses a zero-noise re-encryption key and reports:
+
+```text
+REENCRYPTION_KEY_SECURITY_BEARING=false
+PRE_SECURITY_CLAIM=false
+CCA_SECURITY_CLAIM=false
+COLLUSION_RESISTANCE_CLAIM=false
+UNIDIRECTIONAL_SECURITY_CLAIM=false
+```
+
+This result does not weaken the separately characterized bounded-base
+multiplication/relinearization path. A security-bearing PRE service requires an
+appropriate bounded or otherwise noise-controlled generic source-to-target
+key-switch construction, followed by its own security analysis and validation.
+
 ## What Is Not Claimed
 
 The current artifact does **not** claim:

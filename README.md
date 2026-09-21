@@ -17,15 +17,16 @@ FHE-rs is intended for applications where data should remain encrypted during
 computation. Current examples and validated workloads include:
 
 - private linear inference with encrypted inputs and public model weights;
-- encrypted matrix multiplication with one encrypted operand;
-- encrypted matrix multiplication with both operands encrypted;
+- private nonlinear / MLP inference with an encrypted square activation;
+- encrypted matrix multiplication with one or both operands encrypted;
 - computations over data encrypted by multiple parties;
 - batched matrix multiplication;
 - tensor workloads mapped to encrypted matrix multiplication;
-- convolution-style workloads expressed through tensor-to-matrix mappings.
+- private 1x1 pointwise convolution through NHWC-to-matrix lowering; and
+- a proxy re-encryption correctness prototype built from generic RNS key switching.
 
-The next application layer adds private MLP-style inference, richer tensor
-workloads, and proxy re-encryption as a cryptographic service.
+The current application suite is intentionally sufficient to exercise the
+workload and security-service layers for the next resilience-integration phase.
 
 ## Features
 
@@ -200,7 +201,8 @@ Not yet implemented:
 - integer/discrete CKKS;
 - additional homomorphic-encryption schemes;
 - GPU or FPGA execution backends;
-- production hardening and third-party audit.
+- production hardening and third-party audit;
+- a security-bearing proxy re-encryption construction.
 
 These are planned extensions, but they are not required for the current
 application and resilience research.
