@@ -208,6 +208,23 @@ impl RnsCkksCiphertextMatrix {
         chain: &crate::ring::ModulusChain,
         plan: &RnsNttPlan,
     ) -> Self {
+        self.matmul_structured_bounded_with_ntt_observed(rhs, multiplication_key, chain, plan, None)
+    }
+
+    /// Matrix-structured bounded-Gaussian CCMM with optional execution
+    /// observation.
+    ///
+    /// The mathematical schedule is identical to
+    /// `matmul_structured_bounded_with_ntt`; observation only records
+    /// primitive execution events.
+    pub fn matmul_structured_bounded_with_ntt_observed(
+        &self,
+        rhs: &Self,
+        multiplication_key: &crate::grafting::BoundedRnsMultiplicationKey,
+        chain: &crate::ring::ModulusChain,
+        plan: &RnsNttPlan,
+        mut trace: Option<&mut crate::execution::ExecutionTrace>,
+    ) -> Self {
         assert_eq!(
             self.cols, rhs.rows,
             "RNS CKKS matrix dimensions must be compatible"
@@ -272,10 +289,11 @@ impl RnsCkksCiphertextMatrix {
                     );
                 }
 
-                let relinearized = crate::grafting::bounded_rns_relinearize_with_ntt(
+                let relinearized = crate::grafting::bounded_rns_relinearize_with_ntt_observed(
                     &quadratic,
                     multiplication_key,
                     plan,
+                    trace.as_deref_mut(),
                 );
 
                 let product_state = self
@@ -286,7 +304,11 @@ impl RnsCkksCiphertextMatrix {
                 let product =
                     crate::ckks::RnsCkksCiphertext::new(relinearized, product_state, chain);
 
-                data.push(crate::ckks::rescale_rns_ckks_to_next(&product, chain));
+                data.push(crate::ckks::rescale_rns_ckks_to_next_observed(
+                    &product,
+                    chain,
+                    trace.as_deref_mut(),
+                ));
             }
         }
 

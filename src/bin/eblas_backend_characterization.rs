@@ -6,11 +6,13 @@
 use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
 };
+use ccmm_rs::eblas::gemm_cc_structured_observed;
 use ccmm_rs::eblas::gemm_representation_profile;
 use ccmm_rs::eblas::{
     gemm_cc, gemm_cp, gemm_execution_profile, GemmBackend, GemmOperationCount, GemmShape, GemmSpec,
     MatrixShape, PrivacyMode,
 };
+use ccmm_rs::execution::{ExecutionDevice, ExecutionEventKind, ExecutionTrace};
 use ccmm_rs::grafting::{
     encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout, BoundedRnsKeygenConfig,
     BoundedRnsMultiplicationKey,
@@ -422,6 +424,45 @@ fn main() {
         let scalar_representation = gemm_representation_profile(cc_spec, embedding.slot_count());
         let structured_representation =
             gemm_representation_profile(cc_spec, embedding.slot_count());
+
+        // R4.0b: observed structured-CCMM execution is intentionally outside
+        // the benchmark timing region. The existing timing continues to
+        // characterize only the normal eBLAS GEMM call.
+        let mut observed_trace = ExecutionTrace::new(ExecutionDevice::Cpu);
+
+        let observed_output = gemm_cc_structured_observed(
+            cc_spec,
+            &lhs_ct,
+            &rhs_ct,
+            &multiplication_key,
+            &chain,
+            &plan,
+            &mut observed_trace,
+        );
+        black_box(observed_output);
+
+        let observed_relinearizations = observed_trace.count(ExecutionEventKind::Relinearize);
+        let observed_rescales = observed_trace.count(ExecutionEventKind::Rescale);
+
+        assert_eq!(
+            observed_relinearizations, structured_execution.relinearizations,
+            "observed structured-CCMM relinearization count diverged from static profile"
+        );
+        assert_eq!(
+            observed_rescales, structured_execution.rescales,
+            "observed structured-CCMM rescale count diverged from static profile"
+        );
+
+        println!(
+            "OBSERVED_CCMM,{},{},{},{},{},{},{}",
+            workload.name,
+            workload.m,
+            workload.k,
+            workload.n,
+            observed_relinearizations,
+            observed_rescales,
+            observed_trace.len(),
+        );
 
         print_result(
             workload,

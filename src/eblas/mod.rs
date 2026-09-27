@@ -22,7 +22,7 @@ pub use batched_gemm::{
     BatchedGemmOperationCount, BatchedGemmShape, BatchedGemmSpec,
 };
 
-pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cp, gemm_pc, gemm_pp};
+pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
 pub use gemv::{
     dot_cc, dot_cc_auto, dot_cp, dot_pp, gemv_cc, gemv_cc_auto, gemv_cp, gemv_pp, DotShape,

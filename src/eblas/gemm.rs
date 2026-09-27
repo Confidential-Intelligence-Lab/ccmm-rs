@@ -134,6 +134,34 @@ pub fn gemm_cc(
     }
 }
 
+/// Executes structured ciphertext/ciphertext GEMM while recording observed
+/// primitive execution events.
+///
+/// This entry point exists for characterization and assurance. Normal eBLAS
+/// execution remains unchanged.
+pub fn gemm_cc_structured_observed(
+    spec: GemmSpec,
+    lhs: &RnsCkksCiphertextMatrix,
+    rhs: &RnsCkksCiphertextMatrix,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    trace: &mut crate::execution::ExecutionTrace,
+) -> RnsCkksCiphertextMatrix {
+    assert_eq!(spec.privacy(), PrivacyMode::Cc);
+    assert!(spec.supports_backend(GemmBackend::CcStructured));
+
+    assert_reference_shapes(spec, lhs.rows(), lhs.cols(), rhs.rows(), rhs.cols());
+
+    lhs.matmul_structured_bounded_with_ntt_observed(
+        rhs,
+        multiplication_key,
+        chain,
+        plan,
+        Some(trace),
+    )
+}
+
 /// Executes ciphertext/ciphertext GEMM using the frozen R3.5 backend policy.
 ///
 /// Explicit `gemm_cc` selection remains available for reproducible experiments.
