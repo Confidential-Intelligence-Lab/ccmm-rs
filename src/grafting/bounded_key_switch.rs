@@ -128,6 +128,20 @@ pub fn bounded_rns_relinearize_with_ntt(
     multiplication_key: &BoundedRnsMultiplicationKey,
     plan: &RnsNttPlan,
 ) -> RnsRlweCiphertext {
+    bounded_rns_relinearize_with_ntt_observed(product, multiplication_key, plan, None)
+}
+
+/// Performs bounded NTT-backed relinearization and optionally records the
+/// observed primitive event.
+///
+/// This primitive does not itself carry CKKS chain state, so the event records
+/// ring degree and RNS width but deliberately leaves CKKS level unspecified.
+pub fn bounded_rns_relinearize_with_ntt_observed(
+    product: &RnsQuadraticCiphertext,
+    multiplication_key: &BoundedRnsMultiplicationKey,
+    plan: &RnsNttPlan,
+    trace: Option<&mut crate::execution::ExecutionTrace>,
+) -> RnsRlweCiphertext {
     let layout = multiplication_key.layout();
 
     assert_eq!(
@@ -190,7 +204,22 @@ pub fn bounded_rns_relinearize_with_ntt(
         output_limbs.push(RlweCiphertext::new(b, a));
     }
 
-    RnsRlweCiphertext::from_limbs(output_limbs)
+    {
+        let result = RnsRlweCiphertext::from_limbs(output_limbs);
+
+        if let Some(trace) = trace {
+            trace.record(
+                crate::execution::ExecutionEvent::new(
+                    crate::execution::ExecutionEventKind::Relinearize,
+                )
+                .with_ring_degree(plan.degree())
+                .with_rns_limbs(layout.full_basis().len())
+                .with_rns_limbs_after(result.basis().len()),
+            );
+        }
+
+        result
+    }
 }
 
 fn signed_mod_u64(value: i128, modulus: u64) -> u64 {
@@ -283,7 +312,35 @@ mod tests {
                 &mut key_rng,
             );
 
-            let actual_ciphertext = bounded_rns_relinearize_with_ntt(&quadratic, &key, &plan);
+            // R4.0b observed relinearization: exercise the production
+            // primitive while recording its device-neutral execution event.
+            let mut trace =
+                crate::execution::ExecutionTrace::new(crate::execution::ExecutionDevice::Cpu);
+
+            let actual_ciphertext = bounded_rns_relinearize_with_ntt_observed(
+                &quadratic,
+                &key,
+                &plan,
+                Some(&mut trace),
+            );
+
+            assert_eq!(
+                trace.count(crate::execution::ExecutionEventKind::Relinearize),
+                1
+            );
+            assert_eq!(trace.len(), 1);
+
+            let event = trace.events()[0];
+
+            assert_eq!(
+                event.kind,
+                crate::execution::ExecutionEventKind::Relinearize
+            );
+            assert_eq!(event.ring_degree, Some(degree));
+            assert_eq!(event.level, None);
+            assert_eq!(event.level_after, None);
+            assert_eq!(event.rns_limbs, Some(basis.len()));
+            assert_eq!(event.rns_limbs_after, Some(basis.len()));
 
             let actual = decrypt_rns_raw_with_ntt(&actual_ciphertext, &secret, &plan);
 

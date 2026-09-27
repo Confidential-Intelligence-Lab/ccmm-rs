@@ -55,8 +55,18 @@ pub enum ExecutionEventKind {
 pub struct ExecutionEvent {
     pub kind: ExecutionEventKind,
     pub ring_degree: Option<usize>,
+
+    /// Input CKKS level when known.
     pub level: Option<usize>,
+
+    /// Output CKKS level when the event changes level.
+    pub level_after: Option<usize>,
+
+    /// Input RNS width when known.
     pub rns_limbs: Option<usize>,
+
+    /// Output RNS width when the event changes basis width.
+    pub rns_limbs_after: Option<usize>,
 }
 
 impl ExecutionEvent {
@@ -66,7 +76,9 @@ impl ExecutionEvent {
             kind,
             ring_degree: None,
             level: None,
+            level_after: None,
             rns_limbs: None,
+            rns_limbs_after: None,
         }
     }
 
@@ -85,6 +97,18 @@ impl ExecutionEvent {
     /// Adds active RNS-width metadata.
     pub const fn with_rns_limbs(mut self, rns_limbs: usize) -> Self {
         self.rns_limbs = Some(rns_limbs);
+        self
+    }
+
+    /// Adds output CKKS-level metadata for a state transition.
+    pub const fn with_level_after(mut self, level_after: usize) -> Self {
+        self.level_after = Some(level_after);
+        self
+    }
+
+    /// Adds output RNS-width metadata for a state transition.
+    pub const fn with_rns_limbs_after(mut self, rns_limbs_after: usize) -> Self {
+        self.rns_limbs_after = Some(rns_limbs_after);
         self
     }
 }
@@ -265,6 +289,8 @@ mod tests {
         assert_eq!(trace.events()[1].ring_degree, Some(16));
         assert_eq!(trace.events()[1].level, Some(2));
         assert_eq!(trace.events()[1].rns_limbs, Some(3));
+        assert_eq!(trace.events()[1].level_after, None);
+        assert_eq!(trace.events()[1].rns_limbs_after, None);
     }
 
     #[test]

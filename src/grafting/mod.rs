@@ -41,7 +41,8 @@ pub mod rns_gadget;
 pub use bounded_gadget::{BoundedGadgetDecomposition, BoundedGadgetLayout};
 pub mod bounded_gadget;
 pub use bounded_key_switch::{
-    bounded_rns_relinearize_with_ntt, BoundedRnsKeygenConfig, BoundedRnsMultiplicationKey,
+    bounded_rns_relinearize_with_ntt, bounded_rns_relinearize_with_ntt_observed,
+    BoundedRnsKeygenConfig, BoundedRnsMultiplicationKey,
 };
 pub mod bounded_key_switch;
 pub use key_switch::{relinearize_scheduled, GadgetDigitSchedule};

@@ -65,11 +65,11 @@ pub use rns_multiply::{
     multiply_relinearize_rescale_rns_ckks_with_ntt,
 };
 pub use rns_plain_multiply::multiply_plain_rns_ckks_with_ntt;
-pub use rns_rescale::rescale_rns_ckks_to_next;
+pub use rns_rescale::{rescale_rns_ckks_to_next, rescale_rns_ckks_to_next_observed};
 pub use slot_encoder::CkksSlotEncoder;
 pub use slot_layout::CkksSlotLayout;
 
-pub use rns_mod_switch::mod_switch_rns_ckks_to_next;
+pub use rns_mod_switch::{mod_switch_rns_ckks_to_next, mod_switch_rns_ckks_to_next_observed};
 
 use rand::{CryptoRng, RngCore};
 

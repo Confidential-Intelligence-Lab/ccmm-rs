@@ -20,9 +20,21 @@ pub fn rescale_rns_ckks_to_next(
     ciphertext: &RnsCkksCiphertext,
     chain: &ModulusChain,
 ) -> RnsCkksCiphertext {
+    rescale_rns_ckks_to_next_observed(ciphertext, chain, None)
+}
+
+/// Rescales one RNS CKKS ciphertext and optionally records the observed
+/// transition in a device-neutral execution trace.
+pub fn rescale_rns_ckks_to_next_observed(
+    ciphertext: &RnsCkksCiphertext,
+    chain: &ModulusChain,
+    trace: Option<&mut crate::execution::ExecutionTrace>,
+) -> RnsCkksCiphertext {
     ciphertext.assert_matches_chain(chain);
 
     let level = ciphertext.level();
+    let ring_degree = ciphertext.rlwe().degree();
+    let rns_limbs = ciphertext.basis().len();
 
     let dropped = chain
         .dropped_modulus(level)
@@ -31,8 +43,20 @@ pub fn rescale_rns_ckks_to_next(
     let next_state = ciphertext.state().after_rescale(chain);
 
     let inner = rescale_rns_rlwe(ciphertext.rlwe(), dropped);
+    let result = RnsCkksCiphertext::new(inner, next_state, chain);
 
-    RnsCkksCiphertext::new(inner, next_state, chain)
+    if let Some(trace) = trace {
+        trace.record(
+            crate::execution::ExecutionEvent::new(crate::execution::ExecutionEventKind::Rescale)
+                .with_ring_degree(ring_degree)
+                .with_level(level)
+                .with_level_after(result.level())
+                .with_rns_limbs(rns_limbs)
+                .with_rns_limbs_after(result.basis().len()),
+        );
+    }
+
+    result
 }
 
 /// Rescales both RLWE components limb-by-limb.
@@ -243,6 +267,37 @@ mod tests {
         let inner = rns_rlwe_from_coefficients(chain.top(), coefficients_b, coefficients_a);
 
         RnsCkksCiphertext::new(inner, CkksChainState::top(chain, scale), chain)
+    }
+
+    #[test]
+    fn observed_rescale_records_transition_metadata() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind, ExecutionTrace};
+
+        let chain = chain();
+        let ciphertext = ciphertext_from_coefficients(
+            &chain,
+            &[1, 17, 42, 65_537],
+            &[9, 21, 77, 131],
+            65_537.0 * 65_537.0,
+        );
+        let mut trace = ExecutionTrace::new(ExecutionDevice::Cpu);
+
+        let result = rescale_rns_ckks_to_next_observed(&ciphertext, &chain, Some(&mut trace));
+
+        assert_eq!(trace.count(ExecutionEventKind::Rescale), 1);
+        assert_eq!(trace.len(), 1);
+
+        let event = trace.events()[0];
+
+        assert_eq!(event.kind, ExecutionEventKind::Rescale);
+        assert_eq!(event.ring_degree, Some(ciphertext.rlwe().degree()));
+        assert_eq!(event.level, Some(0));
+        assert_eq!(event.level_after, Some(1));
+        assert_eq!(event.rns_limbs, Some(3));
+        assert_eq!(event.rns_limbs_after, Some(2));
+
+        assert_eq!(result.level(), 1);
+        assert_eq!(result.basis().len(), 2);
     }
 
     #[test]

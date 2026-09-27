@@ -15,9 +15,23 @@ pub fn mod_switch_rns_ckks_to_next(
     ciphertext: &RnsCkksCiphertext,
     chain: &ModulusChain,
 ) -> RnsCkksCiphertext {
+    mod_switch_rns_ckks_to_next_observed(ciphertext, chain, None)
+}
+
+/// Projects one RNS CKKS ciphertext to the next modulus-chain level and
+/// optionally records the observed transition.
+pub fn mod_switch_rns_ckks_to_next_observed(
+    ciphertext: &RnsCkksCiphertext,
+    chain: &ModulusChain,
+    trace: Option<&mut crate::execution::ExecutionTrace>,
+) -> RnsCkksCiphertext {
     ciphertext.assert_matches_chain(chain);
 
-    let next_level = ciphertext.level() + 1;
+    let level = ciphertext.level();
+    let ring_degree = ciphertext.rlwe().degree();
+    let rns_limbs = ciphertext.basis().len();
+
+    let next_level = level + 1;
     assert!(
         next_level <= chain.max_level(),
         "cannot modulus-switch the final CKKS chain level"
@@ -28,8 +42,20 @@ pub fn mod_switch_rns_ckks_to_next(
     let inner = RnsRlweCiphertext::from_limbs(retained_limbs);
 
     let state = CkksChainState::new(chain, next_level, ciphertext.scale());
+    let result = RnsCkksCiphertext::new(inner, state, chain);
 
-    RnsCkksCiphertext::new(inner, state, chain)
+    if let Some(trace) = trace {
+        trace.record(
+            crate::execution::ExecutionEvent::new(crate::execution::ExecutionEventKind::ModSwitch)
+                .with_ring_degree(ring_degree)
+                .with_level(level)
+                .with_level_after(result.level())
+                .with_rns_limbs(rns_limbs)
+                .with_rns_limbs_after(result.basis().len()),
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -83,6 +109,35 @@ mod tests {
             CkksChainState::top(chain, 65_537.0),
             chain,
         )
+    }
+
+    #[test]
+    fn observed_mod_switch_records_transition_metadata() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind, ExecutionTrace};
+
+        let chain = chain();
+        let input = ciphertext(&chain);
+        let input_scale = input.scale();
+
+        let mut trace = ExecutionTrace::new(ExecutionDevice::Cpu);
+
+        let output = mod_switch_rns_ckks_to_next_observed(&input, &chain, Some(&mut trace));
+
+        assert_eq!(trace.count(ExecutionEventKind::ModSwitch), 1);
+        assert_eq!(trace.len(), 1);
+
+        let event = trace.events()[0];
+
+        assert_eq!(event.kind, ExecutionEventKind::ModSwitch);
+        assert_eq!(event.ring_degree, Some(input.rlwe().degree()));
+        assert_eq!(event.level, Some(0));
+        assert_eq!(event.level_after, Some(1));
+        assert_eq!(event.rns_limbs, Some(3));
+        assert_eq!(event.rns_limbs_after, Some(2));
+
+        assert_eq!(output.level(), 1);
+        assert_eq!(output.basis().len(), 2);
+        assert_eq!(output.scale(), input_scale);
     }
 
     #[test]
