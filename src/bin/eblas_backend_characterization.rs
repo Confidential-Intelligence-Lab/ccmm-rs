@@ -6,9 +6,10 @@
 use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
 };
+use ccmm_rs::eblas::gemm_representation_profile;
 use ccmm_rs::eblas::{
-    gemm_cc, gemm_cp, GemmBackend, GemmOperationCount, GemmShape, GemmSpec, MatrixShape,
-    PrivacyMode,
+    gemm_cc, gemm_cp, gemm_execution_profile, GemmBackend, GemmOperationCount, GemmShape, GemmSpec,
+    MatrixShape, PrivacyMode,
 };
 use ccmm_rs::grafting::{
     encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout, BoundedRnsKeygenConfig,
@@ -225,11 +226,19 @@ fn print_result(
     backend: GemmBackend,
     timing: Timing,
     count: GemmOperationCount,
+    execution: ccmm_rs::execution::ExecutionProfile,
+    representation: ccmm_rs::execution::RepresentationProfile,
 ) {
     let outputs = workload.m * workload.n;
 
     println!(
-        "RESULT,{},{},{},{},{},{:?},{:?},{:.3},{:.3},{:.3},{:.3},{},{},{},{}",
+        concat!(
+            "RESULT,{},{},{},{},{},{:?},{:?},{:?},",
+            "{},{},{},{},{},{},{:.12},",
+            "{:.3},{:.3},{:.3},{:.3},",
+            "{},{},{},{},",
+            "{},{},{},{},{},{},{},{},{},{}"
+        ),
         workload.family,
         workload.name,
         workload.m,
@@ -237,6 +246,14 @@ fn print_result(
         workload.n,
         privacy,
         backend,
+        representation.batching,
+        representation.input_ciphertexts,
+        representation.input_plaintexts,
+        representation.output_ciphertexts,
+        representation.output_plaintexts,
+        representation.slots_used_per_ciphertext,
+        representation.slots_available,
+        representation.packing_utilization(),
         timing.median_us,
         timing.min_us,
         timing.max_us,
@@ -245,6 +262,16 @@ fn print_result(
         count.additions,
         count.relinearizations,
         count.rescales,
+        execution.ciphertext_plaintext_multiplies,
+        execution.ciphertext_ciphertext_multiplies,
+        execution.additions,
+        execution.relinearizations,
+        execution.rescales,
+        execution.modulus_switches,
+        execution.automorphisms,
+        execution.rotations,
+        execution.ntt_forwards,
+        execution.ntt_inverses,
     );
 }
 
@@ -282,12 +309,18 @@ fn main() {
     println!("R3_5H1_EBLAS_BACKEND_CHARACTERIZATION_VERSION=1");
     println!("PROFILE={}", profile.name());
     println!("DEGREE={degree}");
+    println!("SLOTS_AVAILABLE={}", embedding.slot_count());
+    println!("INITIAL_SCALE={scale:.12e}");
+    println!("TOP_RNS_LIMBS={}", basis.moduli().len());
+    println!("BATCHING_STRATEGY=ScalarPerCiphertext");
+    println!("SLOTS_USED_PER_CIPHERTEXT=1");
+    println!("MATRIX_LAYOUT=ColumnMajor");
     println!("WARMUPS={WARMUPS}");
     println!("REPEATS={REPEATS}");
     println!("TIMING_STATISTIC=median");
     println!("TIMED_REGION=eblas-gemm-call-only");
     println!("SETUP_INCLUDED_IN_TIMING=NO");
-    println!("CSV_HEADER=family,name,m,k,n,privacy,backend,median_us,min_us,max_us,us_per_output,scalar_products,additions,relinearizations,rescales");
+    println!("CSV_HEADER=family,name,m,k,n,privacy,backend,batching,input_ciphertexts,input_plaintexts,output_ciphertexts,output_plaintexts,slots_used_per_ciphertext,slots_available,packing_utilization,median_us,min_us,max_us,us_per_output,scalar_products,additions,relinearizations,rescales,profile_ct_pt_mul,profile_ct_ct_mul,profile_add,profile_relinearize,profile_rescale,profile_mod_switch,profile_automorphism,profile_rotate,profile_ntt_forward,profile_ntt_inverse");
 
     for (case_index, workload) in WORKLOADS.iter().copied().enumerate() {
         let lhs_values = values(workload.m, workload.k, 0x35A8_1000 + case_index as u64);
@@ -377,10 +410,18 @@ fn main() {
                 &plan,
             )
         });
-
         let cp_count = GemmOperationCount::for_backend(cp_spec, GemmBackend::CpDirect);
         let scalar_count = GemmOperationCount::for_backend(cc_spec, GemmBackend::CcScalar);
         let structured_count = GemmOperationCount::for_backend(cc_spec, GemmBackend::CcStructured);
+
+        let cp_execution = gemm_execution_profile(cp_spec, GemmBackend::CpDirect);
+        let scalar_execution = gemm_execution_profile(cc_spec, GemmBackend::CcScalar);
+        let structured_execution = gemm_execution_profile(cc_spec, GemmBackend::CcStructured);
+
+        let cp_representation = gemm_representation_profile(cp_spec, embedding.slot_count());
+        let scalar_representation = gemm_representation_profile(cc_spec, embedding.slot_count());
+        let structured_representation =
+            gemm_representation_profile(cc_spec, embedding.slot_count());
 
         print_result(
             workload,
@@ -388,20 +429,28 @@ fn main() {
             GemmBackend::CpDirect,
             cp_timing,
             cp_count,
+            cp_execution,
+            cp_representation,
         );
+
         print_result(
             workload,
             PrivacyMode::Cc,
             GemmBackend::CcScalar,
             scalar_timing,
             scalar_count,
+            scalar_execution,
+            scalar_representation,
         );
+
         print_result(
             workload,
             PrivacyMode::Cc,
             GemmBackend::CcStructured,
             structured_timing,
             structured_count,
+            structured_execution,
+            structured_representation,
         );
 
         println!(

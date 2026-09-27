@@ -89,6 +89,110 @@ impl ExecutionEvent {
     }
 }
 
+/// Logical batching/packing strategy used by an encrypted representation.
+///
+/// `ScalarPerCiphertext` describes the current eBLAS matrix representation:
+/// each logical matrix element occupies its own ciphertext/plaintext object,
+/// even though the underlying CKKS ciphertext has additional SIMD capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BatchingStrategy {
+    ScalarPerCiphertext,
+    PackedSimd,
+}
+
+/// Compact representation-level characterization.
+///
+/// These fields describe logical encrypted objects and packing. They do not
+/// represent measured allocations or memory traffic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RepresentationProfile {
+    pub batching: BatchingStrategy,
+    pub input_ciphertexts: usize,
+    pub input_plaintexts: usize,
+    pub output_ciphertexts: usize,
+    pub output_plaintexts: usize,
+    pub slots_used_per_ciphertext: usize,
+    pub slots_available: usize,
+}
+
+impl RepresentationProfile {
+    /// Fraction of available CKKS slots carrying logically distinct values in
+    /// one ciphertext under the selected representation.
+    pub fn packing_utilization(self) -> f64 {
+        if self.slots_available == 0 {
+            return 0.0;
+        }
+
+        self.slots_used_per_ciphertext as f64 / self.slots_available as f64
+    }
+}
+
+/// Compact aggregate characterization of logical encrypted execution.
+///
+/// Unlike `ExecutionTrace`, this representation is O(1) in workload size:
+/// it stores counts rather than materializing one event per operation.
+///
+/// Timing is deliberately excluded.  A profile describes computation; a
+/// measurement describes the performance of that computation on a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionProfile {
+    pub ciphertext_plaintext_multiplies: usize,
+    pub ciphertext_ciphertext_multiplies: usize,
+    pub additions: usize,
+    pub relinearizations: usize,
+    pub rescales: usize,
+    pub modulus_switches: usize,
+    pub automorphisms: usize,
+    pub rotations: usize,
+    pub ntt_forwards: usize,
+    pub ntt_inverses: usize,
+}
+
+impl ExecutionProfile {
+    /// Returns the aggregate count for an event kind represented by this
+    /// profile.
+    ///
+    /// Semantic container events such as GEMM/CPMM/CCMM are intentionally not
+    /// counted here; this profile describes the aggregate computational work.
+    pub const fn count(self, kind: ExecutionEventKind) -> usize {
+        match kind {
+            ExecutionEventKind::CiphertextPlaintextMultiply => self.ciphertext_plaintext_multiplies,
+            ExecutionEventKind::CiphertextCiphertextMultiply => {
+                self.ciphertext_ciphertext_multiplies
+            }
+            ExecutionEventKind::Add => self.additions,
+            ExecutionEventKind::Relinearize => self.relinearizations,
+            ExecutionEventKind::Rescale => self.rescales,
+            ExecutionEventKind::ModSwitch => self.modulus_switches,
+            ExecutionEventKind::Automorphism => self.automorphisms,
+            ExecutionEventKind::Rotate => self.rotations,
+            ExecutionEventKind::NttForward => self.ntt_forwards,
+            ExecutionEventKind::NttInverse => self.ntt_inverses,
+
+            ExecutionEventKind::EblasDot
+            | ExecutionEventKind::EblasGemv
+            | ExecutionEventKind::EblasGemm
+            | ExecutionEventKind::Cpmm
+            | ExecutionEventKind::CcmmScalar
+            | ExecutionEventKind::CcmmStructured => 0,
+        }
+    }
+
+    /// Total number of represented computational events.
+    pub const fn total_operations(self) -> usize {
+        self.ciphertext_plaintext_multiplies
+            + self.ciphertext_ciphertext_multiplies
+            + self.additions
+            + self.relinearizations
+            + self.rescales
+            + self.modulus_switches
+            + self.automorphisms
+            + self.rotations
+            + self.ntt_forwards
+            + self.ntt_inverses
+    }
+}
+
 /// Ordered logical execution trace.
 ///
 /// Timing, hardware counters, and simulator cycle information deliberately do

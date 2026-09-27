@@ -342,6 +342,82 @@ impl GemmOperationCount {
     }
 }
 
+/// Returns the logical representation profile for one GEMM operation.
+///
+/// The current eBLAS RNS-CKKS matrix representation stores one logical matrix
+/// element per ciphertext/plaintext object. `slots_available` records the
+/// underlying CKKS SIMD capacity so that future packed implementations can be
+/// compared against this scalar-per-object baseline.
+pub fn gemm_representation_profile(
+    spec: GemmSpec,
+    slots_available: usize,
+) -> crate::execution::RepresentationProfile {
+    use crate::execution::{BatchingStrategy, RepresentationProfile};
+
+    assert!(
+        slots_available > 0,
+        "eBLAS representation profile requires positive CKKS slot capacity"
+    );
+
+    let lhs = spec.shape().lhs().elements();
+    let rhs = spec.shape().rhs().elements();
+    let output = spec.shape().output().elements();
+
+    let (input_ciphertexts, input_plaintexts, output_ciphertexts, output_plaintexts) =
+        match spec.privacy() {
+            PrivacyMode::Pp => (0, lhs + rhs, 0, output),
+            PrivacyMode::Cp => (lhs, rhs, output, 0),
+            PrivacyMode::Pc => (rhs, lhs, output, 0),
+            PrivacyMode::Cc => (lhs + rhs, 0, output, 0),
+        };
+
+    RepresentationProfile {
+        batching: BatchingStrategy::ScalarPerCiphertext,
+        input_ciphertexts,
+        input_plaintexts,
+        output_ciphertexts,
+        output_plaintexts,
+        slots_used_per_ciphertext: 1,
+        slots_available,
+    }
+}
+
+/// Returns the compact device-neutral execution profile for one GEMM schedule.
+///
+/// `GemmOperationCount` remains the authoritative eBLAS algorithmic schedule.
+/// This function translates that schedule into the common execution vocabulary
+/// without expanding individual events.
+pub fn gemm_execution_profile(
+    spec: GemmSpec,
+    backend: GemmBackend,
+) -> crate::execution::ExecutionProfile {
+    use crate::execution::ExecutionProfile;
+
+    let count = GemmOperationCount::for_backend(spec, backend);
+
+    match backend {
+        GemmBackend::Reference => ExecutionProfile {
+            additions: count.additions,
+            ..ExecutionProfile::default()
+        },
+
+        GemmBackend::CpDirect => ExecutionProfile {
+            ciphertext_plaintext_multiplies: count.scalar_products,
+            additions: count.additions,
+            rescales: count.rescales,
+            ..ExecutionProfile::default()
+        },
+
+        GemmBackend::CcScalar | GemmBackend::CcStructured => ExecutionProfile {
+            ciphertext_ciphertext_multiplies: count.scalar_products,
+            additions: count.additions,
+            relinearizations: count.relinearizations,
+            rescales: count.rescales,
+            ..ExecutionProfile::default()
+        },
+    }
+}
+
 /// Expands one GEMM static schedule into a device-neutral semantic trace.
 ///
 /// This helper is intended for bounded characterization and validation. It
@@ -429,9 +505,10 @@ pub fn predicted_gemm_execution_trace(
 
 #[cfg(test)]
 mod tests {
+    use super::gemm_representation_profile;
     use super::{
-        predicted_gemm_execution_trace, GemmBackend, GemmOperationCount, GemmShape, GemmSpec,
-        MatrixLayout, MatrixShape, OperandPrivacy, PrivacyMode,
+        gemm_execution_profile, predicted_gemm_execution_trace, GemmBackend, GemmOperationCount,
+        GemmShape, GemmSpec, MatrixLayout, MatrixShape, OperandPrivacy, PrivacyMode,
     };
 
     #[test]
@@ -626,5 +703,89 @@ mod tests {
             scalar.count(ExecutionEventKind::Rescale),
             8 * structured.count(ExecutionEventKind::Rescale)
         );
+    }
+
+    #[test]
+    fn gemm_execution_profiles_match_static_schedules() {
+        let shape = GemmShape::new(MatrixShape::new(4, 8), MatrixShape::new(8, 4));
+
+        let cp_spec = GemmSpec::new(shape, PrivacyMode::Cp);
+        let cc_spec = GemmSpec::new(shape, PrivacyMode::Cc);
+
+        let cp_count = GemmOperationCount::for_backend(cp_spec, GemmBackend::CpDirect);
+        let cp = gemm_execution_profile(cp_spec, GemmBackend::CpDirect);
+
+        assert_eq!(cp.ciphertext_plaintext_multiplies, cp_count.scalar_products);
+        assert_eq!(cp.additions, cp_count.additions);
+        assert_eq!(cp.relinearizations, 0);
+        assert_eq!(cp.rescales, cp_count.rescales);
+
+        let scalar_count = GemmOperationCount::for_backend(cc_spec, GemmBackend::CcScalar);
+        let scalar = gemm_execution_profile(cc_spec, GemmBackend::CcScalar);
+
+        assert_eq!(
+            scalar.ciphertext_ciphertext_multiplies,
+            scalar_count.scalar_products
+        );
+        assert_eq!(scalar.additions, scalar_count.additions);
+        assert_eq!(scalar.relinearizations, scalar_count.relinearizations);
+        assert_eq!(scalar.rescales, scalar_count.rescales);
+
+        let structured_count = GemmOperationCount::for_backend(cc_spec, GemmBackend::CcStructured);
+        let structured = gemm_execution_profile(cc_spec, GemmBackend::CcStructured);
+
+        assert_eq!(
+            structured.ciphertext_ciphertext_multiplies,
+            structured_count.scalar_products
+        );
+        assert_eq!(structured.additions, structured_count.additions);
+        assert_eq!(
+            structured.relinearizations,
+            structured_count.relinearizations
+        );
+        assert_eq!(structured.rescales, structured_count.rescales);
+
+        assert_eq!(
+            scalar.ciphertext_ciphertext_multiplies,
+            structured.ciphertext_ciphertext_multiplies
+        );
+        assert_eq!(scalar.relinearizations, 8 * structured.relinearizations);
+        assert_eq!(scalar.rescales, 8 * structured.rescales);
+    }
+
+    #[test]
+    fn gemm_representation_profiles_match_privacy_modes() {
+        use crate::execution::BatchingStrategy;
+
+        let shape = GemmShape::new(MatrixShape::new(2, 3), MatrixShape::new(3, 4));
+
+        let pp = gemm_representation_profile(GemmSpec::new(shape, PrivacyMode::Pp), 2048);
+        assert_eq!(pp.batching, BatchingStrategy::ScalarPerCiphertext);
+        assert_eq!(pp.input_ciphertexts, 0);
+        assert_eq!(pp.input_plaintexts, 6 + 12);
+        assert_eq!(pp.output_ciphertexts, 0);
+        assert_eq!(pp.output_plaintexts, 8);
+        assert_eq!(pp.slots_used_per_ciphertext, 1);
+        assert_eq!(pp.slots_available, 2048);
+
+        let cp = gemm_representation_profile(GemmSpec::new(shape, PrivacyMode::Cp), 2048);
+        assert_eq!(cp.input_ciphertexts, 6);
+        assert_eq!(cp.input_plaintexts, 12);
+        assert_eq!(cp.output_ciphertexts, 8);
+        assert_eq!(cp.output_plaintexts, 0);
+
+        let pc = gemm_representation_profile(GemmSpec::new(shape, PrivacyMode::Pc), 2048);
+        assert_eq!(pc.input_ciphertexts, 12);
+        assert_eq!(pc.input_plaintexts, 6);
+        assert_eq!(pc.output_ciphertexts, 8);
+        assert_eq!(pc.output_plaintexts, 0);
+
+        let cc = gemm_representation_profile(GemmSpec::new(shape, PrivacyMode::Cc), 2048);
+        assert_eq!(cc.input_ciphertexts, 6 + 12);
+        assert_eq!(cc.input_plaintexts, 0);
+        assert_eq!(cc.output_ciphertexts, 8);
+        assert_eq!(cc.output_plaintexts, 0);
+
+        assert!((cc.packing_utilization() - (1.0 / 2048.0)).abs() < 1.0e-15);
     }
 }
