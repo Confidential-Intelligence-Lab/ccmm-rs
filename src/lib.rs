@@ -96,6 +96,7 @@ pub mod ccmm;
 pub mod ckks;
 pub mod eblas;
 pub mod eval;
+pub mod execution;
 pub mod grafting;
 pub mod matrix;
 pub mod ring;

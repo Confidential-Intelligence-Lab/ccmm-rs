@@ -342,11 +342,96 @@ impl GemmOperationCount {
     }
 }
 
+/// Expands one GEMM static schedule into a device-neutral semantic trace.
+///
+/// This helper is intended for bounded characterization and validation. It
+/// materializes one event per predicted logical operation and therefore must
+/// not be used as the scalable cost representation for large workloads.
+/// `GemmOperationCount` remains the compact analytical schedule.
+///
+/// This trace is predicted rather than observed: it is derived from the eBLAS
+/// contract and selected backend, does not observe runtime execution, and does
+/// not include lower-level NTT/RNS events.
+pub fn predicted_gemm_execution_trace(
+    spec: GemmSpec,
+    backend: GemmBackend,
+    device: crate::execution::ExecutionDevice,
+) -> crate::execution::ExecutionTrace {
+    use crate::execution::{ExecutionEvent, ExecutionEventKind, ExecutionTrace};
+
+    let count = GemmOperationCount::for_backend(spec, backend);
+    let mut trace = ExecutionTrace::new(device);
+
+    trace.record(ExecutionEvent::new(ExecutionEventKind::EblasGemm));
+
+    match backend {
+        GemmBackend::Reference => {}
+
+        GemmBackend::CpDirect => {
+            trace.record(ExecutionEvent::new(ExecutionEventKind::Cpmm));
+
+            for _ in 0..count.scalar_products {
+                trace.record(ExecutionEvent::new(
+                    ExecutionEventKind::CiphertextPlaintextMultiply,
+                ));
+            }
+
+            for _ in 0..count.additions {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Add));
+            }
+
+            for _ in 0..count.rescales {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Rescale));
+            }
+        }
+
+        GemmBackend::CcScalar => {
+            trace.record(ExecutionEvent::new(ExecutionEventKind::CcmmScalar));
+
+            for _ in 0..count.scalar_products {
+                trace.record(ExecutionEvent::new(
+                    ExecutionEventKind::CiphertextCiphertextMultiply,
+                ));
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Relinearize));
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Rescale));
+            }
+
+            for _ in 0..count.additions {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Add));
+            }
+        }
+
+        GemmBackend::CcStructured => {
+            trace.record(ExecutionEvent::new(ExecutionEventKind::CcmmStructured));
+
+            for _ in 0..count.scalar_products {
+                trace.record(ExecutionEvent::new(
+                    ExecutionEventKind::CiphertextCiphertextMultiply,
+                ));
+            }
+
+            for _ in 0..count.additions {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Add));
+            }
+
+            for _ in 0..count.relinearizations {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Relinearize));
+            }
+
+            for _ in 0..count.rescales {
+                trace.record(ExecutionEvent::new(ExecutionEventKind::Rescale));
+            }
+        }
+    }
+
+    trace
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GemmBackend, GemmOperationCount, GemmShape, GemmSpec, MatrixLayout, MatrixShape,
-        OperandPrivacy, PrivacyMode,
+        predicted_gemm_execution_trace, GemmBackend, GemmOperationCount, GemmShape, GemmSpec,
+        MatrixLayout, MatrixShape, OperandPrivacy, PrivacyMode,
     };
 
     #[test]
@@ -433,5 +518,113 @@ mod tests {
         );
         assert_eq!(structured_cc.relinearizations, 4);
         assert_eq!(structured_cc.rescales, 4);
+    }
+
+    #[test]
+    fn predicted_cp_trace_matches_static_operation_count() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind};
+
+        let spec = GemmSpec::new(
+            GemmShape::new(MatrixShape::new(2, 3), MatrixShape::new(3, 4)),
+            PrivacyMode::Cp,
+        );
+
+        let trace =
+            predicted_gemm_execution_trace(spec, GemmBackend::CpDirect, ExecutionDevice::Cpu);
+        let count = GemmOperationCount::for_backend(spec, GemmBackend::CpDirect);
+
+        assert_eq!(trace.count(ExecutionEventKind::EblasGemm), 1);
+        assert_eq!(trace.count(ExecutionEventKind::Cpmm), 1);
+        assert_eq!(
+            trace.count(ExecutionEventKind::CiphertextPlaintextMultiply),
+            count.scalar_products
+        );
+        assert_eq!(trace.count(ExecutionEventKind::Add), count.additions);
+        assert_eq!(trace.count(ExecutionEventKind::Relinearize), 0);
+        assert_eq!(trace.count(ExecutionEventKind::Rescale), count.rescales);
+    }
+
+    #[test]
+    fn predicted_scalar_cc_trace_matches_static_operation_count() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind};
+
+        let spec = GemmSpec::new(
+            GemmShape::new(MatrixShape::new(2, 3), MatrixShape::new(3, 4)),
+            PrivacyMode::Cc,
+        );
+
+        let trace =
+            predicted_gemm_execution_trace(spec, GemmBackend::CcScalar, ExecutionDevice::Cpu);
+        let count = GemmOperationCount::for_backend(spec, GemmBackend::CcScalar);
+
+        assert_eq!(trace.count(ExecutionEventKind::EblasGemm), 1);
+        assert_eq!(trace.count(ExecutionEventKind::CcmmScalar), 1);
+        assert_eq!(
+            trace.count(ExecutionEventKind::CiphertextCiphertextMultiply),
+            count.scalar_products
+        );
+        assert_eq!(trace.count(ExecutionEventKind::Add), count.additions);
+        assert_eq!(
+            trace.count(ExecutionEventKind::Relinearize),
+            count.relinearizations
+        );
+        assert_eq!(trace.count(ExecutionEventKind::Rescale), count.rescales);
+    }
+
+    #[test]
+    fn predicted_structured_cc_trace_matches_static_operation_count() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind};
+
+        let spec = GemmSpec::new(
+            GemmShape::new(MatrixShape::new(2, 3), MatrixShape::new(3, 4)),
+            PrivacyMode::Cc,
+        );
+
+        let trace =
+            predicted_gemm_execution_trace(spec, GemmBackend::CcStructured, ExecutionDevice::Cpu);
+        let count = GemmOperationCount::for_backend(spec, GemmBackend::CcStructured);
+
+        assert_eq!(trace.count(ExecutionEventKind::EblasGemm), 1);
+        assert_eq!(trace.count(ExecutionEventKind::CcmmStructured), 1);
+        assert_eq!(
+            trace.count(ExecutionEventKind::CiphertextCiphertextMultiply),
+            count.scalar_products
+        );
+        assert_eq!(trace.count(ExecutionEventKind::Add), count.additions);
+        assert_eq!(
+            trace.count(ExecutionEventKind::Relinearize),
+            count.relinearizations
+        );
+        assert_eq!(trace.count(ExecutionEventKind::Rescale), count.rescales);
+    }
+
+    #[test]
+    fn structured_cc_trace_reduces_expensive_post_product_operations() {
+        use crate::execution::{ExecutionDevice, ExecutionEventKind};
+
+        let spec = GemmSpec::new(
+            GemmShape::new(MatrixShape::new(4, 8), MatrixShape::new(8, 4)),
+            PrivacyMode::Cc,
+        );
+
+        let scalar =
+            predicted_gemm_execution_trace(spec, GemmBackend::CcScalar, ExecutionDevice::Cpu);
+        let structured =
+            predicted_gemm_execution_trace(spec, GemmBackend::CcStructured, ExecutionDevice::Cpu);
+
+        assert_eq!(
+            scalar.count(ExecutionEventKind::CiphertextCiphertextMultiply),
+            structured.count(ExecutionEventKind::CiphertextCiphertextMultiply)
+        );
+
+        assert_eq!(
+            scalar.count(ExecutionEventKind::Relinearize),
+            8 * structured.count(ExecutionEventKind::Relinearize)
+        );
+
+        assert_eq!(
+            scalar.count(ExecutionEventKind::Rescale),
+            8 * structured.count(ExecutionEventKind::Rescale)
+        );
     }
 }
