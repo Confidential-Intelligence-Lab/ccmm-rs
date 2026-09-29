@@ -48,6 +48,60 @@ fn ciphertext_mul_monomial(ciphertext: &RlweCiphertext, exponent: usize) -> Rlwe
     )
 }
 
+/// Multiplicative inverse modulo `modulus`.
+///
+/// This is used by Park C-MT both for:
+///
+/// - `N^{-1} mod q`; and
+/// - `(2j+1)^{-1} mod 2N`.
+fn modular_inverse(value: u64, modulus: u64) -> u64 {
+    assert!(modulus > 1, "modulus must exceed one");
+
+    let mut t: i128 = 0;
+    let mut new_t: i128 = 1;
+    let mut r: i128 = modulus as i128;
+    let mut new_r: i128 = (value % modulus) as i128;
+
+    while new_r != 0 {
+        let quotient = r / new_r;
+
+        let next_t = t - quotient * new_t;
+        t = new_t;
+        new_t = next_t;
+
+        let next_r = r - quotient * new_r;
+        r = new_r;
+        new_r = next_r;
+    }
+
+    assert_eq!(r, 1, "value must be invertible modulo modulus");
+
+    let modulus_i128 = modulus as i128;
+    let inverse = ((t % modulus_i128) + modulus_i128) % modulus_i128;
+
+    inverse as u64
+}
+
+/// Multiplies both RLWE components by a scalar modulo q.
+fn ciphertext_scalar_mul(ciphertext: &RlweCiphertext, scalar: u64) -> RlweCiphertext {
+    RlweCiphertext::new(
+        ciphertext.b().scalar_mul(scalar),
+        ciphertext.a().scalar_mul(scalar),
+    )
+}
+
+/// Returns the Galois key for an odd exponent.
+///
+/// Exponent one is the identity automorphism and therefore needs no key.
+fn galois_key_for_exponent(
+    keys: &[crate::ckks::GaloisKey],
+    exponent: usize,
+) -> &crate::ckks::GaloisKey {
+    keys.iter()
+        .find(|key| key.exponent() == exponent)
+        .unwrap_or_else(|| panic!("missing Park C-MT Galois key for exponent {exponent}"))
+}
+
 /// Park Algorithm 3: Tweak.
 ///
 /// For `n` ciphertexts over ring degree `N`, where both `n` and `N` are
@@ -131,6 +185,151 @@ pub fn tweak(ciphertexts: &[RlweCiphertext]) -> Vec<RlweCiphertext> {
             output[j] = ciphertext_add(&previous[j], &rotated);
             output[j + width] = ciphertext_sub(&previous[j], &rotated);
         }
+    }
+
+    output
+}
+
+/// Park Algorithm 4: ciphertext matrix transpose (C-MT).
+///
+/// Input consists of `N` RLWE ciphertexts over a ring of degree `N`.
+/// Ciphertext `i` encrypts one row:
+///
+/// ```text
+/// m_i(X) = sum_j M[i,j] X^j.
+/// ```
+///
+/// The output consists of `N` ciphertexts encrypting the columns:
+///
+/// ```text
+/// m'_j(X) = sum_i M[i,j] X^i.
+/// ```
+///
+/// This implementation follows Algorithm 4 directly:
+///
+/// 1. `Tweak(X^i * ct_i)`;
+/// 2. reindex by `(2j+1)^{-1} mod 2N` and multiply by `N^{-1} mod q`;
+/// 3. apply `sigma_(2j+1)` and switch back to the original secret;
+/// 4. apply `Tweak` again;
+/// 5. apply the final Park monomial/sign correction.
+///
+/// The identity automorphism (`j = 0`, exponent `1`) does not require
+/// a switching key.
+pub fn transpose(
+    params: crate::rlwe::RlweParameters,
+    ciphertexts: &[RlweCiphertext],
+    galois_keys: &[crate::ckks::GaloisKey],
+) -> Vec<RlweCiphertext> {
+    assert!(!ciphertexts.is_empty(), "C-MT requires ciphertexts");
+
+    let degree = params.degree();
+    let modulus = params.modulus();
+
+    assert_eq!(
+        ciphertexts.len(),
+        degree,
+        "Park Algorithm 4 requires N ciphertexts for ring degree N"
+    );
+
+    assert!(
+        degree.is_power_of_two(),
+        "Park C-MT requires power-of-two ring degree"
+    );
+
+    assert_eq!(
+        modulus.value() % 2,
+        1,
+        "Park C-MT requires N invertible modulo q; CKKS q must be odd"
+    );
+
+    for ciphertext in ciphertexts {
+        assert_eq!(
+            ciphertext.b().degree(),
+            degree,
+            "C-MT ciphertext degree must match RLWE degree"
+        );
+        assert_eq!(
+            ciphertext.b().modulus(),
+            modulus,
+            "C-MT ciphertext modulus must match RLWE modulus"
+        );
+        assert_eq!(ciphertext.a().degree(), degree);
+        assert_eq!(ciphertext.a().modulus(), modulus);
+    }
+
+    let two_n = 2 * degree;
+
+    // Algorithm 4, Step 1:
+    //
+    // aux <- Tweak((X^i * ct_i)_i)
+    let shifted_inputs: Vec<RlweCiphertext> = ciphertexts
+        .iter()
+        .enumerate()
+        .map(|(i, ciphertext)| ciphertext_mul_monomial(ciphertext, i))
+        .collect();
+
+    let aux = tweak(&shifted_inputs);
+
+    // Algorithm 4, Steps 2--5.
+    let n_inverse = modular_inverse(degree as u64, modulus.value());
+
+    let mut transformed = Vec::with_capacity(degree);
+
+    for j in 0..degree {
+        let exponent = 2 * j + 1;
+
+        // index =
+        //   (-1 + (2j+1)^(-1) mod 2N) / 2
+        let inverse_exponent = modular_inverse(exponent as u64, two_n as u64) as usize;
+
+        assert_eq!(
+            inverse_exponent % 2,
+            1,
+            "inverse of odd C-MT exponent must remain odd"
+        );
+
+        let source_index = (inverse_exponent - 1) / 2;
+
+        let normalized = ciphertext_scalar_mul(&aux[source_index], n_inverse);
+
+        let automorphed = if exponent == 1 {
+            normalized
+        } else {
+            let key = galois_key_for_exponent(galois_keys, exponent);
+
+            crate::ckks::apply_galois_automorphism(params, &normalized, key)
+        };
+
+        transformed.push(automorphed);
+    }
+
+    // Algorithm 4, Step 6.
+    let second_tweak = tweak(&transformed);
+
+    // Algorithm 4, Steps 7--9:
+    //
+    // ct'_(j mod N) =
+    //   -X^(N-j) * ct''_((N-j) mod N)
+    //
+    // for j = 1..N.
+    let zero = RlweCiphertext::new(
+        Polynomial::zero(modulus, degree),
+        Polynomial::zero(modulus, degree),
+    );
+
+    let mut output = vec![zero; degree];
+
+    // Handle the constant-coefficient column explicitly.
+    output[0] = second_tweak[0].clone();
+
+    // Apply the negacyclic correction to the remaining columns.
+    for (output_index, output_slot) in output.iter_mut().enumerate().take(degree).skip(1) {
+        let source_index = degree - output_index;
+        let exponent = degree - output_index;
+
+        let corrected = ciphertext_mul_monomial(&second_tweak[source_index], exponent);
+
+        *output_slot = ciphertext_scalar_mul(&corrected, modulus.value() - 1);
     }
 
     output
@@ -268,5 +467,176 @@ mod tests {
                 "decrypted Park Tweak output diverged at index {j}"
             );
         }
+    }
+
+    fn park_galois_keys(
+        params: RlweParameters,
+        secret: &SecretKey,
+        seed: u64,
+    ) -> Vec<crate::ckks::GaloisKey> {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        (1..params.degree())
+            .map(|j| {
+                let exponent = 2 * j + 1;
+
+                crate::ckks::GaloisKey::generate_with_rng(params, secret, exponent, 16, &mut rng)
+            })
+            .collect()
+    }
+
+    fn encrypt_coefficient_rows(
+        params: RlweParameters,
+        secret: &SecretKey,
+        rows: &[Vec<u64>],
+        seed: u64,
+    ) -> Vec<RlweCiphertext> {
+        assert_eq!(rows.len(), params.degree());
+
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        rows.iter()
+            .map(|row| {
+                assert_eq!(row.len(), params.degree());
+
+                let message = Polynomial::new(params.modulus(), row.clone());
+
+                encrypt_raw_with_rng(params, secret, &message, &mut rng)
+            })
+            .collect()
+    }
+
+    fn decrypt_coefficient_rows(
+        params: RlweParameters,
+        secret: &SecretKey,
+        ciphertexts: &[RlweCiphertext],
+    ) -> Vec<Vec<u64>> {
+        ciphertexts
+            .iter()
+            .map(|ciphertext| {
+                decrypt_raw(params, secret, ciphertext)
+                    .coefficients()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn transpose_cleartext(matrix: &[Vec<u64>]) -> Vec<Vec<u64>> {
+        let n = matrix.len();
+
+        assert!(matrix.iter().all(|row| row.len() == n));
+
+        (0..n)
+            .map(|col| (0..n).map(|row| matrix[row][col]).collect())
+            .collect()
+    }
+
+    #[test]
+    fn modular_inverse_matches_expected_values() {
+        assert_eq!(modular_inverse(8, 12_289), 10_753);
+
+        for exponent in [1_u64, 3, 5, 7, 9, 11, 13, 15] {
+            let inverse = modular_inverse(exponent, 16);
+
+            assert_eq!((exponent * inverse) % 16, 1);
+        }
+    }
+
+    #[test]
+    fn park_cmt_transposes_asymmetric_matrix_exactly() {
+        // Noise-free parameters isolate Park Algorithm 4 algebra from
+        // approximation/noise behavior.
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_434d_5401);
+
+        let secret = SecretKey::generate_with_rng(params, &mut key_rng);
+
+        let keys = park_galois_keys(params, &secret, 0x5041_524b_434d_5402);
+
+        let matrix: Vec<Vec<u64>> = (0..8)
+            .map(|row| (0..8).map(|col| 1 + 10 * row as u64 + col as u64).collect())
+            .collect();
+
+        let ciphertexts = encrypt_coefficient_rows(params, &secret, &matrix, 0x5041_524b_434d_5403);
+
+        let transposed = transpose(params, &ciphertexts, &keys);
+
+        let actual = decrypt_coefficient_rows(params, &secret, &transposed);
+
+        let expected = transpose_cleartext(&matrix);
+
+        assert_eq!(
+            actual, expected,
+            "Park C-MT failed asymmetric 8x8 transpose"
+        );
+    }
+
+    #[test]
+    fn park_cmt_maps_basis_matrix_eij_to_eji() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_434d_5411);
+
+        let secret = SecretKey::generate_with_rng(params, &mut key_rng);
+
+        let keys = park_galois_keys(params, &secret, 0x5041_524b_434d_5412);
+
+        for source_row in 0..8 {
+            for source_col in 0..8 {
+                let mut matrix = vec![vec![0_u64; 8]; 8];
+                matrix[source_row][source_col] = 1;
+
+                let ciphertexts = encrypt_coefficient_rows(
+                    params,
+                    &secret,
+                    &matrix,
+                    0x5041_524b_434d_5500 + (8 * source_row + source_col) as u64,
+                );
+
+                let transposed = transpose(params, &ciphertexts, &keys);
+
+                let actual = decrypt_coefficient_rows(params, &secret, &transposed);
+
+                let expected = transpose_cleartext(&matrix);
+
+                assert_eq!(
+                    actual, expected,
+                    "Park C-MT failed basis E_{{{source_row},{source_col}}}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn park_cmt_is_involution_on_encrypted_matrix() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_434d_5421);
+
+        let secret = SecretKey::generate_with_rng(params, &mut key_rng);
+
+        let keys = park_galois_keys(params, &secret, 0x5041_524b_434d_5422);
+
+        let matrix: Vec<Vec<u64>> = (0..8)
+            .map(|row| {
+                (0..8)
+                    .map(|col| {
+                        (37 + 19 * row as u64 + 23 * col as u64 + 3 * row as u64 * col as u64)
+                            % params.modulus().value()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let ciphertexts = encrypt_coefficient_rows(params, &secret, &matrix, 0x5041_524b_434d_5423);
+
+        let once = transpose(params, &ciphertexts, &keys);
+
+        let twice = transpose(params, &once, &keys);
+
+        let actual = decrypt_coefficient_rows(params, &secret, &twice);
+
+        assert_eq!(actual, matrix, "Park C-MT involution failed");
     }
 }
