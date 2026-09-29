@@ -190,6 +190,236 @@ pub fn tweak(ciphertexts: &[RlweCiphertext]) -> Vec<RlweCiphertext> {
     output
 }
 
+/// RNS form of Park Algorithm 3: Tweak.
+///
+/// The Park Tweak transform contains only ciphertext addition/subtraction and
+/// multiplication by public monomials. These operations are defined
+/// independently in every CRT/RNS residue, so the RNS transform is exactly the
+/// collection of scalar Park Tweak transforms over the active modulus basis.
+///
+/// This function intentionally uses the scalar implementation as the
+/// specification path. RNS/NTT specialization is a separate optimization.
+pub fn rns_tweak(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    assert!(
+        !ciphertexts.is_empty(),
+        "RNS Tweak requires at least one ciphertext"
+    );
+
+    let n = ciphertexts.len();
+    let degree = ciphertexts[0].degree();
+    let basis = ciphertexts[0].basis().clone();
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "RNS Tweak ciphertext degrees must match"
+    );
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.basis() == &basis),
+        "RNS Tweak ciphertext bases must match"
+    );
+
+    let limb_count = basis.len();
+
+    let transformed_by_limb: Vec<Vec<RlweCiphertext>> = (0..limb_count)
+        .map(|limb_index| {
+            let limb_inputs: Vec<RlweCiphertext> = ciphertexts
+                .iter()
+                .map(|ciphertext| ciphertext.limb(limb_index).clone())
+                .collect();
+
+            tweak(&limb_inputs)
+        })
+        .collect();
+
+    (0..n)
+        .map(|ciphertext_index| {
+            let limbs = transformed_by_limb
+                .iter()
+                .map(|limb_outputs| limb_outputs[ciphertext_index].clone())
+                .collect();
+
+            crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+        })
+        .collect()
+}
+
+fn rns_ciphertext_mul_monomial(
+    ciphertext: &crate::grafting::RnsRlweCiphertext,
+    exponent: usize,
+) -> crate::grafting::RnsRlweCiphertext {
+    let limbs = ciphertext
+        .limbs()
+        .iter()
+        .map(|limb| ciphertext_mul_monomial(limb, exponent))
+        .collect();
+
+    crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+}
+
+fn rns_ciphertext_scalar_mul(
+    ciphertext: &crate::grafting::RnsRlweCiphertext,
+    scalars: &[u64],
+) -> crate::grafting::RnsRlweCiphertext {
+    assert_eq!(
+        ciphertext.limbs().len(),
+        scalars.len(),
+        "RNS scalar multiplication requires one scalar per limb"
+    );
+
+    let limbs = ciphertext
+        .limbs()
+        .iter()
+        .zip(scalars)
+        .map(|(limb, &scalar)| ciphertext_scalar_mul(limb, scalar))
+        .collect();
+
+    crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+}
+
+fn rns_galois_key_for_exponent(
+    keys: &[crate::ckks::RnsGaloisKey],
+    exponent: usize,
+) -> &crate::ckks::RnsGaloisKey {
+    keys.iter()
+        .find(|key| key.exponent() == exponent)
+        .unwrap_or_else(|| panic!("missing RNS Galois key for exponent {exponent}"))
+}
+
+/// RNS form of Park Algorithm 4: ciphertext matrix transpose (C-MT).
+///
+/// The public polynomial arithmetic is performed independently in each active
+/// CRT limb. The automorphism/key-switch step remains RNS-native through
+/// `RnsGaloisKey` and `apply_rns_galois_automorphism`.
+///
+/// Input and output follow the same row/column packing convention as
+/// [`transpose`].
+pub fn rns_transpose(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    assert!(!ciphertexts.is_empty(), "RNS C-MT requires ciphertexts");
+
+    let degree = ciphertexts[0].degree();
+    let basis = ciphertexts[0].basis().clone();
+
+    assert_eq!(
+        ciphertexts.len(),
+        degree,
+        "Park Algorithm 4 requires N ciphertexts for ring degree N"
+    );
+
+    assert!(
+        degree.is_power_of_two(),
+        "Park RNS C-MT requires power-of-two ring degree"
+    );
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "RNS C-MT ciphertext degrees must match"
+    );
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.basis() == &basis),
+        "RNS C-MT ciphertext bases must match"
+    );
+
+    assert!(
+        basis
+            .moduli()
+            .iter()
+            .all(|modulus| modulus.value() % 2 == 1),
+        "Park RNS C-MT requires N invertible modulo every active modulus"
+    );
+
+    let two_n = 2 * degree;
+
+    // Algorithm 4, Step 1:
+    //
+    // aux <- Tweak((X^i * ct_i)_i)
+    let shifted_inputs: Vec<crate::grafting::RnsRlweCiphertext> = ciphertexts
+        .iter()
+        .enumerate()
+        .map(|(i, ciphertext)| rns_ciphertext_mul_monomial(ciphertext, i))
+        .collect();
+
+    let aux = rns_tweak(&shifted_inputs);
+
+    // Algorithm 4, Steps 2--5.
+    //
+    // N^{-1} is represented independently in every CRT limb.
+    let n_inverses: Vec<u64> = basis
+        .moduli()
+        .iter()
+        .map(|modulus| modular_inverse(degree as u64, modulus.value()))
+        .collect();
+
+    let mut transformed = Vec::with_capacity(degree);
+
+    for j in 0..degree {
+        let exponent = 2 * j + 1;
+
+        let inverse_exponent = modular_inverse(exponent as u64, two_n as u64) as usize;
+
+        assert_eq!(
+            inverse_exponent % 2,
+            1,
+            "inverse of odd RNS C-MT exponent must remain odd"
+        );
+
+        let source_index = (inverse_exponent - 1) / 2;
+        let normalized = rns_ciphertext_scalar_mul(&aux[source_index], &n_inverses);
+
+        let automorphed = if exponent == 1 {
+            normalized
+        } else {
+            let key = rns_galois_key_for_exponent(galois_keys, exponent);
+
+            crate::ckks::apply_rns_galois_automorphism(&normalized, key)
+        };
+
+        transformed.push(automorphed);
+    }
+
+    // Algorithm 4, Step 6.
+    let second_tweak = rns_tweak(&transformed);
+
+    // Algorithm 4, Steps 7--9.
+    //
+    // Preserve the scalar implementation's experimentally validated boundary
+    // treatment: output 0 is copied directly, while the remaining outputs
+    // receive Park's negacyclic monomial/sign correction.
+    let mut output = Vec::with_capacity(degree);
+    output.push(second_tweak[0].clone());
+
+    for output_index in 1..degree {
+        let source_index = degree - output_index;
+        let exponent = degree - output_index;
+
+        let corrected = rns_ciphertext_mul_monomial(&second_tweak[source_index], exponent);
+
+        let minus_one: Vec<u64> = basis
+            .moduli()
+            .iter()
+            .map(|modulus| modulus.value() - 1)
+            .collect();
+
+        output.push(rns_ciphertext_scalar_mul(&corrected, &minus_one));
+    }
+
+    output
+}
+
 /// Park Algorithm 4: ciphertext matrix transpose (C-MT).
 ///
 /// Input consists of `N` RLWE ciphertexts over a ring of degree `N`.
@@ -616,6 +846,7 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
+    use crate::grafting::RnsRlweCiphertext;
     use crate::ring::{Modulus, Polynomial};
     use crate::rlwe::{decrypt_raw, encrypt_raw_with_rng, RlweParameters, SecretKey};
 
@@ -659,6 +890,368 @@ mod tests {
         );
 
         RlweCiphertext::new(b, a)
+    }
+
+    fn park_rns_test_moduli() -> [Modulus; 3] {
+        [
+            Modulus::new(12_289),
+            Modulus::new(40_961),
+            Modulus::new(65_537),
+        ]
+    }
+
+    fn park_rns_test_secret_coefficients() -> [i8; 8] {
+        [-1, 0, 1, 1, 0, -1, 1, 0]
+    }
+
+    fn park_rns_test_secret(modulus: Modulus) -> SecretKey {
+        let coefficients = park_rns_test_secret_coefficients();
+
+        SecretKey::from_polynomial(Polynomial::new(
+            modulus,
+            coefficients
+                .iter()
+                .map(|&value| match value {
+                    -1 => modulus.value() - 1,
+                    0 => 0,
+                    1 => 1,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        ))
+    }
+
+    fn encrypt_rns_coefficient_rows(matrix: &[Vec<u64>], seed: u64) -> Vec<RnsRlweCiphertext> {
+        let degree = matrix.len();
+        let moduli = park_rns_test_moduli();
+
+        assert_eq!(degree, 8);
+        assert!(matrix.iter().all(|row| row.len() == degree));
+
+        matrix
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let limbs = moduli
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(limb_index, modulus)| {
+                        let params = RlweParameters::new(degree, modulus, 2, 0);
+                        let secret = park_rns_test_secret(modulus);
+
+                        let plaintext = Polynomial::new(
+                            modulus,
+                            row.iter().map(|&value| value % modulus.value()).collect(),
+                        );
+
+                        let mut rng = ChaCha20Rng::seed_from_u64(
+                            seed ^ ((row_index as u64) << 8) ^ limb_index as u64,
+                        );
+
+                        encrypt_raw_with_rng(params, &secret, &plaintext, &mut rng)
+                    })
+                    .collect();
+
+                RnsRlweCiphertext::from_limbs(limbs)
+            })
+            .collect()
+    }
+
+    fn park_rns_galois_keys(seed: u64) -> Vec<crate::ckks::RnsGaloisKey> {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+        let basis = crate::ring::ModulusBasis::new(moduli.to_vec());
+        let layout = crate::grafting::RnsGadgetLayout::new(basis, vec![1, 2]);
+        let secret_coefficients = park_rns_test_secret_coefficients();
+
+        (1..degree)
+            .map(|j| 2 * j + 1)
+            .map(|exponent| {
+                let mut rng = ChaCha20Rng::seed_from_u64(seed ^ exponent as u64);
+
+                crate::ckks::RnsGaloisKey::generate_with_rng(
+                    degree,
+                    2,
+                    0,
+                    &secret_coefficients,
+                    exponent,
+                    layout.clone(),
+                    &mut rng,
+                )
+            })
+            .collect()
+    }
+
+    fn decrypt_rns_coefficient_rows(ciphertexts: &[RnsRlweCiphertext]) -> Vec<Vec<Vec<u64>>> {
+        let degree = ciphertexts.len();
+        let moduli = park_rns_test_moduli();
+
+        moduli
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(limb_index, modulus)| {
+                let params = RlweParameters::new(degree, modulus, 2, 0);
+                let secret = park_rns_test_secret(modulus);
+
+                ciphertexts
+                    .iter()
+                    .map(|ciphertext| {
+                        decrypt_raw(params, &secret, ciphertext.limb(limb_index))
+                            .coefficients()
+                            .to_vec()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rns_cmt_maps_basis_matrix_eij_to_eji() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+        let keys = park_rns_galois_keys(0xC4A2_0000);
+
+        for source_row in 0..degree {
+            for source_col in 0..degree {
+                let mut matrix = vec![vec![0_u64; degree]; degree];
+                matrix[source_row][source_col] = 1;
+
+                let ciphertexts = encrypt_rns_coefficient_rows(
+                    &matrix,
+                    0xC4A3_0000 ^ (degree * source_row + source_col) as u64,
+                );
+
+                let transposed = rns_transpose(&ciphertexts, &keys);
+                let actual_by_limb = decrypt_rns_coefficient_rows(&transposed);
+
+                let expected = transpose_cleartext(&matrix);
+
+                for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+                    assert_eq!(
+                        actual_by_limb[limb_index],
+                        expected,
+                        "RNS Park C-MT failed basis E_{{{source_row},{source_col}}} \
+                         at limb {limb_index}, modulus {}",
+                        modulus.value()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rns_cmt_is_involution_on_encrypted_matrix() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+        let keys = park_rns_galois_keys(0xC4A4_0000);
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 37 + 19 * row as u64 + 23 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let ciphertexts = encrypt_rns_coefficient_rows(&matrix, 0xC4A5_0000);
+
+        let once = rns_transpose(&ciphertexts, &keys);
+        let twice = rns_transpose(&once, &keys);
+
+        let actual_by_limb = decrypt_rns_coefficient_rows(&twice);
+
+        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+            let expected: Vec<Vec<u64>> = matrix
+                .iter()
+                .map(|row| row.iter().map(|&value| value % modulus.value()).collect())
+                .collect();
+
+            assert_eq!(
+                actual_by_limb[limb_index],
+                expected,
+                "RNS Park C-MT involution failed at limb {limb_index}, \
+                 modulus {}",
+                modulus.value()
+            );
+        }
+    }
+
+    #[test]
+    fn rns_cmt_transposes_asymmetric_matrix_exactly() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let degree = 8;
+        let moduli = [
+            Modulus::new(12_289),
+            Modulus::new(40_961),
+            Modulus::new(65_537),
+        ];
+
+        let basis = crate::ring::ModulusBasis::new(moduli.to_vec());
+        let secret_coefficients = [-1_i8, 0, 1, 1, 0, -1, 1, 0];
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 1 + (17 * row + 5 * col + row * col) as u64)
+                    .collect()
+            })
+            .collect();
+
+        let ciphertexts: Vec<RnsRlweCiphertext> = matrix
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let limbs = moduli
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(limb_index, modulus)| {
+                        let params = RlweParameters::new(degree, modulus, 2, 0);
+
+                        let secret = SecretKey::from_polynomial(Polynomial::new(
+                            modulus,
+                            secret_coefficients
+                                .iter()
+                                .map(|&value| match value {
+                                    -1 => modulus.value() - 1,
+                                    0 => 0,
+                                    1 => 1,
+                                    _ => unreachable!(),
+                                })
+                                .collect(),
+                        ));
+
+                        let plaintext = Polynomial::new(
+                            modulus,
+                            row.iter().map(|&value| value % modulus.value()).collect(),
+                        );
+
+                        let mut rng = ChaCha20Rng::seed_from_u64(
+                            0xC4A0_0000 ^ ((row_index as u64) << 8) ^ limb_index as u64,
+                        );
+
+                        encrypt_raw_with_rng(params, &secret, &plaintext, &mut rng)
+                    })
+                    .collect();
+
+                RnsRlweCiphertext::from_limbs(limbs)
+            })
+            .collect();
+
+        let layout = crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let galois_keys: Vec<crate::ckks::RnsGaloisKey> = (1..degree)
+            .map(|j| 2 * j + 1)
+            .map(|exponent| {
+                let mut rng = ChaCha20Rng::seed_from_u64(0xC4A1_0000 ^ exponent as u64);
+
+                crate::ckks::RnsGaloisKey::generate_with_rng(
+                    degree,
+                    2,
+                    0,
+                    &secret_coefficients,
+                    exponent,
+                    layout.clone(),
+                    &mut rng,
+                )
+            })
+            .collect();
+
+        let transposed = rns_transpose(&ciphertexts, &galois_keys);
+
+        assert_eq!(transposed.len(), degree);
+
+        for (output_col, ciphertext) in transposed.iter().enumerate() {
+            for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+                let secret = SecretKey::from_polynomial(Polynomial::new(
+                    modulus,
+                    secret_coefficients
+                        .iter()
+                        .map(|&value| match value {
+                            -1 => modulus.value() - 1,
+                            0 => 0,
+                            1 => 1,
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                ));
+
+                let params = RlweParameters::new(degree, modulus, 2, 0);
+                let observed = decrypt_raw(params, &secret, ciphertext.limb(limb_index));
+
+                let expected: Vec<u64> = (0..degree)
+                    .map(|row| matrix[row][output_col] % modulus.value())
+                    .collect();
+
+                assert_eq!(
+                    observed.coefficients(),
+                    expected.as_slice(),
+                    "RNS C-MT mismatch at output column {output_col}, \
+                     limb {limb_index}, modulus {}",
+                    modulus.value()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rns_tweak_matches_independent_scalar_limbs() {
+        let moduli = [
+            Modulus::new(12_289),
+            Modulus::new(40_961),
+            Modulus::new(65_537),
+        ];
+        let degree = 8;
+
+        for n in [1_usize, 2, 4, 8] {
+            let input: Vec<RnsRlweCiphertext> = (0..n)
+                .map(|ciphertext_index| {
+                    let limbs = moduli
+                        .iter()
+                        .enumerate()
+                        .map(|(limb_index, &modulus)| {
+                            deterministic_ciphertext(
+                                modulus,
+                                degree,
+                                1000 + 100 * ciphertext_index as u64 + 17 * limb_index as u64,
+                            )
+                        })
+                        .collect();
+
+                    RnsRlweCiphertext::from_limbs(limbs)
+                })
+                .collect();
+
+            let actual = rns_tweak(&input);
+
+            assert_eq!(
+                actual.len(),
+                n,
+                "RNS Park Tweak returned wrong bundle length for n={n}"
+            );
+
+            for limb_index in 0..moduli.len() {
+                let scalar_input: Vec<RlweCiphertext> = input
+                    .iter()
+                    .map(|ciphertext| ciphertext.limb(limb_index).clone())
+                    .collect();
+
+                let expected = tweak(&scalar_input);
+
+                for output_index in 0..n {
+                    assert_eq!(
+                        actual[output_index].limb(limb_index),
+                        &expected[output_index],
+                        "RNS Park Tweak diverged from independent scalar limb \
+                         for n={n}, limb={limb_index}, output={output_index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
