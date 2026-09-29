@@ -1,5 +1,6 @@
 pub mod cpmm;
 pub mod multiply;
+pub mod park;
 
 pub use cpmm::{cpmm, decrypt_matrix_raw, encrypt_matrix_with_rng, RlweMatrixCiphertext};
 
