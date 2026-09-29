@@ -13,7 +13,8 @@
 use std::hint::black_box;
 
 use ccmm_rs::ccmm::park::{
-    rns_ccmm_quadratic_with_backend_measured, ParkCcmmMeasurement, ParkModPpMmBackend,
+    rns_ccmm_quadratic_with_backend_measured, rns_transpose_measured, ParkCcmmMeasurement,
+    ParkCmtMeasurement, ParkModPpMmBackend,
 };
 use ccmm_rs::ckks::RnsGaloisKey;
 use ccmm_rs::grafting::{
@@ -34,6 +35,19 @@ struct Summary {
     total_ns: u128,
     cmt_ns: u128,
     mod_pp_mm_ns: u128,
+    residual_ns: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CmtSummary {
+    total_ns: u128,
+    input_shift_ns: u128,
+    first_tweak_ns: u128,
+    normalization_ns: u128,
+    automorphism_ns: u128,
+    key_switch_ns: u128,
+    second_tweak_ns: u128,
+    correction_ns: u128,
     residual_ns: u128,
 }
 
@@ -106,6 +120,49 @@ fn encrypt_columns(
         .collect()
 }
 
+fn encrypt_rows(
+    matrix: &[Vec<u64>],
+    basis: &ModulusBasis,
+    secret: &[i8],
+    plan: &RnsNttPlan,
+    seed: u64,
+) -> Vec<RnsRlweCiphertext> {
+    let degree = matrix.len();
+
+    assert!(matrix.iter().all(|row| row.len() == degree));
+
+    matrix
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let residues = basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    Polynomial::new(
+                        modulus,
+                        row.iter().map(|&value| value % modulus.value()).collect(),
+                    )
+                })
+                .collect();
+
+            let plaintext = RnsPolynomial::from_residues(residues);
+
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ ((row_index as u64) << 16));
+
+            encrypt_rns_raw_with_distribution_ntt_rng(
+                &plaintext,
+                2,
+                ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                secret,
+                plan,
+                &mut rng,
+            )
+        })
+        .collect()
+}
+
 fn galois_keys(degree: usize, basis: &ModulusBasis, secret: &[i8], seed: u64) -> Vec<RnsGaloisKey> {
     let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
 
@@ -159,6 +216,58 @@ fn summarize(samples: &[ParkCcmmMeasurement]) -> Summary {
         mod_pp_mm_ns: median_u128(&mut mod_pp_mm),
         residual_ns: median_u128(&mut residual),
     }
+}
+
+fn summarize_cmt(samples: &[ParkCmtMeasurement]) -> CmtSummary {
+    fn median_field(
+        samples: &[ParkCmtMeasurement],
+        field: impl Fn(&ParkCmtMeasurement) -> u128,
+    ) -> u128 {
+        let mut values: Vec<_> = samples.iter().map(field).collect();
+        median_u128(&mut values)
+    }
+
+    CmtSummary {
+        total_ns: median_field(samples, |m| m.total_ns),
+        input_shift_ns: median_field(samples, |m| m.input_shift_ns),
+        first_tweak_ns: median_field(samples, |m| m.first_tweak_ns),
+        normalization_ns: median_field(samples, |m| m.normalization_ns),
+        automorphism_ns: median_field(samples, |m| m.automorphism_ns),
+        key_switch_ns: median_field(samples, |m| m.key_switch_ns),
+        second_tweak_ns: median_field(samples, |m| m.second_tweak_ns),
+        correction_ns: median_field(samples, |m| m.correction_ns),
+        residual_ns: median_field(samples, |m| m.residual_ns()),
+    }
+}
+
+fn characterize_cmt(
+    degree: usize,
+    ciphertexts: &[RnsRlweCiphertext],
+    galois_keys: &[RnsGaloisKey],
+) -> CmtSummary {
+    for _ in 0..WARMUPS {
+        let (output, measurement) =
+            rns_transpose_measured(black_box(ciphertexts), black_box(galois_keys));
+
+        assert_eq!(measurement.degree, degree);
+        assert_eq!(measurement.rns_limbs, MODULI.len());
+        assert_eq!(measurement.automorphism_calls, degree - 1);
+        assert_eq!(measurement.key_switch_calls, degree - 1);
+
+        black_box(output);
+    }
+
+    let mut samples = Vec::with_capacity(REPEATS);
+
+    for _ in 0..REPEATS {
+        let (output, measurement) =
+            rns_transpose_measured(black_box(ciphertexts), black_box(galois_keys));
+
+        black_box(output);
+        samples.push(measurement);
+    }
+
+    summarize_cmt(&samples)
 }
 
 fn backend_name(backend: ParkModPpMmBackend) -> &'static str {
@@ -240,6 +349,13 @@ logical_cmt,logical_mod_pp_mm,physical_mod_pp_mm,\
 speedup_vs_reference"
     );
 
+    println!(
+        "CMT_CSV_HEADER=degree,rns_limbs,total_us,input_shift_us,\
+first_tweak_us,normalization_us,automorphism_us,key_switch_us,\
+second_tweak_us,correction_us,residual_us,key_switch_pct,\
+automorphism_pct,tweak_pct"
+    );
+
     for &degree in DEGREES {
         let moduli = moduli();
         let basis = ModulusBasis::new(moduli);
@@ -269,6 +385,37 @@ speedup_vs_reference"
         );
 
         let keys = galois_keys(degree, &basis, &secret, 0x5500_0000 ^ degree as u64);
+
+        let cmt_input = encrypt_rows(
+            &lhs_plain,
+            &basis,
+            &secret,
+            &plan,
+            0x5600_0000 ^ degree as u64,
+        );
+
+        let cmt = characterize_cmt(degree, &cmt_input, &keys);
+
+        let tweak_ns = cmt.first_tweak_ns + cmt.second_tweak_ns;
+
+        println!(
+            "CMT_RESULT,{},{},{:.3},{:.3},{:.3},{:.3},{:.3},\
+{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            degree,
+            MODULI.len(),
+            us(cmt.total_ns),
+            us(cmt.input_shift_ns),
+            us(cmt.first_tweak_ns),
+            us(cmt.normalization_ns),
+            us(cmt.automorphism_ns),
+            us(cmt.key_switch_ns),
+            us(cmt.second_tweak_ns),
+            us(cmt.correction_ns),
+            us(cmt.residual_ns),
+            pct(cmt.key_switch_ns, cmt.total_ns),
+            pct(cmt.automorphism_ns, cmt.total_ns),
+            pct(tweak_ns, cmt.total_ns),
+        );
 
         let reference = characterize(degree, ParkModPpMmBackend::Reference, &lhs, &rhs, &keys);
 
