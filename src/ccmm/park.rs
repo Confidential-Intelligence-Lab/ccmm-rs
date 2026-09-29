@@ -335,6 +335,263 @@ pub fn transpose(
     output
 }
 
+/// Ordinary dense matrix over Z_q used by the Park reduction.
+type ParkMatrix = Vec<Vec<u64>>;
+
+fn park_matrix_transpose(matrix: &[Vec<u64>]) -> ParkMatrix {
+    assert!(!matrix.is_empty());
+
+    let rows = matrix.len();
+    let cols = matrix[0].len();
+
+    assert!(matrix.iter().all(|row| row.len() == cols));
+
+    let mut result = vec![vec![0_u64; rows]; cols];
+
+    for (row, source_row) in matrix.iter().enumerate() {
+        for (col, &value) in source_row.iter().enumerate() {
+            result[col][row] = value;
+        }
+    }
+
+    result
+}
+
+fn park_matrix_add(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
+    assert_eq!(lhs.len(), rhs.len());
+    assert!(!lhs.is_empty());
+    assert_eq!(lhs[0].len(), rhs[0].len());
+
+    lhs.iter()
+        .zip(rhs)
+        .map(|(lhs_row, rhs_row)| {
+            lhs_row
+                .iter()
+                .zip(rhs_row)
+                .map(|(&lhs_value, &rhs_value)| {
+                    ((lhs_value as u128 + rhs_value as u128) % modulus as u128) as u64
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Park Mod-PP-MM: ordinary modular matrix multiplication.
+fn park_matrix_mul(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
+    assert!(!lhs.is_empty());
+    assert!(!rhs.is_empty());
+
+    let rows = lhs.len();
+    let inner = lhs[0].len();
+    let cols = rhs[0].len();
+
+    assert!(lhs.iter().all(|row| row.len() == inner));
+    assert_eq!(rhs.len(), inner);
+    assert!(rhs.iter().all(|row| row.len() == cols));
+
+    let mut result = vec![vec![0_u64; cols]; rows];
+    let modulus_u128 = modulus as u128;
+
+    for (row, result_row) in result.iter_mut().enumerate() {
+        for (col, result_value) in result_row.iter_mut().enumerate() {
+            let mut accumulator = 0_u128;
+
+            for (k, rhs_row) in rhs.iter().enumerate().take(inner) {
+                accumulator += (lhs[row][k] as u128) * (rhs_row[col] as u128);
+                accumulator %= modulus_u128;
+            }
+
+            *result_value = accumulator as u64;
+        }
+    }
+
+    result
+}
+
+/// Interprets ciphertext polynomial coefficients as matrix columns.
+fn park_components_by_columns(ciphertexts: &[RlweCiphertext], select_a: bool) -> ParkMatrix {
+    assert!(!ciphertexts.is_empty());
+
+    let degree = ciphertexts.len();
+
+    assert!(ciphertexts.iter().all(|ciphertext| {
+        ciphertext.a().degree() == degree && ciphertext.b().degree() == degree
+    }));
+
+    let mut matrix = vec![vec![0_u64; degree]; degree];
+
+    for (column, ciphertext) in ciphertexts.iter().enumerate() {
+        let polynomial = if select_a {
+            ciphertext.a()
+        } else {
+            ciphertext.b()
+        };
+
+        for (row, &coefficient) in polynomial.coefficients().iter().enumerate() {
+            matrix[row][column] = coefficient;
+        }
+    }
+
+    matrix
+}
+
+/// Constructs a synthetic Park `(A,0)` bundle with `A` packed by rows.
+///
+/// FHE-rs stores ciphertexts as `(b,a)`, so each generated ciphertext is
+/// `(b=0, a=row)`.
+fn park_synthetic_a_bundle_from_rows(
+    matrix: &[Vec<u64>],
+    modulus: crate::ring::Modulus,
+) -> Vec<RlweCiphertext> {
+    assert!(!matrix.is_empty());
+
+    let degree = matrix.len();
+
+    assert!(
+        matrix.iter().all(|row| row.len() == degree),
+        "Park synthetic row bundle must be square"
+    );
+
+    matrix
+        .iter()
+        .map(|row| {
+            let a = Polynomial::new(modulus, row.clone());
+            let b = Polynomial::zero(modulus, degree);
+
+            RlweCiphertext::new(b, a)
+        })
+        .collect()
+}
+
+/// Park Algorithm 8 up to, but excluding, relinearization and rescaling.
+///
+/// Both input operands are column-wise N x N RLWE ciphertext bundles,
+/// matching Park Algorithm 8:
+///
+/// ```text
+/// ciphertext j encrypts matrix column j.
+/// ```
+///
+/// The returned vector is likewise column-wise and contains one degree-two
+/// RLWE ciphertext per output matrix column.
+///
+/// This reference implementation deliberately uses ordinary O(N^3)
+/// modular matrix multiplication.  Acceleration is a separate concern.
+pub fn ccmm_quadratic(
+    params: crate::rlwe::RlweParameters,
+    lhs: &[RlweCiphertext],
+    rhs: &[RlweCiphertext],
+    galois_keys: &[crate::ckks::GaloisKey],
+) -> Vec<crate::rlwe::RlweQuadraticCiphertext> {
+    let degree = params.degree();
+    let modulus = params.modulus();
+    let q = modulus.value();
+
+    assert_eq!(
+        lhs.len(),
+        degree,
+        "Park CC-MM lhs must contain N column ciphertexts"
+    );
+
+    assert_eq!(
+        rhs.len(),
+        degree,
+        "Park CC-MM rhs must contain N column ciphertexts"
+    );
+
+    // ------------------------------------------------------------------
+    // Algorithm 8, Step 1.
+    //
+    // RHS:
+    //
+    //     ColumnBundle(A',B')
+    //           |
+    //          C-MT
+    //           |
+    //       RowBundle(A~,B~)
+    // ------------------------------------------------------------------
+
+    let rhs_transposed = transpose(params, rhs, galois_keys);
+
+    // Original lhs satisfies:
+    //
+    //     M = S* A + B,
+    //
+    // where ciphertext j contributes column j of A and B.
+    let a = park_components_by_columns(lhs, true);
+    let b = park_components_by_columns(lhs, false);
+
+    // C-MT(rhs) gives raw component matrices A_out, B_out with
+    //
+    //     M'^T = S* A_out + B_out.
+    //
+    // Therefore Park's row-side representation is
+    //
+    //     M' = A_out^T S*^T + B_out^T.
+    let a_tilde = park_matrix_transpose(&park_components_by_columns(&rhs_transposed, true));
+    let b_tilde = park_matrix_transpose(&park_components_by_columns(&rhs_transposed, false));
+
+    // ------------------------------------------------------------------
+    // Algorithm 8, Step 2: four Mod-PP-MM operations.
+    // ------------------------------------------------------------------
+
+    let c00 = park_matrix_mul(&a, &a_tilde, q);
+    let c01 = park_matrix_mul(&a, &b_tilde, q);
+    let c10 = park_matrix_mul(&b, &a_tilde, q);
+    let c11 = park_matrix_mul(&b, &b_tilde, q);
+
+    // ------------------------------------------------------------------
+    // Algorithm 8, Steps 3 and 4.
+    //
+    // C00 and C10 must enter C-MT packed BY ROWS.
+    // ------------------------------------------------------------------
+
+    let c00_bundle = park_synthetic_a_bundle_from_rows(&c00, modulus);
+    let c10_bundle = park_synthetic_a_bundle_from_rows(&c10, modulus);
+
+    let d01 = transpose(params, &c00_bundle, galois_keys);
+    let d23 = transpose(params, &c10_bundle, galois_keys);
+
+    let d0 = park_components_by_columns(&d01, true);
+    let d1 = park_components_by_columns(&d01, false);
+    let d2 = park_components_by_columns(&d23, true);
+    let d3 = park_components_by_columns(&d23, false);
+
+    // ------------------------------------------------------------------
+    // Algorithm 8 pre-relinearization reconstruction:
+    //
+    //     c2 = D0
+    //     c1 = D1 + D2 + C01
+    //     c0 = D3 + C11
+    //
+    // FHE-rs quadratic convention:
+    //
+    //     c0 + c1*s + c2*s^2.
+    // ------------------------------------------------------------------
+
+    let c1_matrix = park_matrix_add(&park_matrix_add(&d1, &d2, q), &c01, q);
+
+    let c0_matrix = park_matrix_add(&d3, &c11, q);
+
+    (0..degree)
+        .map(|column| {
+            let c0 = Polynomial::new(
+                modulus,
+                (0..degree).map(|row| c0_matrix[row][column]).collect(),
+            );
+
+            let c1 = Polynomial::new(
+                modulus,
+                (0..degree).map(|row| c1_matrix[row][column]).collect(),
+            );
+
+            let c2 = Polynomial::new(modulus, (0..degree).map(|row| d0[row][column]).collect());
+
+            crate::rlwe::RlweQuadraticCiphertext::new(c0, c1, c2)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;
@@ -485,6 +742,31 @@ mod tests {
             .collect()
     }
 
+    fn encrypt_coefficient_columns(
+        params: RlweParameters,
+        secret: &SecretKey,
+        matrix: &[Vec<u64>],
+        seed: u64,
+    ) -> Vec<RlweCiphertext> {
+        let degree = params.degree();
+
+        assert_eq!(matrix.len(), degree);
+        assert!(matrix.iter().all(|row| row.len() == degree));
+
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        (0..degree)
+            .map(|column| {
+                let message = Polynomial::new(
+                    params.modulus(),
+                    (0..degree).map(|row| matrix[row][column]).collect(),
+                );
+
+                encrypt_raw_with_rng(params, secret, &message, &mut rng)
+            })
+            .collect()
+    }
+
     fn encrypt_coefficient_rows(
         params: RlweParameters,
         secret: &SecretKey,
@@ -580,8 +862,8 @@ mod tests {
             for col in 0..cols {
                 let mut accumulator = 0_u128;
 
-                for k in 0..inner {
-                    accumulator += (lhs[row][k] as u128) * (rhs[k][col] as u128);
+                for (k, rhs_row) in rhs.iter().enumerate().take(inner) {
+                    accumulator += (lhs[row][k] as u128) * (rhs_row[col] as u128);
                     accumulator %= modulus as u128;
                 }
 
@@ -927,5 +1209,205 @@ mod tests {
         let actual = decrypt_coefficient_rows(params, &secret, &twice);
 
         assert_eq!(actual, matrix, "Park C-MT involution failed");
+    }
+
+    fn decrypt_park_quadratic_columns(
+        secret: &SecretKey,
+        ciphertexts: &[crate::rlwe::RlweQuadraticCiphertext],
+    ) -> Vec<Vec<u64>> {
+        let degree = secret.polynomial().degree();
+        let mut matrix = vec![vec![0_u64; degree]; degree];
+
+        let s = secret.polynomial();
+        let s_squared = s.negacyclic_mul(s);
+
+        for (column, ciphertext) in ciphertexts.iter().enumerate() {
+            let plaintext = ciphertext
+                .c0()
+                .add(&ciphertext.c1().negacyclic_mul(s))
+                .add(&ciphertext.c2().negacyclic_mul(&s_squared));
+
+            for (row, matrix_row) in matrix.iter_mut().enumerate() {
+                matrix_row[column] = plaintext.coefficients()[row];
+            }
+        }
+
+        matrix
+    }
+
+    fn clear_matrix_product(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> Vec<Vec<u64>> {
+        modular_matrix_mul(lhs, rhs, modulus)
+    }
+
+    #[test]
+    fn park_ccmm_quadratic_right_identity() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_5033_4201);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5041_524b_5033_4202);
+
+        let degree = params.degree();
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 19 + 23 * row as u64 + 29 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let mut identity = vec![vec![0_u64; degree]; degree];
+        for (index, row) in identity.iter_mut().enumerate() {
+            row[index] = 1;
+        }
+
+        let lhs = encrypt_coefficient_columns(params, &secret, &matrix, 0x5041_524b_5033_4203);
+
+        let rhs = encrypt_coefficient_columns(params, &secret, &identity, 0x5041_524b_5033_4204);
+
+        let product = ccmm_quadratic(params, &lhs, &rhs, &galois_keys);
+
+        assert_eq!(
+            decrypt_park_quadratic_columns(&secret, &product),
+            matrix,
+            "Park quadratic CC-MM failed M x I"
+        );
+    }
+
+    #[test]
+    fn park_ccmm_quadratic_left_identity() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_5033_4211);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5041_524b_5033_4212);
+
+        let degree = params.degree();
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 31 + 17 * row as u64 + 13 * col as u64 + 5 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let mut identity = vec![vec![0_u64; degree]; degree];
+        for (index, row) in identity.iter_mut().enumerate() {
+            row[index] = 1;
+        }
+
+        let lhs = encrypt_coefficient_columns(params, &secret, &identity, 0x5041_524b_5033_4213);
+
+        let rhs = encrypt_coefficient_columns(params, &secret, &matrix, 0x5041_524b_5033_4214);
+
+        let product = ccmm_quadratic(params, &lhs, &rhs, &galois_keys);
+
+        assert_eq!(
+            decrypt_park_quadratic_columns(&secret, &product),
+            matrix,
+            "Park quadratic CC-MM failed I x M"
+        );
+    }
+
+    #[test]
+    fn park_ccmm_quadratic_matches_asymmetric_clear_product() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_5033_4221);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5041_524b_5033_4222);
+
+        let degree = params.degree();
+        let q = params.modulus().value();
+
+        let lhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (3 + 5 * row as u64 + 7 * col as u64 + 2 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (11 + 13 * row as u64 + 17 * col as u64 + 3 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs = encrypt_coefficient_columns(params, &secret, &lhs_plain, 0x5041_524b_5033_4223);
+
+        let rhs = encrypt_coefficient_columns(params, &secret, &rhs_plain, 0x5041_524b_5033_4224);
+
+        let product = ccmm_quadratic(params, &lhs, &rhs, &galois_keys);
+
+        let actual = decrypt_park_quadratic_columns(&secret, &product);
+
+        let expected = clear_matrix_product(&lhs_plain, &rhs_plain, q);
+
+        assert_eq!(
+            actual, expected,
+            "Park quadratic CC-MM failed asymmetric product"
+        );
+    }
+
+    #[test]
+    fn park_ccmm_quadratic_basis_products() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_5033_4231);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5041_524b_5033_4232);
+
+        let degree = params.degree();
+
+        for i in 0..degree {
+            for j in 0..degree {
+                for k in 0..degree {
+                    let mut lhs_plain = vec![vec![0_u64; degree]; degree];
+                    lhs_plain[i][j] = 1;
+
+                    let mut rhs_plain = vec![vec![0_u64; degree]; degree];
+                    rhs_plain[j][k] = 1;
+
+                    let lhs = encrypt_coefficient_columns(
+                        params,
+                        &secret,
+                        &lhs_plain,
+                        0x5041_524b_6000_0000 + (i * 64 + j * 8 + k) as u64,
+                    );
+
+                    let rhs = encrypt_coefficient_columns(
+                        params,
+                        &secret,
+                        &rhs_plain,
+                        0x5041_524b_7000_0000 + (i * 64 + j * 8 + k) as u64,
+                    );
+
+                    let product = ccmm_quadratic(params, &lhs, &rhs, &galois_keys);
+
+                    let actual = decrypt_park_quadratic_columns(&secret, &product);
+
+                    let mut expected = vec![vec![0_u64; degree]; degree];
+                    expected[i][k] = 1;
+
+                    assert_eq!(
+                        actual, expected,
+                        "Park basis product E_{{{i},{j}}} E_{{{j},{k}}} failed"
+                    );
+                }
+            }
+        }
     }
 }
