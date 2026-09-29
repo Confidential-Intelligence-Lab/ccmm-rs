@@ -622,6 +622,65 @@ pub enum ParkModPpMmBackend {
     TransposedRhs,
 }
 
+/// Runtime characterization of one Park RNS quadratic CC-MM execution.
+///
+/// This structure is deliberately separate from `ExecutionTrace`: execution
+/// traces describe semantic work, while this object records implementation
+/// timing for a particular run.
+///
+/// Times are accumulated wall-clock nanoseconds measured around the three
+/// Park C-MT invocations and the physical per-RNS-limb Mod-PP-MM kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkCcmmMeasurement {
+    pub degree: usize,
+    pub rns_limbs: usize,
+    pub backend: ParkModPpMmBackend,
+
+    /// Park Algorithm 8 contains exactly three logical C-MT operations.
+    pub cmt_calls: usize,
+
+    /// Park Algorithm 8 contains four logical Mod-PP-MM operations.
+    pub logical_mod_pp_mm_calls: usize,
+
+    /// Physical modular matrix kernels executed across all active RNS limbs.
+    pub physical_mod_pp_mm_calls: usize,
+
+    /// Total wall-clock time spent inside the three RNS C-MT calls.
+    pub cmt_ns: u128,
+
+    /// Total wall-clock time spent inside physical Mod-PP-MM kernels.
+    pub mod_pp_mm_ns: u128,
+
+    /// Wall-clock time for the complete quadratic Park Algorithm 8 path.
+    pub total_ns: u128,
+}
+
+impl ParkCcmmMeasurement {
+    fn new(degree: usize, rns_limbs: usize, backend: ParkModPpMmBackend) -> Self {
+        Self {
+            degree,
+            rns_limbs,
+            backend,
+            cmt_calls: 0,
+            logical_mod_pp_mm_calls: 4,
+            physical_mod_pp_mm_calls: 0,
+            cmt_ns: 0,
+            mod_pp_mm_ns: 0,
+            total_ns: 0,
+        }
+    }
+
+    /// Time not directly attributed to C-MT or Mod-PP-MM.
+    ///
+    /// This includes component extraction, packing, matrix additions,
+    /// quadratic reconstruction, allocation, and measurement overhead.
+    pub fn residual_ns(self) -> u128 {
+        self.total_ns
+            .saturating_sub(self.cmt_ns)
+            .saturating_sub(self.mod_pp_mm_ns)
+    }
+}
+
 /// Park Mod-PP-MM: ordinary modular matrix multiplication.
 ///
 /// This is the frozen reference implementation used as the correctness oracle
@@ -866,11 +925,30 @@ pub fn rns_ccmm_quadratic_with_backend(
     galois_keys: &[crate::ckks::RnsGaloisKey],
     backend: ParkModPpMmBackend,
 ) -> Vec<crate::grafting::RnsQuadraticCiphertext> {
+    rns_ccmm_quadratic_with_backend_measured(lhs, rhs, galois_keys, backend).0
+}
+
+/// Executes Park RNS Algorithm 8 while collecting implementation timing.
+///
+/// The returned ciphertext bundle is identical to
+/// `rns_ccmm_quadratic_with_backend`; measurement does not alter arithmetic.
+pub fn rns_ccmm_quadratic_with_backend_measured(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    backend: ParkModPpMmBackend,
+) -> (
+    Vec<crate::grafting::RnsQuadraticCiphertext>,
+    ParkCcmmMeasurement,
+) {
     assert!(!lhs.is_empty(), "Park RNS CC-MM lhs must not be empty");
 
     let degree = lhs[0].degree();
     let basis = lhs[0].basis().clone();
     let moduli = basis.moduli();
+
+    let total_start = std::time::Instant::now();
+    let mut measurement = ParkCcmmMeasurement::new(degree, moduli.len(), backend);
 
     assert_eq!(
         lhs.len(),
@@ -898,7 +976,10 @@ pub fn rns_ccmm_quadratic_with_backend(
     );
 
     // Algorithm 8, Step 1.
+    let cmt_start = std::time::Instant::now();
     let rhs_transposed = rns_transpose(rhs, galois_keys);
+    measurement.cmt_ns += cmt_start.elapsed().as_nanos();
+    measurement.cmt_calls += 1;
 
     // Algorithm 8, Step 2: four Mod-PP-MM operations independently
     // in every CRT residue.
@@ -924,25 +1005,47 @@ pub fn rns_ccmm_quadratic_with_backend(
             false,
         ));
 
+        let mod_pp_mm_start = std::time::Instant::now();
         c00_by_limb.push(park_matrix_mul_with_backend(&a, &a_tilde, q, backend));
+        measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
+        measurement.physical_mod_pp_mm_calls += 1;
+
+        let mod_pp_mm_start = std::time::Instant::now();
         c01_by_limb.push(park_matrix_mul_with_backend(&a, &b_tilde, q, backend));
+        measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
+        measurement.physical_mod_pp_mm_calls += 1;
+
+        let mod_pp_mm_start = std::time::Instant::now();
         c10_by_limb.push(park_matrix_mul_with_backend(&b, &a_tilde, q, backend));
+        measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
+        measurement.physical_mod_pp_mm_calls += 1;
+
+        let mod_pp_mm_start = std::time::Instant::now();
         c11_by_limb.push(park_matrix_mul_with_backend(&b, &b_tilde, q, backend));
+        measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
+        measurement.physical_mod_pp_mm_calls += 1;
     }
 
     // Algorithm 8, Steps 3 and 4. C00 and C10 enter C-MT packed by rows.
     let c00_bundle = park_rns_synthetic_a_bundle_from_rows(&c00_by_limb, moduli);
     let c10_bundle = park_rns_synthetic_a_bundle_from_rows(&c10_by_limb, moduli);
 
+    let cmt_start = std::time::Instant::now();
     let d01 = rns_transpose(&c00_bundle, galois_keys);
+    measurement.cmt_ns += cmt_start.elapsed().as_nanos();
+    measurement.cmt_calls += 1;
+
+    let cmt_start = std::time::Instant::now();
     let d23 = rns_transpose(&c10_bundle, galois_keys);
+    measurement.cmt_ns += cmt_start.elapsed().as_nanos();
+    measurement.cmt_calls += 1;
 
     // Reconstruct each output column independently in every RNS limb:
     //
     //     c2 = D0
     //     c1 = D1 + D2 + C01
     //     c0 = D3 + C11.
-    (0..degree)
+    let output: Vec<_> = (0..degree)
         .map(|column| {
             let mut c0_residues = Vec::with_capacity(moduli.len());
             let mut c1_residues = Vec::with_capacity(moduli.len());
@@ -982,7 +1085,11 @@ pub fn rns_ccmm_quadratic_with_backend(
                 crate::ring::RnsPolynomial::from_residues(c2_residues),
             )
         })
-        .collect()
+        .collect();
+
+    measurement.total_ns = total_start.elapsed().as_nanos();
+
+    (output, measurement)
 }
 
 /// RNS Park Algorithm 8 followed by RNS relinearization.
@@ -1533,6 +1640,92 @@ mod tests {
                 matrix
             })
             .collect()
+    }
+
+    #[test]
+    fn rns_park_ccmm_measurement_preserves_exact_output() {
+        let degree = 8;
+
+        let lhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 7 + 11 * row as u64 + 13 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 17 + 19 * row as u64 + 23 * col as u64 + 5 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let lhs_encrypted = encrypt_rns_coefficient_columns(&lhs, 0x7272_0000);
+        let rhs_encrypted = encrypt_rns_coefficient_columns(&rhs, 0x7373_0000);
+        let galois_keys = park_rns_galois_keys(0x7474_0000);
+
+        for backend in [
+            ParkModPpMmBackend::Reference,
+            ParkModPpMmBackend::TransposedRhs,
+        ] {
+            let expected = rns_ccmm_quadratic_with_backend(
+                &lhs_encrypted,
+                &rhs_encrypted,
+                &galois_keys,
+                backend,
+            );
+
+            let (actual, measurement) = rns_ccmm_quadratic_with_backend_measured(
+                &lhs_encrypted,
+                &rhs_encrypted,
+                &galois_keys,
+                backend,
+            );
+
+            assert_eq!(
+                actual, expected,
+                "measurement changed Park quadratic output for {backend:?}"
+            );
+
+            assert_eq!(measurement.degree, degree);
+            assert_eq!(measurement.rns_limbs, park_rns_test_moduli().len());
+            assert_eq!(measurement.backend, backend);
+
+            assert_eq!(
+                measurement.cmt_calls, 3,
+                "Park Algorithm 8 must execute three logical C-MTs"
+            );
+
+            assert_eq!(
+                measurement.logical_mod_pp_mm_calls, 4,
+                "Park Algorithm 8 must execute four logical Mod-PP-MMs"
+            );
+
+            assert_eq!(
+                measurement.physical_mod_pp_mm_calls,
+                4 * measurement.rns_limbs,
+                "Park RNS path must execute four physical Mod-PP-MM kernels \
+                 per active RNS limb"
+            );
+
+            assert!(
+                measurement.total_ns >= measurement.cmt_ns,
+                "total time must include C-MT time"
+            );
+
+            assert!(
+                measurement.total_ns >= measurement.mod_pp_mm_ns,
+                "total time must include Mod-PP-MM time"
+            );
+
+            assert_eq!(
+                measurement.total_ns,
+                measurement.cmt_ns + measurement.mod_pp_mm_ns + measurement.residual_ns(),
+                "Park measurement accounting must close exactly"
+            );
+        }
     }
 
     #[test]
