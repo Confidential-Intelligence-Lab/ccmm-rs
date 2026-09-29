@@ -542,6 +542,295 @@ mod tests {
         }
     }
 
+    /// Builds the ordinary N x N coefficient matrix for multiplication by
+    /// `polynomial` in Z_q[X]/(X^N + 1).
+    ///
+    /// Column j is the coefficient vector of polynomial * X^j.
+    fn negacyclic_multiplication_matrix(polynomial: &Polynomial) -> Vec<Vec<u64>> {
+        let degree = polynomial.degree();
+        let modulus = polynomial.modulus();
+
+        let mut matrix = vec![vec![0_u64; degree]; degree];
+
+        for column in 0..degree {
+            let mut monomial_coefficients = vec![0_u64; degree];
+            monomial_coefficients[column] = 1;
+
+            let monomial = Polynomial::new(modulus, monomial_coefficients);
+            let product = polynomial.negacyclic_mul(&monomial);
+
+            for (row, &coefficient) in product.coefficients().iter().enumerate() {
+                matrix[row][column] = coefficient;
+            }
+        }
+
+        matrix
+    }
+
+    fn modular_matrix_mul(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> Vec<Vec<u64>> {
+        let rows = lhs.len();
+        let inner = lhs[0].len();
+        let cols = rhs[0].len();
+
+        assert_eq!(rhs.len(), inner);
+
+        let mut result = vec![vec![0_u64; cols]; rows];
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut accumulator = 0_u128;
+
+                for k in 0..inner {
+                    accumulator += (lhs[row][k] as u128) * (rhs[k][col] as u128);
+                    accumulator %= modulus as u128;
+                }
+
+                result[row][col] = accumulator as u64;
+            }
+        }
+
+        result
+    }
+
+    fn modular_matrix_add(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> Vec<Vec<u64>> {
+        assert_eq!(lhs.len(), rhs.len());
+        assert_eq!(lhs[0].len(), rhs[0].len());
+
+        lhs.iter()
+            .zip(rhs)
+            .map(|(lhs_row, rhs_row)| {
+                lhs_row
+                    .iter()
+                    .zip(rhs_row)
+                    .map(|(&lhs_value, &rhs_value)| {
+                        ((lhs_value as u128 + rhs_value as u128) % modulus as u128) as u64
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn modular_matrix_transpose(matrix: &[Vec<u64>]) -> Vec<Vec<u64>> {
+        let rows = matrix.len();
+        let cols = matrix[0].len();
+
+        let mut result = vec![vec![0_u64; rows]; cols];
+
+        for (row, matrix_row) in matrix.iter().enumerate() {
+            for (col, &value) in matrix_row.iter().enumerate() {
+                result[col][row] = value;
+            }
+        }
+
+        result
+    }
+
+    fn ciphertext_component_matrix(
+        ciphertexts: &[RlweCiphertext],
+        select_a: bool,
+    ) -> Vec<Vec<u64>> {
+        let degree = ciphertexts.len();
+        let mut matrix = vec![vec![0_u64; degree]; degree];
+
+        // Ciphertext j is interpreted as coefficient column j.
+        for (column, ciphertext) in ciphertexts.iter().enumerate() {
+            let polynomial = if select_a {
+                ciphertext.a()
+            } else {
+                ciphertext.b()
+            };
+
+            for (row, &coefficient) in polynomial.coefficients().iter().enumerate() {
+                matrix[row][column] = coefficient;
+            }
+        }
+
+        matrix
+    }
+
+    fn matrix_from_ciphertext_columns(
+        ciphertexts: &[RlweCiphertext],
+        select_a: bool,
+    ) -> Vec<Vec<u64>> {
+        ciphertext_component_matrix(ciphertexts, select_a)
+    }
+
+    fn matrix_from_ciphertext_rows(
+        ciphertexts: &[RlweCiphertext],
+        select_a: bool,
+    ) -> Vec<Vec<u64>> {
+        modular_matrix_transpose(&ciphertext_component_matrix(ciphertexts, select_a))
+    }
+
+    fn synthetic_a_bundle_from_rows(matrix: &[Vec<u64>], modulus: Modulus) -> Vec<RlweCiphertext> {
+        let degree = matrix.len();
+        assert_eq!(matrix[0].len(), degree);
+
+        (0..degree)
+            .map(|row| {
+                let a = Polynomial::new(modulus, matrix[row].clone());
+                let b = Polynomial::zero(modulus, degree);
+                RlweCiphertext::new(b, a)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn park_cmt_component_identity_for_synthetic_bundle() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x434d_545f_434f_4d50);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x434d_545f_4b45_5953);
+
+        let degree = params.degree();
+        let modulus = params.modulus();
+        let q = modulus.value();
+
+        // Arbitrary, asymmetric ordinary matrix C.
+        let c: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (7 + 11 * row as u64 + 17 * col as u64 + 5 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Construct Park's synthetic pair (C, 0).
+        //
+        // Park notation is (A,B), whereas FHE-rs stores (b,a).
+        // Therefore each ciphertext column is (b=0, a=C[:,j]).
+        let synthetic: Vec<RlweCiphertext> = (0..degree)
+            .map(|column| {
+                let a = Polynomial::new(modulus, (0..degree).map(|row| c[row][column]).collect());
+
+                let b = Polynomial::zero(modulus, degree);
+
+                RlweCiphertext::new(b, a)
+            })
+            .collect();
+
+        let transformed = transpose(params, &synthetic, &galois_keys);
+
+        // FHE-rs component matrices after C-MT.
+        let d0 = ciphertext_component_matrix(&transformed, true);
+        let d1 = ciphertext_component_matrix(&transformed, false);
+
+        // S* is defined operationally: the matrix representing
+        // multiplication by s(X) in the negacyclic ring.
+        let s_star = negacyclic_multiplication_matrix(secret.polynomial());
+        let s_star_transpose = modular_matrix_transpose(&s_star);
+
+        // Park Algorithm 8 requires:
+        //
+        // Because C is packed by columns, C-MT gives:
+        //
+        //     C^T S*^T = S* D0 + D1.
+        //
+        let lhs = modular_matrix_mul(&modular_matrix_transpose(&c), &s_star_transpose, q);
+
+        let rhs = modular_matrix_add(&modular_matrix_mul(&s_star, &d0, q), &d1, q);
+
+        assert_eq!(
+            lhs, rhs,
+            "C-MT component identity C^T*S*^T = S*D0 + D1 failed"
+        );
+    }
+
+    #[test]
+    fn park_algorithm8_representation_flow_matches_matrix_algebra() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5041_524b_5033_4101);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5041_524b_5033_4102);
+
+        let degree = params.degree();
+        let modulus = params.modulus();
+        let q = modulus.value();
+
+        let lhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (3 + 7 * row as u64 + 11 * col as u64 + 2 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (5 + 13 * row as u64 + 17 * col as u64 + 3 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs = encrypt_coefficient_rows(params, &secret, &lhs_plain, 0x5041_524b_5033_4103);
+
+        let rhs = encrypt_coefficient_rows(params, &secret, &rhs_plain, 0x5041_524b_5033_4104);
+
+        // Existing C-MT contract:
+        // row-packed RHS -> column-packed RHS^T.
+        let rhs_cmt = transpose(params, &rhs, &galois_keys);
+
+        // LHS input is row-packed, so its raw component matrices are read
+        // by rows. The C-MT output is column-packed, so its components are
+        // read by columns.
+        let a = matrix_from_ciphertext_rows(&lhs, true);
+        let b = matrix_from_ciphertext_rows(&lhs, false);
+
+        let a_tilde = matrix_from_ciphertext_columns(&rhs_cmt, true);
+        let b_tilde = matrix_from_ciphertext_columns(&rhs_cmt, false);
+
+        let c00 = modular_matrix_mul(&a, &a_tilde, q);
+        let c01 = modular_matrix_mul(&a, &b_tilde, q);
+        let c10 = modular_matrix_mul(&b, &a_tilde, q);
+        let c11 = modular_matrix_mul(&b, &b_tilde, q);
+
+        // Algorithm 8 Steps 3-4 require C00 and C10 to enter C-MT
+        // by rows, not by columns.
+        let c00_bundle = synthetic_a_bundle_from_rows(&c00, modulus);
+        let c10_bundle = synthetic_a_bundle_from_rows(&c10, modulus);
+
+        let d01 = transpose(params, &c00_bundle, &galois_keys);
+        let d23 = transpose(params, &c10_bundle, &galois_keys);
+
+        let d0 = matrix_from_ciphertext_columns(&d01, true);
+        let d1 = matrix_from_ciphertext_columns(&d01, false);
+        let d2 = matrix_from_ciphertext_columns(&d23, true);
+        let d3 = matrix_from_ciphertext_columns(&d23, false);
+
+        let s_star = negacyclic_multiplication_matrix(secret.polynomial());
+        let s_star_t = modular_matrix_transpose(&s_star);
+
+        // These are precisely the two component identities required by
+        // Algorithm 8 after its second and third C-MTs.
+        assert_eq!(
+            modular_matrix_mul(&c00, &s_star_t, q),
+            modular_matrix_add(&modular_matrix_mul(&s_star, &d0, q), &d1, q,),
+            "C00 row-packed C-MT identity failed",
+        );
+
+        assert_eq!(
+            modular_matrix_mul(&c10, &s_star_t, q),
+            modular_matrix_add(&modular_matrix_mul(&s_star, &d2, q), &d3, q,),
+            "C10 row-packed C-MT identity failed",
+        );
+
+        // Keep the four PP-MM outputs live and dimension-checked.
+        assert_eq!(c01.len(), degree);
+        assert_eq!(c11.len(), degree);
+        assert!(c01.iter().all(|row| row.len() == degree));
+        assert!(c11.iter().all(|row| row.len() == degree));
+    }
     #[test]
     fn park_cmt_transposes_asymmetric_matrix_exactly() {
         // Noise-free parameters isolate Park Algorithm 4 algebra from
