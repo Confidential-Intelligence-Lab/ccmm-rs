@@ -305,6 +305,76 @@ pub fn research_profile_16384() -> CkksParameterProfile {
     )
 }
 
+/// Large-N research profile for polynomial degree 32768.
+///
+/// The thirteen 50-bit NTT primes provide an aggregate 650-bit Q basis.
+/// This remains below the 868-bit 128-bit-classical guideline reference
+/// for a uniform-ternary secret and Gaussian error sigma 3.19.
+///
+/// This profile is research infrastructure and remains non-security-bearing
+/// until its complete execution path receives the corresponding validation.
+pub fn research_profile_32768() -> CkksParameterProfile {
+    CkksParameterProfile::new(
+        "research-32768",
+        32768,
+        &[
+            0x3ffffffdf0001,
+            0x3ffffffd20001,
+            0x3ffffffcd0001,
+            0x3ffffffc70001,
+            0x3ffffffb80001,
+            0x3ffffffb10001,
+            0x3ffffff8b0001,
+            0x3ffffff5d0001,
+            0x3fffffed60001,
+            0x3fffffec80001,
+            0x3fffffebe0001,
+            0x3fffffeb90001,
+            0x3fffffead0001,
+        ],
+        2.0_f64.powi(50),
+        CkksParameterClass::Research,
+        None,
+    )
+}
+
+/// Large-N research profile for polynomial degree 65536.
+///
+/// The seventeen 55-bit NTT primes provide an aggregate 935-bit Q basis.
+/// This remains below the 1747-bit 128-bit-classical guideline reference
+/// for a uniform-ternary secret and Gaussian error sigma 3.19.
+///
+/// This profile is research infrastructure and remains non-security-bearing
+/// until its complete execution path receives the corresponding validation.
+pub fn research_profile_65536() -> CkksParameterProfile {
+    CkksParameterProfile::new(
+        "research-65536",
+        65536,
+        &[
+            0x7fffffffba0001,
+            0x7fffffffaa0001,
+            0x7fffffff7e0001,
+            0x7fffffff380001,
+            0x7ffffffef00001,
+            0x7ffffffeba0001,
+            0x7ffffffeac0001,
+            0x7ffffffe700001,
+            0x7ffffffe600001,
+            0x7ffffffe4c0001,
+            0x7ffffffe220001,
+            0x7ffffffe160001,
+            0x7ffffffdec0001,
+            0x7ffffffdd00001,
+            0x7ffffffdce0001,
+            0x7ffffffdbc0001,
+            0x7ffffffd5c0001,
+        ],
+        2.0_f64.powi(55),
+        CkksParameterClass::Research,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +462,8 @@ mod tests {
             research_profile_4096(),
             research_profile_8192(),
             research_profile_16384(),
+            research_profile_32768(),
+            research_profile_65536(),
         ] {
             assert!(!profile.security_bearing());
             assert_eq!(profile.security_model(), None);
@@ -431,6 +503,8 @@ mod tests {
             (research_profile_4096(), 105_u32),
             (research_profile_8192(), 200_u32),
             (research_profile_16384(), 405_u32),
+            (research_profile_32768(), 650_u32),
+            (research_profile_65536(), 935_u32),
         ];
 
         for (profile, expected_bits) in cases {
@@ -487,6 +561,8 @@ mod tests {
             research_profile_4096(),
             research_profile_8192(),
             research_profile_16384(),
+            research_profile_32768(),
+            research_profile_65536(),
         ] {
             let plan = profile.rns_ntt_plan();
             let basis = profile.modulus_basis();
@@ -520,48 +596,65 @@ mod tests {
     }
 
     #[test]
-    fn research_4096_supports_ntt_backed_rns_encrypt_decrypt() {
+    fn research_profiles_support_ntt_backed_rns_encrypt_decrypt() {
         use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
         use crate::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_ntt_rng};
         use crate::ring::RnsPolynomial;
 
-        let profile = research_profile_4096();
-        let basis = profile.modulus_basis();
-        let plan = profile.rns_ntt_plan();
+        let profiles = [
+            research_profile_4096(),
+            research_profile_8192(),
+            research_profile_16384(),
+            research_profile_32768(),
+            research_profile_65536(),
+        ];
 
-        let secret: Vec<i8> = (0..profile.degree())
-            .map(|index| match index % 3 {
-                0 => -1,
-                1 => 0,
-                _ => 1,
-            })
-            .collect();
+        for (profile_index, profile) in profiles.into_iter().enumerate() {
+            let basis = profile.modulus_basis();
+            let plan = profile.rns_ntt_plan();
 
-        let coefficients: Vec<u128> = (0..profile.degree())
-            .map(|index| {
-                if index < 16 {
-                    (17 + 13 * index) as u128
-                } else {
-                    0
-                }
-            })
-            .collect();
+            let secret: Vec<i8> = (0..profile.degree())
+                .map(|index| match index % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect();
 
-        let message = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+            let coefficients: Vec<u128> = (0..profile.degree())
+                .map(|index| {
+                    if index < 16 {
+                        (17 + 13 * index) as u128
+                    } else {
+                        0
+                    }
+                })
+                .collect();
 
-        let mut rng = ChaCha20Rng::seed_from_u64(0x290A_300E);
+            let message = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
 
-        /*
-         * Zero noise makes this a strict functional smoke rather than
-         * a precision/noise experiment. R2.9c characterizes noise.
-         */
-        let ciphertext = encrypt_rns_raw_with_ntt_rng(&message, 2, 0, &secret, &plan, &mut rng);
+            let mut rng = ChaCha20Rng::seed_from_u64(
+                0x290A_300E ^ profile.degree() as u64 ^ ((profile_index as u64) << 48),
+            );
 
-        let recovered = decrypt_rns_raw_with_ntt(&ciphertext, &secret, &plan);
+            /*
+             * Zero noise deliberately keeps this a functional
+             * degree-portability smoke. Noise/security validation
+             * remains a separate concern.
+             */
+            let ciphertext = encrypt_rns_raw_with_ntt_rng(&message, 2, 0, &secret, &plan, &mut rng);
 
-        assert_eq!(recovered, message);
+            let recovered = decrypt_rns_raw_with_ntt(&ciphertext, &secret, &plan);
+
+            assert_eq!(
+                recovered,
+                message,
+                "NTT-backed RNS encrypt/decrypt failed for {}",
+                profile.name(),
+            );
+        }
     }
 
     #[test]
