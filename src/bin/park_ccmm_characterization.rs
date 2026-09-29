@@ -16,6 +16,7 @@ use ccmm_rs::ccmm::park::{
     rns_ccmm_quadratic_with_backend_measured, rns_transpose_measured, ParkCcmmMeasurement,
     ParkCmtMeasurement, ParkModPpMmBackend,
 };
+use ccmm_rs::ccmm::park::{rns_tweak, rns_tweak_native};
 use ccmm_rs::ckks::RnsGaloisKey;
 use ccmm_rs::grafting::{
     encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout, RnsRlweCiphertext,
@@ -270,6 +271,37 @@ fn characterize_cmt(
     summarize_cmt(&samples)
 }
 
+fn characterize_tweak(ciphertexts: &[RnsRlweCiphertext], native: bool) -> u128 {
+    for _ in 0..WARMUPS {
+        let output = if native {
+            rns_tweak_native(black_box(ciphertexts))
+        } else {
+            rns_tweak(black_box(ciphertexts))
+        };
+
+        black_box(output);
+    }
+
+    let mut samples = Vec::with_capacity(REPEATS);
+
+    for _ in 0..REPEATS {
+        let start = std::time::Instant::now();
+
+        let output = if native {
+            rns_tweak_native(black_box(ciphertexts))
+        } else {
+            rns_tweak(black_box(ciphertexts))
+        };
+
+        let elapsed = start.elapsed().as_nanos();
+
+        black_box(output);
+        samples.push(elapsed);
+    }
+
+    median_u128(&mut samples)
+}
+
 fn backend_name(backend: ParkModPpMmBackend) -> &'static str {
     match backend {
         ParkModPpMmBackend::Reference => "Reference",
@@ -356,6 +388,11 @@ second_tweak_us,correction_us,residual_us,key_switch_pct,\
 automorphism_pct,tweak_pct"
     );
 
+    println!(
+        "TWEAK_CSV_HEADER=degree,rns_limbs,oracle_us,native_us,\
+speedup_native_vs_oracle"
+    );
+
     for &degree in DEGREES {
         let moduli = moduli();
         let basis = ModulusBasis::new(moduli);
@@ -397,6 +434,24 @@ automorphism_pct,tweak_pct"
         let cmt = characterize_cmt(degree, &cmt_input, &keys);
 
         let tweak_ns = cmt.first_tweak_ns + cmt.second_tweak_ns;
+
+        let tweak_oracle_ns = characterize_tweak(&cmt_input, false);
+
+        let tweak_native_ns = characterize_tweak(&cmt_input, true);
+
+        assert!(
+            tweak_native_ns > 0,
+            "native RNS Tweak timing must be nonzero"
+        );
+
+        println!(
+            "TWEAK_RESULT,{},{},{:.3},{:.3},{:.6}",
+            degree,
+            MODULI.len(),
+            us(tweak_oracle_ns),
+            us(tweak_native_ns),
+            tweak_oracle_ns as f64 / tweak_native_ns as f64,
+        );
 
         println!(
             "CMT_RESULT,{},{},{:.3},{:.3},{:.3},{:.3},{:.3},\

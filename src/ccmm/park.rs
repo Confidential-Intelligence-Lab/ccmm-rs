@@ -250,6 +250,138 @@ pub fn rns_tweak(
         .collect()
 }
 
+/// Native ciphertext-major RNS implementation of Park Algorithm 3.
+///
+/// This executes the same butterfly schedule as [`tweak`] directly over
+/// `RnsRlweCiphertext` values. The existing [`rns_tweak`] remains the
+/// specification oracle that evaluates the scalar transform independently
+/// over every CRT limb.
+pub fn rns_tweak_native(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    assert!(
+        !ciphertexts.is_empty(),
+        "RNS Tweak requires at least one ciphertext"
+    );
+
+    let n = ciphertexts.len();
+
+    assert!(
+        n.is_power_of_two(),
+        "RNS Tweak ciphertext count must be a power of two"
+    );
+
+    let degree = ciphertexts[0].degree();
+    let basis = ciphertexts[0].basis().clone();
+
+    assert!(
+        degree.is_power_of_two(),
+        "RNS Tweak ring degree must be a power of two"
+    );
+
+    assert!(
+        n <= degree && degree % n == 0,
+        "RNS Tweak ciphertext count must divide ring degree"
+    );
+
+    for ciphertext in ciphertexts {
+        assert_eq!(
+            ciphertext.degree(),
+            degree,
+            "RNS Tweak ciphertext degrees must match"
+        );
+        assert_eq!(
+            ciphertext.basis(),
+            &basis,
+            "RNS Tweak ciphertext bases must match"
+        );
+    }
+
+    if n == 1 {
+        return vec![ciphertexts[0].clone()];
+    }
+
+    let mut output = vec![ciphertexts[0].clone(); n];
+    output[0] = ciphertexts[0].clone();
+
+    let log_n = n.trailing_zeros() as usize;
+
+    for ell in 0..log_n {
+        let width = 1usize << ell;
+        let stride = n >> (ell + 1);
+
+        let odd_inputs: Vec<_> = (0..width)
+            .map(|j| ciphertexts[(2 * j + 1) * stride].clone())
+            .collect();
+
+        let aux = rns_tweak_native(&odd_inputs);
+
+        let previous = output[..width].to_vec();
+
+        for j in 0..width {
+            let exponent = j * degree / width;
+
+            let rotated = rns_ciphertext_mul_monomial(&aux[j], exponent);
+
+            output[j] = rns_ciphertext_add(&previous[j], &rotated);
+
+            output[j + width] = rns_ciphertext_sub(&previous[j], &rotated);
+        }
+    }
+
+    output
+}
+
+fn rns_ciphertext_add(
+    lhs: &crate::grafting::RnsRlweCiphertext,
+    rhs: &crate::grafting::RnsRlweCiphertext,
+) -> crate::grafting::RnsRlweCiphertext {
+    assert_eq!(
+        lhs.basis(),
+        rhs.basis(),
+        "RNS ciphertext addition requires matching bases"
+    );
+    assert_eq!(
+        lhs.degree(),
+        rhs.degree(),
+        "RNS ciphertext addition requires matching degrees"
+    );
+
+    let limbs = lhs
+        .limbs()
+        .iter()
+        .zip(rhs.limbs())
+        .map(|(lhs_limb, rhs_limb)| ciphertext_add(lhs_limb, rhs_limb))
+        .collect();
+
+    crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+}
+
+fn rns_ciphertext_sub(
+    lhs: &crate::grafting::RnsRlweCiphertext,
+    rhs: &crate::grafting::RnsRlweCiphertext,
+) -> crate::grafting::RnsRlweCiphertext {
+    assert_eq!(
+        lhs.basis(),
+        rhs.basis(),
+        "RNS ciphertext subtraction requires matching bases"
+    );
+    assert_eq!(
+        lhs.degree(),
+        rhs.degree(),
+        "RNS ciphertext subtraction requires matching degrees"
+    );
+
+    let limbs = lhs
+        .limbs()
+        .iter()
+        .zip(rhs.limbs())
+        .map(|(lhs_limb, rhs_limb)| ciphertext_sub(lhs_limb, rhs_limb))
+        .collect();
+
+    crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+}
+
 fn rns_ciphertext_mul_monomial(
     ciphertext: &crate::grafting::RnsRlweCiphertext,
     exponent: usize,
@@ -2690,6 +2822,73 @@ mod tests {
                  modulus {}",
                 modulus.value()
             );
+        }
+    }
+
+    #[test]
+    fn rns_tweak_native_matches_scalar_limb_oracle() {
+        use crate::ring::Polynomial;
+        use crate::rlwe::RlweCiphertext;
+
+        let moduli = park_rns_test_moduli();
+
+        for &degree in &[1usize, 2, 4, 8, 16, 32] {
+            for &n in &[1usize, 2, 4, 8, 16, 32] {
+                if n > degree {
+                    continue;
+                }
+
+                let ciphertexts: Vec<_> = (0..n)
+                    .map(|ciphertext_index| {
+                        let limbs = moduli
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(limb_index, modulus)| {
+                                let b = Polynomial::new(
+                                    modulus,
+                                    (0..degree)
+                                        .map(|coefficient| {
+                                            (1 + 17 * ciphertext_index
+                                                + 29 * coefficient
+                                                + 7 * limb_index
+                                                + 3 * ciphertext_index * coefficient)
+                                                as u64
+                                                % modulus.value()
+                                        })
+                                        .collect(),
+                                );
+
+                                let a = Polynomial::new(
+                                    modulus,
+                                    (0..degree)
+                                        .map(|coefficient| {
+                                            (5 + 11 * ciphertext_index
+                                                + 19 * coefficient
+                                                + 13 * limb_index
+                                                + 5 * ciphertext_index * coefficient)
+                                                as u64
+                                                % modulus.value()
+                                        })
+                                        .collect(),
+                                );
+
+                                RlweCiphertext::new(b, a)
+                            })
+                            .collect();
+
+                        crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+                    })
+                    .collect();
+
+                let expected = rns_tweak(&ciphertexts);
+                let actual = rns_tweak_native(&ciphertexts);
+
+                assert_eq!(
+                    actual, expected,
+                    "native RNS Tweak mismatch for degree={degree}, n={n}"
+                );
+            }
         }
     }
 
