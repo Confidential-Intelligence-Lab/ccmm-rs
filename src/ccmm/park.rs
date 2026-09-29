@@ -895,6 +895,28 @@ pub fn rns_ccmm_quadratic(
         .collect()
 }
 
+/// RNS Park Algorithm 8 followed by RNS relinearization.
+///
+/// This converts each degree-two Park output
+///
+/// ```text
+/// c0 + c1*s + c2*s^2
+/// ```
+///
+/// into an RNS RLWE ciphertext under `s`. CKKS rescaling is deliberately
+/// excluded from this layer.
+pub fn rns_ccmm_relinearized(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    multiplication_key: &crate::grafting::RnsMultiplicationKey,
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    rns_ccmm_quadratic(lhs, rhs, galois_keys)
+        .iter()
+        .map(|product| crate::grafting::rns_relinearize(product, multiplication_key))
+        .collect()
+}
+
 /// Park Algorithm 8 up to, but excluding, relinearization and rescaling.
 ///
 /// Both input operands are column-wise N x N RLWE ciphertext bundles,
@@ -1283,6 +1305,139 @@ mod tests {
                 matrix
             })
             .collect()
+    }
+
+    #[test]
+    fn rns_park_ccmm_relinearized_matches_asymmetric_clear_product() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let lhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 5 + 7 * row as u64 + 11 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 13 + 17 * row as u64 + 19 * col as u64 + 5 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let lhs_ciphertexts = encrypt_rns_coefficient_columns(&lhs, 0xC4C4_0000);
+        let rhs_ciphertexts = encrypt_rns_coefficient_columns(&rhs, 0xC4C5_0000);
+
+        let galois_keys = park_rns_galois_keys(0xC4C6_0000);
+
+        let basis = crate::ring::ModulusBasis::new(moduli.to_vec());
+
+        let layout = crate::grafting::RnsGadgetLayout::new(basis, vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xC4C7_0000);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &park_rns_test_secret_coefficients(),
+            layout,
+            &mut key_rng,
+        );
+
+        let output = rns_ccmm_relinearized(
+            &lhs_ciphertexts,
+            &rhs_ciphertexts,
+            &galois_keys,
+            &multiplication_key,
+        );
+
+        let output_by_limb = decrypt_rns_coefficient_rows(&output);
+
+        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+            let actual = transpose_cleartext(&output_by_limb[limb_index]);
+
+            let expected = park_matrix_mul(&lhs, &rhs, modulus.value());
+
+            assert_eq!(
+                actual,
+                expected,
+                "RNS Park relinearized CC-MM mismatch at limb \
+                 {limb_index}, modulus {}",
+                modulus.value()
+            );
+        }
+    }
+
+    #[test]
+    fn rns_park_ccmm_relinearization_preserves_quadratic_decryption() {
+        let degree = 8;
+        let basis = crate::ring::ModulusBasis::new(park_rns_test_moduli().to_vec());
+
+        let lhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 7 + 11 * row as u64 + 13 * col as u64 + 2 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        3 + 17 * row as u64
+                            + 19 * col as u64
+                            + 5 * row as u64 * col as u64
+                            + col as u64 * col as u64
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs_ciphertexts = encrypt_rns_coefficient_columns(&lhs, 0xC4C0_0000);
+        let rhs_ciphertexts = encrypt_rns_coefficient_columns(&rhs, 0xC4C1_0000);
+
+        let galois_keys = park_rns_galois_keys(0xC4C2_0000);
+
+        let quadratic = rns_ccmm_quadratic(&lhs_ciphertexts, &rhs_ciphertexts, &galois_keys);
+
+        let layout = crate::grafting::RnsGadgetLayout::new(basis, vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xC4C3_0000);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &park_rns_test_secret_coefficients(),
+            layout,
+            &mut key_rng,
+        );
+
+        let relinearized: Vec<RnsRlweCiphertext> = quadratic
+            .iter()
+            .map(|product| crate::grafting::rns_relinearize(product, &multiplication_key))
+            .collect();
+
+        let quadratic_plaintexts = decrypt_rns_quadratic_columns(&quadratic);
+
+        let relinearized_plaintexts = decrypt_rns_coefficient_rows(&relinearized);
+
+        for (limb_index, modulus) in park_rns_test_moduli().iter().copied().enumerate() {
+            let relinearized_matrix = transpose_cleartext(&relinearized_plaintexts[limb_index]);
+
+            assert_eq!(
+                relinearized_matrix,
+                quadratic_plaintexts[limb_index],
+                "Park RNS relinearization changed decryption at limb \
+                 {limb_index}, modulus {}",
+                modulus.value()
+            );
+        }
     }
 
     #[test]
