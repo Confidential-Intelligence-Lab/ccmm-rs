@@ -552,6 +552,176 @@ pub fn rns_transpose(
     output
 }
 
+/// Generalized Park Algorithm 4 over a logical matrix order `n` embedded
+/// in an RLWE ring of degree `N`.
+///
+/// Let
+///
+/// ```text
+/// n = ciphertexts.len()
+/// N = ciphertexts[0].degree()
+/// stride = N / n
+/// Y = X^stride.
+/// ```
+///
+/// The logical matrix is represented in the negacyclic subring generated
+/// by `Y`, so a logical row
+///
+/// ```text
+/// [m_0, ..., m_(n-1)]
+/// ```
+///
+/// is packed as
+///
+/// ```text
+/// m_0 + m_1 X^stride + ... + m_(n-1) X^((n-1) stride).
+/// ```
+///
+/// Because `Y^n = X^N = -1`, Park Algorithm 4 applies unchanged in the
+/// logical variable `Y`. In the ambient ring this means:
+///
+/// - input shift `Y^i` becomes `X^(stride*i)`;
+/// - Tweak already supplies its `N/n` exponent scaling;
+/// - permutation and normalization use logical order `n`;
+/// - Galois exponents remain `2*j+1`;
+/// - final correction `Y^(n-j)` becomes `X^(stride*(n-j))`.
+///
+/// For `n == N`, `stride == 1` and this reduces exactly to [`rns_transpose`].
+///
+/// This function is introduced as an experimental specification path while
+/// the existing `rns_transpose` remains the validated `n == N` implementation.
+pub fn rns_transpose_embedded(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    assert!(
+        !ciphertexts.is_empty(),
+        "embedded Park RNS C-MT requires ciphertexts"
+    );
+
+    let n = ciphertexts.len();
+    let degree = ciphertexts[0].degree();
+    let basis = ciphertexts[0].basis().clone();
+
+    assert!(
+        n.is_power_of_two(),
+        "embedded Park RNS C-MT logical order must be a power of two"
+    );
+
+    assert!(
+        degree.is_power_of_two(),
+        "embedded Park RNS C-MT ring degree must be a power of two"
+    );
+
+    assert!(
+        n <= degree && degree % n == 0,
+        "embedded Park RNS C-MT requires logical order n to divide ring degree N"
+    );
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "embedded Park RNS C-MT ciphertext degrees must match"
+    );
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.basis() == &basis),
+        "embedded Park RNS C-MT ciphertext bases must match"
+    );
+
+    assert!(
+        basis
+            .moduli()
+            .iter()
+            .all(|modulus| modulus.value() % 2 == 1),
+        "embedded Park RNS C-MT requires n invertible modulo every active modulus"
+    );
+
+    let stride = degree / n;
+    let two_n = 2 * n;
+
+    // Algorithm 4, Step 1 in logical variable Y = X^stride:
+    //
+    //     aux <- Tweak((Y^i * ct_i)_i)
+    //
+    // so Y^i becomes X^(stride*i) in R_N.
+    let shifted_inputs: Vec<crate::grafting::RnsRlweCiphertext> = ciphertexts
+        .iter()
+        .enumerate()
+        .map(|(i, ciphertext)| rns_ciphertext_mul_monomial(ciphertext, stride * i))
+        .collect();
+
+    let aux = rns_tweak(&shifted_inputs);
+
+    // Algorithm 4, Steps 2--5 operate over the logical order n.
+    let n_inverses: Vec<u64> = basis
+        .moduli()
+        .iter()
+        .map(|modulus| modular_inverse(n as u64, modulus.value()))
+        .collect();
+
+    let mut transformed = Vec::with_capacity(n);
+
+    for j in 0..n {
+        let exponent = 2 * j + 1;
+
+        let inverse_exponent = modular_inverse(exponent as u64, two_n as u64) as usize;
+
+        assert_eq!(
+            inverse_exponent % 2,
+            1,
+            "inverse of odd embedded RNS C-MT exponent must remain odd"
+        );
+
+        let source_index = (inverse_exponent - 1) / 2;
+
+        assert!(
+            source_index < n,
+            "embedded Park RNS C-MT source index escaped logical dimension"
+        );
+
+        let normalized = rns_ciphertext_scalar_mul(&aux[source_index], &n_inverses);
+
+        let automorphed = if exponent == 1 {
+            normalized
+        } else {
+            let key = rns_galois_key_for_exponent(galois_keys, exponent);
+            crate::ckks::apply_rns_galois_automorphism(&normalized, key)
+        };
+
+        transformed.push(automorphed);
+    }
+
+    // Algorithm 4, Step 6.
+    let second_tweak = rns_tweak(&transformed);
+
+    // Algorithm 4, Steps 7--9 in Y:
+    //
+    //     -Y^(n-j) = -X^(stride*(n-j)).
+    let minus_one: Vec<u64> = basis
+        .moduli()
+        .iter()
+        .map(|modulus| modulus.value() - 1)
+        .collect();
+
+    let mut output = Vec::with_capacity(n);
+    output.push(second_tweak[0].clone());
+
+    for output_index in 1..n {
+        let source_index = n - output_index;
+        let exponent = stride * (n - output_index);
+
+        let corrected = rns_ciphertext_mul_monomial(&second_tweak[source_index], exponent);
+
+        output.push(rns_ciphertext_scalar_mul(&corrected, &minus_one));
+    }
+
+    output
+}
+
 /// Runtime decomposition of one Park RNS ciphertext-matrix transpose.
 ///
 /// This measurement is intentionally separate from semantic execution
@@ -3044,6 +3214,213 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn embedded_rns_cmt_semantic_case(degree: usize, moduli: Vec<crate::ring::Modulus>, seed: u64) {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let n = 8_usize;
+
+        assert!(degree >= n);
+        assert_eq!(degree % n, 0);
+        assert_eq!(
+            moduli.len(),
+            3,
+            "P6b.1 test layout expects the current three-limb RNS basis"
+        );
+
+        let stride = degree / n;
+
+        let basis = crate::ring::ModulusBasis::new(moduli.clone());
+
+        let secret_coefficients: Vec<i8> = (0..degree)
+            .map(|index| match index % 5 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            })
+            .collect();
+
+        let matrix: Vec<Vec<u64>> = (0..n)
+            .map(|row| {
+                (0..n)
+                    .map(|col| {
+                        1 + 17 * row as u64
+                            + 5 * col as u64
+                            + 3 * row as u64 * col as u64
+                            + row as u64 * row as u64
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Encrypt logical matrix rows into the embedded subring generated
+        // by Y = X^(N/n).
+        let ciphertexts: Vec<crate::grafting::RnsRlweCiphertext> = matrix
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let limbs = moduli
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(limb_index, modulus)| {
+                        let params = crate::rlwe::RlweParameters::new(degree, modulus, 2, 0);
+
+                        let secret_key =
+                            crate::rlwe::SecretKey::from_polynomial(crate::ring::Polynomial::new(
+                                modulus,
+                                secret_coefficients
+                                    .iter()
+                                    .map(|&value| match value {
+                                        -1 => modulus.value() - 1,
+                                        0 => 0,
+                                        1 => 1,
+                                        _ => unreachable!(),
+                                    })
+                                    .collect(),
+                            ));
+
+                        let mut coefficients = vec![0_u64; degree];
+
+                        for logical_col in 0..n {
+                            coefficients[logical_col * stride] = row[logical_col] % modulus.value();
+                        }
+
+                        let plaintext = crate::ring::Polynomial::new(modulus, coefficients);
+
+                        let mut rng = ChaCha20Rng::seed_from_u64(
+                            seed ^ ((row_index as u64) << 24) ^ ((limb_index as u64) << 8),
+                        );
+
+                        crate::rlwe::encrypt_raw_with_rng(params, &secret_key, &plaintext, &mut rng)
+                    })
+                    .collect();
+
+                crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+            })
+            .collect();
+
+        // Only the n-1 nonidentity logical Park automorphisms are required,
+        // even though each key acts in the ambient degree-N RLWE ring.
+        let layout = crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let galois_keys: Vec<crate::ckks::RnsGaloisKey> = (1..n)
+            .map(|j| 2 * j + 1)
+            .map(|exponent| {
+                let mut rng =
+                    ChaCha20Rng::seed_from_u64(seed ^ 0x4741_4c4f_4953_0000 ^ exponent as u64);
+
+                crate::ckks::RnsGaloisKey::generate_with_rng(
+                    degree,
+                    2,
+                    0,
+                    &secret_coefficients,
+                    exponent,
+                    layout.clone(),
+                    &mut rng,
+                )
+            })
+            .collect();
+
+        let transposed = rns_transpose_embedded(&ciphertexts, &galois_keys);
+
+        assert_eq!(
+            transposed.len(),
+            n,
+            "embedded C-MT must return one ciphertext per logical column"
+        );
+
+        // Every logical output column must contain exactly the corresponding
+        // transposed matrix row at positions k*stride. All non-embedded
+        // coefficients must remain zero.
+        for (output_index, ciphertext) in transposed.iter().enumerate() {
+            for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+                let params = crate::rlwe::RlweParameters::new(degree, modulus, 2, 0);
+
+                let secret_key =
+                    crate::rlwe::SecretKey::from_polynomial(crate::ring::Polynomial::new(
+                        modulus,
+                        secret_coefficients
+                            .iter()
+                            .map(|&value| match value {
+                                -1 => modulus.value() - 1,
+                                0 => 0,
+                                1 => 1,
+                                _ => unreachable!(),
+                            })
+                            .collect(),
+                    ));
+
+                let observed =
+                    crate::rlwe::decrypt_raw(params, &secret_key, ciphertext.limb(limb_index));
+
+                let mut expected = vec![0_u64; degree];
+
+                for logical_row in 0..n {
+                    expected[logical_row * stride] =
+                        matrix[logical_row][output_index] % modulus.value();
+                }
+
+                assert_eq!(
+                    observed.coefficients(),
+                    expected.as_slice(),
+                    "embedded Park C-MT mismatch for n={n}, N={degree}, \
+                     output={output_index}, limb={limb_index}, modulus={}",
+                    modulus.value()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rns_cmt_embedded_matches_existing_path_when_n_equals_degree() {
+        let degree = 8;
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 1 + 17 * row as u64 + 5 * col as u64 + row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let ciphertexts = encrypt_rns_coefficient_rows(&matrix, 0xC4F0_0000);
+
+        let keys = park_rns_galois_keys(0xC4F1_0000);
+
+        let reference = rns_transpose(&ciphertexts, &keys);
+        let embedded = rns_transpose_embedded(&ciphertexts, &keys);
+
+        assert_eq!(
+            embedded, reference,
+            "embedded Park C-MT must reduce exactly to existing C-MT when n=N"
+        );
+    }
+
+    #[test]
+    fn rns_cmt_embedded_transposes_n8_in_n64_ring() {
+        embedded_rns_cmt_semantic_case(
+            64,
+            vec![
+                crate::ring::Modulus::new(12_289),
+                crate::ring::Modulus::new(40_961),
+                crate::ring::Modulus::new(65_537),
+            ],
+            0xC4F2_0000,
+        );
+    }
+
+    #[test]
+    fn rns_cmt_embedded_transposes_n8_in_n4096_ring() {
+        let profile = crate::ckks::research_profile_4096();
+
+        embedded_rns_cmt_semantic_case(
+            4096,
+            profile.modulus_basis().moduli().to_vec(),
+            0xC4F3_0000,
+        );
     }
 
     #[test]
