@@ -917,6 +917,134 @@ pub fn rns_ccmm_relinearized(
         .collect()
 }
 
+/// Executes Park CC-MM over same-level RNS CKKS ciphertext bundles,
+/// relinearizes each output column, and rescales once.
+///
+/// Both operands use Park's column-wise matrix packing. All columns in both
+/// operands must share one CKKS level and active RNS basis.
+///
+/// The CKKS state transition matches ordinary ciphertext multiplication:
+///
+/// ```text
+/// level L, scales Delta_l and Delta_r
+///     -> Park CC-MM + relinearization at level L
+///     -> scale Delta_l * Delta_r
+///     -> rescale by chain.dropped_modulus(L)
+///     -> level L + 1
+/// ```
+pub fn rns_ckks_ccmm_relinearize_rescale(
+    lhs: &[crate::ckks::RnsCkksCiphertext],
+    rhs: &[crate::ckks::RnsCkksCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    multiplication_key: &crate::grafting::RnsMultiplicationKey,
+    chain: &crate::ring::ModulusChain,
+) -> Vec<crate::ckks::RnsCkksCiphertext> {
+    assert!(!lhs.is_empty(), "Park CKKS CC-MM lhs must not be empty");
+
+    assert_eq!(
+        lhs.len(),
+        rhs.len(),
+        "Park CKKS CC-MM operands must contain the same number of columns"
+    );
+
+    let lhs_state = lhs[0].state();
+    let rhs_state = rhs[0].state();
+
+    lhs_state.assert_matches_chain(chain);
+    rhs_state.assert_matches_chain(chain);
+
+    assert_eq!(
+        lhs_state.level(),
+        rhs_state.level(),
+        "Park CKKS CC-MM requires matching operand levels"
+    );
+
+    assert_eq!(
+        lhs_state.basis(),
+        rhs_state.basis(),
+        "Park CKKS CC-MM requires matching operand bases"
+    );
+
+    assert!(
+        chain.has_next_level(lhs_state.level()),
+        "Park CKKS CC-MM requires a next chain level for rescaling"
+    );
+
+    for ciphertext in lhs {
+        ciphertext.assert_matches_chain(chain);
+
+        assert_eq!(
+            ciphertext.level(),
+            lhs_state.level(),
+            "all Park CKKS lhs columns must share one level"
+        );
+
+        assert_eq!(
+            ciphertext.basis(),
+            lhs_state.basis(),
+            "all Park CKKS lhs columns must share one basis"
+        );
+
+        assert_eq!(
+            ciphertext.scale(),
+            lhs_state.scale(),
+            "all Park CKKS lhs columns must share one scale"
+        );
+    }
+
+    for ciphertext in rhs {
+        ciphertext.assert_matches_chain(chain);
+
+        assert_eq!(
+            ciphertext.level(),
+            rhs_state.level(),
+            "all Park CKKS rhs columns must share one level"
+        );
+
+        assert_eq!(
+            ciphertext.basis(),
+            rhs_state.basis(),
+            "all Park CKKS rhs columns must share one basis"
+        );
+
+        assert_eq!(
+            ciphertext.scale(),
+            rhs_state.scale(),
+            "all Park CKKS rhs columns must share one scale"
+        );
+    }
+
+    assert_eq!(
+        multiplication_key.layout().full_basis(),
+        lhs_state.basis(),
+        "Park RNS multiplication-key basis must match active CKKS level"
+    );
+
+    let lhs_rlwe: Vec<_> = lhs
+        .iter()
+        .map(|ciphertext| ciphertext.rlwe().clone())
+        .collect();
+
+    let rhs_rlwe: Vec<_> = rhs
+        .iter()
+        .map(|ciphertext| ciphertext.rlwe().clone())
+        .collect();
+
+    let relinearized = rns_ccmm_relinearized(&lhs_rlwe, &rhs_rlwe, galois_keys, multiplication_key);
+
+    let product_state = lhs_state.after_multiply(rhs_state, chain);
+
+    relinearized
+        .into_iter()
+        .map(|ciphertext| {
+            let product =
+                crate::ckks::RnsCkksCiphertext::new(ciphertext, product_state.clone(), chain);
+
+            crate::ckks::rescale_rns_ckks_to_next(&product, chain)
+        })
+        .collect()
+}
+
 /// Park Algorithm 8 up to, but excluding, relinearization and rescaling.
 ///
 /// Both input operands are column-wise N x N RLWE ciphertext bundles,
@@ -1305,6 +1433,310 @@ mod tests {
                 matrix
             })
             .collect()
+    }
+
+    #[test]
+    fn rns_park_ckks_ccmm_decodes_approximate_matrix_product() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let chain = crate::ring::ModulusChain::from_top_basis(crate::ring::ModulusBasis::new(
+            moduli.to_vec(),
+        ));
+
+        // Match the top-level rescale divisor so multiplication followed
+        // by one rescale returns to approximately the original scale.
+        let scale = moduli[moduli.len() - 1].value() as f64;
+
+        let lhs_clear: Vec<Vec<f64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        0.015 + 0.002 * row as f64 - 0.001 * col as f64
+                            + 0.0002 * (row * col) as f64
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rhs_clear: Vec<Vec<f64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        -0.010 + 0.0015 * row as f64 + 0.001 * col as f64
+                            - 0.0001 * (row * col) as f64
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let encode_matrix = |matrix: &[Vec<f64>], seed: u64| {
+            let scaled: Vec<Vec<i128>> = matrix
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&value| (value * scale).round() as i128)
+                        .collect()
+                })
+                .collect();
+
+            let residue_matrix = |modulus: crate::ring::Modulus| {
+                let q = i128::from(modulus.value());
+
+                scaled
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|&value| (((value % q) + q) % q) as u64)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let matrices_by_limb: Vec<Vec<Vec<u64>>> =
+                moduli.iter().copied().map(residue_matrix).collect();
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+            (0..degree)
+                .map(|column| {
+                    let limbs = moduli
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(limb_index, modulus)| {
+                            let params = crate::rlwe::RlweParameters::new(degree, modulus, 2, 0);
+
+                            let message = crate::ring::Polynomial::new(
+                                modulus,
+                                (0..degree)
+                                    .map(|row| matrices_by_limb[limb_index][row][column])
+                                    .collect(),
+                            );
+
+                            crate::rlwe::encrypt_raw_with_rng(
+                                params,
+                                &park_rns_test_secret(modulus),
+                                &message,
+                                &mut rng,
+                            )
+                        })
+                        .collect();
+
+                    let rlwe = crate::grafting::RnsRlweCiphertext::from_limbs(limbs);
+
+                    crate::ckks::RnsCkksCiphertext::new(
+                        rlwe,
+                        crate::ckks::CkksChainState::top(&chain, scale),
+                        &chain,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let lhs = encode_matrix(&lhs_clear, 0xC4D4_0000);
+        let rhs = encode_matrix(&rhs_clear, 0xC4D5_0000);
+
+        let galois_keys = park_rns_galois_keys(0xC4D6_0000);
+
+        let layout = crate::grafting::RnsGadgetLayout::new(chain.top().clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xC4D7_0000);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &park_rns_test_secret_coefficients(),
+            layout,
+            &mut key_rng,
+        );
+
+        let output = rns_ckks_ccmm_relinearize_rescale(
+            &lhs,
+            &rhs,
+            &galois_keys,
+            &multiplication_key,
+            &chain,
+        );
+
+        let output_scale = output[0].scale();
+
+        let secret = park_rns_test_secret_coefficients();
+
+        let mut actual = vec![vec![0.0_f64; degree]; degree];
+
+        for (column, ciphertext) in output.iter().enumerate() {
+            let decrypted = crate::grafting::decrypt_rns_raw(ciphertext.rlwe(), &secret);
+
+            let modulus = decrypted.composite_modulus();
+
+            for (row, value) in decrypted.reconstruct_coefficients().into_iter().enumerate() {
+                let centered = if value > modulus / 2 {
+                    value as i128 - modulus as i128
+                } else {
+                    value as i128
+                };
+
+                actual[row][column] = centered as f64 / output_scale;
+            }
+        }
+
+        let mut expected = vec![vec![0.0_f64; degree]; degree];
+
+        for row in 0..degree {
+            for column in 0..degree {
+                expected[row][column] = (0..degree)
+                    .map(|k| lhs_clear[row][k] * rhs_clear[k][column])
+                    .sum();
+            }
+        }
+
+        let mut max_error = 0.0_f64;
+        let mut max_error_at = (0_usize, 0_usize);
+
+        for row in 0..degree {
+            for column in 0..degree {
+                let error = (actual[row][column] - expected[row][column]).abs();
+
+                if error > max_error {
+                    max_error = error;
+                    max_error_at = (row, column);
+                }
+            }
+        }
+
+        println!("PARK_CKKS_CCMM_OUTPUT_SCALE={output_scale:.12e}");
+        println!("PARK_CKKS_CCMM_MAX_ERROR={max_error:.12e}");
+        println!(
+            "PARK_CKKS_CCMM_MAX_ERROR_AT={},{}",
+            max_error_at.0, max_error_at.1
+        );
+
+        assert!(
+            max_error < 5.0e-4,
+            "Park CKKS CC-MM numerical error {max_error:.12e} \
+             at ({}, {}) exceeds 5e-4",
+            max_error_at.0,
+            max_error_at.1
+        );
+    }
+
+    #[test]
+    fn rns_park_ckks_ccmm_advances_level_and_scale() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let chain = crate::ring::ModulusChain::from_top_basis(crate::ring::ModulusBasis::new(
+            moduli.to_vec(),
+        ));
+
+        // Choosing the trailing top-level modulus as both operand scales
+        // makes the expected post-rescale scale equal to that modulus.
+        let input_scale = moduli[moduli.len() - 1].value() as f64;
+
+        let lhs_matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 3 + 5 * row as u64 + 7 * col as u64 + row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs_matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 11 + 13 * row as u64 + 17 * col as u64 + 2 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let lhs_rlwe = encrypt_rns_coefficient_columns(&lhs_matrix, 0xC4D0_0000);
+        let rhs_rlwe = encrypt_rns_coefficient_columns(&rhs_matrix, 0xC4D1_0000);
+
+        let lhs: Vec<_> = lhs_rlwe
+            .into_iter()
+            .map(|ciphertext| {
+                crate::ckks::RnsCkksCiphertext::new(
+                    ciphertext,
+                    crate::ckks::CkksChainState::top(&chain, input_scale),
+                    &chain,
+                )
+            })
+            .collect();
+
+        let rhs: Vec<_> = rhs_rlwe
+            .into_iter()
+            .map(|ciphertext| {
+                crate::ckks::RnsCkksCiphertext::new(
+                    ciphertext,
+                    crate::ckks::CkksChainState::top(&chain, input_scale),
+                    &chain,
+                )
+            })
+            .collect();
+
+        let galois_keys = park_rns_galois_keys(0xC4D2_0000);
+
+        let layout = crate::grafting::RnsGadgetLayout::new(chain.top().clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xC4D3_0000);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &park_rns_test_secret_coefficients(),
+            layout,
+            &mut key_rng,
+        );
+
+        let output = rns_ckks_ccmm_relinearize_rescale(
+            &lhs,
+            &rhs,
+            &galois_keys,
+            &multiplication_key,
+            &chain,
+        );
+
+        assert_eq!(
+            output.len(),
+            degree,
+            "Park CKKS CC-MM must return N column ciphertexts"
+        );
+
+        let dropped = chain
+            .dropped_modulus(0)
+            .expect("top level must have a rescale divisor");
+
+        let expected_scale = input_scale * input_scale / dropped.value() as f64;
+
+        for ciphertext in &output {
+            assert_eq!(
+                ciphertext.level(),
+                1,
+                "Park CKKS CC-MM must rescale exactly once"
+            );
+
+            assert_eq!(
+                ciphertext.basis(),
+                chain.level(1),
+                "Park CKKS CC-MM output basis must match level 1"
+            );
+
+            assert_eq!(
+                ciphertext.basis().len(),
+                moduli.len() - 1,
+                "Park CKKS CC-MM must drop exactly one RNS limb"
+            );
+
+            assert_eq!(
+                ciphertext.scale(),
+                expected_scale,
+                "Park CKKS CC-MM output scale must follow multiply-rescale"
+            );
+
+            ciphertext.assert_matches_chain(&chain);
+        }
     }
 
     #[test]
