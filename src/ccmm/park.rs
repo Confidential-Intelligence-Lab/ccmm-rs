@@ -606,8 +606,27 @@ fn park_matrix_add(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatr
         .collect()
 }
 
+/// Execution backend for Park's modular plaintext/plaintext matrix
+/// multiplication primitive.
+///
+/// This backend is intentionally independent of the higher-level Park CC-MM
+/// algorithm. Future CPU, GPU, FPGA, or other accelerated implementations can
+/// replace the Mod-PP-MM kernel without changing Algorithm 8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkModPpMmBackend {
+    /// Dependency-free O(N^3) modular matrix multiplication.
+    Reference,
+
+    /// O(N^3) CPU implementation that transposes the right operand once
+    /// so each output entry is computed from two contiguous rows.
+    TransposedRhs,
+}
+
 /// Park Mod-PP-MM: ordinary modular matrix multiplication.
-fn park_matrix_mul(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
+///
+/// This is the frozen reference implementation used as the correctness oracle
+/// for future accelerated Mod-PP-MM backends.
+fn park_matrix_mul_reference(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
     assert!(!lhs.is_empty());
     assert!(!rhs.is_empty());
 
@@ -636,6 +655,68 @@ fn park_matrix_mul(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatr
     }
 
     result
+}
+
+/// Cache-oriented Park Mod-PP-MM implementation.
+///
+/// The right operand is transposed once so that every matrix dot product
+/// reads both operands linearly. Arithmetic intentionally follows the same
+/// modular reduction order as the reference implementation so the two
+/// backends are bit-exact.
+fn park_matrix_mul_transposed_rhs(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
+    assert!(!lhs.is_empty());
+    assert!(!rhs.is_empty());
+
+    let rows = lhs.len();
+    let inner = lhs[0].len();
+    let cols = rhs[0].len();
+
+    assert!(lhs.iter().all(|row| row.len() == inner));
+    assert_eq!(rhs.len(), inner);
+    assert!(rhs.iter().all(|row| row.len() == cols));
+
+    let mut rhs_transposed = vec![vec![0_u64; inner]; cols];
+
+    for (k, rhs_row) in rhs.iter().enumerate() {
+        for (col, &value) in rhs_row.iter().enumerate() {
+            rhs_transposed[col][k] = value;
+        }
+    }
+
+    let modulus_u128 = modulus as u128;
+    let mut result = vec![vec![0_u64; cols]; rows];
+
+    for (lhs_row, result_row) in lhs.iter().zip(result.iter_mut()) {
+        for (rhs_column, result_value) in rhs_transposed.iter().zip(result_row.iter_mut()) {
+            let mut accumulator = 0_u128;
+
+            for (&lhs_value, &rhs_value) in lhs_row.iter().zip(rhs_column.iter()) {
+                accumulator += (lhs_value as u128) * (rhs_value as u128);
+                accumulator %= modulus_u128;
+            }
+
+            *result_value = accumulator as u64;
+        }
+    }
+
+    result
+}
+
+/// Dispatches one Park Mod-PP-MM operation to the selected implementation.
+///
+/// Keeping this dispatch below Algorithm 8 makes the homomorphic algorithm
+/// independent of the device or algorithm used for ordinary modular matrix
+/// multiplication.
+fn park_matrix_mul_with_backend(
+    lhs: &[Vec<u64>],
+    rhs: &[Vec<u64>],
+    modulus: u64,
+    backend: ParkModPpMmBackend,
+) -> ParkMatrix {
+    match backend {
+        ParkModPpMmBackend::Reference => park_matrix_mul_reference(lhs, rhs, modulus),
+        ParkModPpMmBackend::TransposedRhs => park_matrix_mul_transposed_rhs(lhs, rhs, modulus),
+    }
 }
 
 /// Interprets ciphertext polynomial coefficients as matrix columns.
@@ -776,6 +857,15 @@ pub fn rns_ccmm_quadratic(
     rhs: &[crate::grafting::RnsRlweCiphertext],
     galois_keys: &[crate::ckks::RnsGaloisKey],
 ) -> Vec<crate::grafting::RnsQuadraticCiphertext> {
+    rns_ccmm_quadratic_with_backend(lhs, rhs, galois_keys, ParkModPpMmBackend::Reference)
+}
+
+pub fn rns_ccmm_quadratic_with_backend(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    backend: ParkModPpMmBackend,
+) -> Vec<crate::grafting::RnsQuadraticCiphertext> {
     assert!(!lhs.is_empty(), "Park RNS CC-MM lhs must not be empty");
 
     let degree = lhs[0].degree();
@@ -834,10 +924,10 @@ pub fn rns_ccmm_quadratic(
             false,
         ));
 
-        c00_by_limb.push(park_matrix_mul(&a, &a_tilde, q));
-        c01_by_limb.push(park_matrix_mul(&a, &b_tilde, q));
-        c10_by_limb.push(park_matrix_mul(&b, &a_tilde, q));
-        c11_by_limb.push(park_matrix_mul(&b, &b_tilde, q));
+        c00_by_limb.push(park_matrix_mul_with_backend(&a, &a_tilde, q, backend));
+        c01_by_limb.push(park_matrix_mul_with_backend(&a, &b_tilde, q, backend));
+        c10_by_limb.push(park_matrix_mul_with_backend(&b, &a_tilde, q, backend));
+        c11_by_limb.push(park_matrix_mul_with_backend(&b, &b_tilde, q, backend));
     }
 
     // Algorithm 8, Steps 3 and 4. C00 and C10 enter C-MT packed by rows.
@@ -1065,6 +1155,16 @@ pub fn ccmm_quadratic(
     rhs: &[RlweCiphertext],
     galois_keys: &[crate::ckks::GaloisKey],
 ) -> Vec<crate::rlwe::RlweQuadraticCiphertext> {
+    ccmm_quadratic_with_backend(params, lhs, rhs, galois_keys, ParkModPpMmBackend::Reference)
+}
+
+pub fn ccmm_quadratic_with_backend(
+    params: crate::rlwe::RlweParameters,
+    lhs: &[RlweCiphertext],
+    rhs: &[RlweCiphertext],
+    galois_keys: &[crate::ckks::GaloisKey],
+    backend: ParkModPpMmBackend,
+) -> Vec<crate::rlwe::RlweQuadraticCiphertext> {
     let degree = params.degree();
     let modulus = params.modulus();
     let q = modulus.value();
@@ -1117,10 +1217,10 @@ pub fn ccmm_quadratic(
     // Algorithm 8, Step 2: four Mod-PP-MM operations.
     // ------------------------------------------------------------------
 
-    let c00 = park_matrix_mul(&a, &a_tilde, q);
-    let c01 = park_matrix_mul(&a, &b_tilde, q);
-    let c10 = park_matrix_mul(&b, &a_tilde, q);
-    let c11 = park_matrix_mul(&b, &b_tilde, q);
+    let c00 = park_matrix_mul_with_backend(&a, &a_tilde, q, backend);
+    let c01 = park_matrix_mul_with_backend(&a, &b_tilde, q, backend);
+    let c10 = park_matrix_mul_with_backend(&b, &a_tilde, q, backend);
+    let c11 = park_matrix_mul_with_backend(&b, &b_tilde, q, backend);
 
     // ------------------------------------------------------------------
     // Algorithm 8, Steps 3 and 4.
@@ -1433,6 +1533,151 @@ mod tests {
                 matrix
             })
             .collect()
+    }
+
+    #[test]
+    fn rns_park_ccmm_quadratic_backends_match_exactly() {
+        let degree = 8;
+
+        let lhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 3 + 7 * row as u64 + 11 * col as u64 + 2 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 5 + 13 * row as u64 + 17 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let lhs_encrypted = encrypt_rns_coefficient_columns(&lhs, 0x5151);
+        let rhs_encrypted = encrypt_rns_coefficient_columns(&rhs, 0x6161);
+        let galois_keys = park_rns_galois_keys(0x7171_0000);
+
+        let reference = rns_ccmm_quadratic_with_backend(
+            &lhs_encrypted,
+            &rhs_encrypted,
+            &galois_keys,
+            ParkModPpMmBackend::Reference,
+        );
+
+        let transposed_rhs = rns_ccmm_quadratic_with_backend(
+            &lhs_encrypted,
+            &rhs_encrypted,
+            &galois_keys,
+            ParkModPpMmBackend::TransposedRhs,
+        );
+
+        assert_eq!(
+            transposed_rhs, reference,
+            "Park RNS Algorithm 8 must be bit-exact across Mod-PP-MM backends"
+        );
+    }
+
+    #[test]
+    fn park_mod_pp_mm_backends_match_rectangular_campaign() {
+        let moduli = [97_u64, 12_289, 40_961, 65_537];
+
+        let shapes = [
+            (1_usize, 1_usize, 1_usize),
+            (1, 4, 3),
+            (3, 1, 5),
+            (2, 3, 4),
+            (4, 5, 2),
+            (8, 8, 8),
+        ];
+
+        for modulus in moduli {
+            for (rows, inner, cols) in shapes {
+                let lhs: Vec<Vec<u64>> = (0..rows)
+                    .map(|row| {
+                        (0..inner)
+                            .map(|k| {
+                                (17 + 29 * row as u64 + 31 * k as u64 + 7 * row as u64 * k as u64)
+                                    % modulus
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let rhs: Vec<Vec<u64>> = (0..inner)
+                    .map(|k| {
+                        (0..cols)
+                            .map(|col| {
+                                (23 + 37 * k as u64 + 41 * col as u64 + 11 * k as u64 * col as u64)
+                                    % modulus
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let reference = park_matrix_mul_with_backend(
+                    &lhs,
+                    &rhs,
+                    modulus,
+                    ParkModPpMmBackend::Reference,
+                );
+
+                let transposed = park_matrix_mul_with_backend(
+                    &lhs,
+                    &rhs,
+                    modulus,
+                    ParkModPpMmBackend::TransposedRhs,
+                );
+
+                assert_eq!(
+                    transposed, reference,
+                    "Park Mod-PP-MM backend mismatch for \
+                     shape {rows}x{inner} * {inner}x{cols}, modulus {modulus}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn park_mod_pp_mm_backends_match_structured_inputs() {
+        let modulus = 12_289_u64;
+        let degree = 8;
+
+        let zero = vec![vec![0_u64; degree]; degree];
+
+        let identity: Vec<Vec<u64>> = (0..degree)
+            .map(|row| (0..degree).map(|col| u64::from(row == col)).collect())
+            .collect();
+
+        let asymmetric: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (1 + 17 * row as u64 + 5 * col as u64 + row as u64 * col as u64) % modulus
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for (name, lhs, rhs) in [
+            ("zero-left", &zero, &asymmetric),
+            ("zero-right", &asymmetric, &zero),
+            ("identity-left", &identity, &asymmetric),
+            ("identity-right", &asymmetric, &identity),
+            ("asymmetric-square", &asymmetric, &asymmetric),
+        ] {
+            let reference =
+                park_matrix_mul_with_backend(lhs, rhs, modulus, ParkModPpMmBackend::Reference);
+
+            let transposed =
+                park_matrix_mul_with_backend(lhs, rhs, modulus, ParkModPpMmBackend::TransposedRhs);
+
+            assert_eq!(
+                transposed, reference,
+                "Park Mod-PP-MM structured differential failed: {name}"
+            );
+        }
     }
 
     #[test]
@@ -1792,7 +2037,7 @@ mod tests {
         for (limb_index, modulus) in moduli.iter().copied().enumerate() {
             let actual = transpose_cleartext(&output_by_limb[limb_index]);
 
-            let expected = park_matrix_mul(&lhs, &rhs, modulus.value());
+            let expected = park_matrix_mul_reference(&lhs, &rhs, modulus.value());
 
             assert_eq!(
                 actual,
@@ -2013,7 +2258,7 @@ mod tests {
         let actual_by_limb = decrypt_rns_quadratic_columns(&product);
 
         for (limb_index, modulus) in moduli.iter().copied().enumerate() {
-            let expected = park_matrix_mul(&lhs, &rhs, modulus.value());
+            let expected = park_matrix_mul_reference(&lhs, &rhs, modulus.value());
 
             assert_eq!(
                 actual_by_limb[limb_index],
