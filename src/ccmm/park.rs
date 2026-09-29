@@ -693,6 +693,208 @@ fn park_synthetic_a_bundle_from_rows(
         .collect()
 }
 
+fn park_rns_components_by_columns(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+    limb_index: usize,
+    select_a: bool,
+) -> ParkMatrix {
+    assert!(!ciphertexts.is_empty());
+
+    let degree = ciphertexts.len();
+
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "Park RNS component bundle must contain N degree-N ciphertexts"
+    );
+
+    park_components_by_columns(
+        &ciphertexts
+            .iter()
+            .map(|ciphertext| ciphertext.limb(limb_index).clone())
+            .collect::<Vec<_>>(),
+        select_a,
+    )
+}
+
+fn park_rns_synthetic_a_bundle_from_rows(
+    matrices_by_limb: &[ParkMatrix],
+    moduli: &[crate::ring::Modulus],
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    assert!(!matrices_by_limb.is_empty());
+    assert_eq!(
+        matrices_by_limb.len(),
+        moduli.len(),
+        "Park RNS synthetic bundle requires one matrix per modulus"
+    );
+
+    let degree = matrices_by_limb[0].len();
+
+    assert!(
+        matrices_by_limb.iter().all(|matrix| {
+            matrix.len() == degree && matrix.iter().all(|row| row.len() == degree)
+        }),
+        "Park RNS synthetic matrices must be square and dimension-compatible"
+    );
+
+    (0..degree)
+        .map(|row| {
+            let limbs = matrices_by_limb
+                .iter()
+                .zip(moduli.iter().copied())
+                .map(|(matrix, modulus)| {
+                    let a = Polynomial::new(modulus, matrix[row].clone());
+                    let b = Polynomial::zero(modulus, degree);
+                    RlweCiphertext::new(b, a)
+                })
+                .collect();
+
+            crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
+        })
+        .collect()
+}
+
+/// RNS form of Park Algorithm 8 up to, but excluding, relinearization
+/// and CKKS rescaling.
+///
+/// Both operands are column-wise N x N RNS RLWE ciphertext bundles.
+/// Park's three C-MT operations use the RNS-native transform and RNS
+/// Galois/key-switch machinery. The four Mod-PP-MM operations are evaluated
+/// independently modulo every active RNS prime using the scalar reference
+/// matrix kernel.
+///
+/// The returned bundle contains one RNS degree-two ciphertext per output
+/// matrix column, with FHE-rs convention
+///
+/// ```text
+/// c0 + c1*s + c2*s^2.
+/// ```
+/// Mod-PP-MM acceleration is deliberately separate from this correctness path.
+pub fn rns_ccmm_quadratic(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+) -> Vec<crate::grafting::RnsQuadraticCiphertext> {
+    assert!(!lhs.is_empty(), "Park RNS CC-MM lhs must not be empty");
+
+    let degree = lhs[0].degree();
+    let basis = lhs[0].basis().clone();
+    let moduli = basis.moduli();
+
+    assert_eq!(
+        lhs.len(),
+        degree,
+        "Park RNS CC-MM lhs must contain N column ciphertexts"
+    );
+    assert_eq!(
+        rhs.len(),
+        degree,
+        "Park RNS CC-MM rhs must contain N column ciphertexts"
+    );
+
+    assert!(
+        lhs.iter()
+            .chain(rhs.iter())
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "Park RNS CC-MM ciphertext degrees must match"
+    );
+
+    assert!(
+        lhs.iter()
+            .chain(rhs.iter())
+            .all(|ciphertext| ciphertext.basis() == &basis),
+        "Park RNS CC-MM ciphertext bases must match"
+    );
+
+    // Algorithm 8, Step 1.
+    let rhs_transposed = rns_transpose(rhs, galois_keys);
+
+    // Algorithm 8, Step 2: four Mod-PP-MM operations independently
+    // in every CRT residue.
+    let mut c00_by_limb = Vec::with_capacity(moduli.len());
+    let mut c01_by_limb = Vec::with_capacity(moduli.len());
+    let mut c10_by_limb = Vec::with_capacity(moduli.len());
+    let mut c11_by_limb = Vec::with_capacity(moduli.len());
+
+    for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+        let q = modulus.value();
+
+        let a = park_rns_components_by_columns(lhs, limb_index, true);
+        let b = park_rns_components_by_columns(lhs, limb_index, false);
+
+        let a_tilde = park_matrix_transpose(&park_rns_components_by_columns(
+            &rhs_transposed,
+            limb_index,
+            true,
+        ));
+        let b_tilde = park_matrix_transpose(&park_rns_components_by_columns(
+            &rhs_transposed,
+            limb_index,
+            false,
+        ));
+
+        c00_by_limb.push(park_matrix_mul(&a, &a_tilde, q));
+        c01_by_limb.push(park_matrix_mul(&a, &b_tilde, q));
+        c10_by_limb.push(park_matrix_mul(&b, &a_tilde, q));
+        c11_by_limb.push(park_matrix_mul(&b, &b_tilde, q));
+    }
+
+    // Algorithm 8, Steps 3 and 4. C00 and C10 enter C-MT packed by rows.
+    let c00_bundle = park_rns_synthetic_a_bundle_from_rows(&c00_by_limb, moduli);
+    let c10_bundle = park_rns_synthetic_a_bundle_from_rows(&c10_by_limb, moduli);
+
+    let d01 = rns_transpose(&c00_bundle, galois_keys);
+    let d23 = rns_transpose(&c10_bundle, galois_keys);
+
+    // Reconstruct each output column independently in every RNS limb:
+    //
+    //     c2 = D0
+    //     c1 = D1 + D2 + C01
+    //     c0 = D3 + C11.
+    (0..degree)
+        .map(|column| {
+            let mut c0_residues = Vec::with_capacity(moduli.len());
+            let mut c1_residues = Vec::with_capacity(moduli.len());
+            let mut c2_residues = Vec::with_capacity(moduli.len());
+
+            for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+                let q = modulus.value();
+
+                let d0 = park_rns_components_by_columns(&d01, limb_index, true);
+                let d1 = park_rns_components_by_columns(&d01, limb_index, false);
+                let d2 = park_rns_components_by_columns(&d23, limb_index, true);
+                let d3 = park_rns_components_by_columns(&d23, limb_index, false);
+
+                let c1_matrix =
+                    park_matrix_add(&park_matrix_add(&d1, &d2, q), &c01_by_limb[limb_index], q);
+                let c0_matrix = park_matrix_add(&d3, &c11_by_limb[limb_index], q);
+
+                c0_residues.push(Polynomial::new(
+                    modulus,
+                    (0..degree).map(|row| c0_matrix[row][column]).collect(),
+                ));
+
+                c1_residues.push(Polynomial::new(
+                    modulus,
+                    (0..degree).map(|row| c1_matrix[row][column]).collect(),
+                ));
+
+                c2_residues.push(Polynomial::new(
+                    modulus,
+                    (0..degree).map(|row| d0[row][column]).collect(),
+                ));
+            }
+
+            crate::grafting::RnsQuadraticCiphertext::from_rns_polynomials(
+                crate::ring::RnsPolynomial::from_residues(c0_residues),
+                crate::ring::RnsPolynomial::from_residues(c1_residues),
+                crate::ring::RnsPolynomial::from_residues(c2_residues),
+            )
+        })
+        .collect()
+}
+
 /// Park Algorithm 8 up to, but excluding, relinearization and rescaling.
 ///
 /// Both input operands are column-wise N x N RLWE ciphertext bundles,
@@ -1005,6 +1207,235 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn encrypt_rns_coefficient_columns(matrix: &[Vec<u64>], seed: u64) -> Vec<RnsRlweCiphertext> {
+        let degree = matrix.len();
+        let moduli = park_rns_test_moduli();
+
+        assert_eq!(degree, 8);
+        assert!(matrix.iter().all(|row| row.len() == degree));
+
+        (0..degree)
+            .map(|column| {
+                let limbs = moduli
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(limb_index, modulus)| {
+                        let params = RlweParameters::new(degree, modulus, 2, 0);
+                        let secret = park_rns_test_secret(modulus);
+
+                        let plaintext = Polynomial::new(
+                            modulus,
+                            (0..degree)
+                                .map(|row| matrix[row][column] % modulus.value())
+                                .collect(),
+                        );
+
+                        let mut rng = ChaCha20Rng::seed_from_u64(
+                            seed ^ ((column as u64) << 8) ^ limb_index as u64,
+                        );
+
+                        encrypt_raw_with_rng(params, &secret, &plaintext, &mut rng)
+                    })
+                    .collect();
+
+                RnsRlweCiphertext::from_limbs(limbs)
+            })
+            .collect()
+    }
+
+    fn decrypt_rns_quadratic_columns(
+        ciphertexts: &[crate::grafting::RnsQuadraticCiphertext],
+    ) -> Vec<Vec<Vec<u64>>> {
+        let degree = ciphertexts.len();
+        let moduli = park_rns_test_moduli();
+
+        moduli
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(limb_index, modulus)| {
+                let secret = park_rns_test_secret(modulus);
+                let s = secret.polynomial();
+                let s_squared = s.negacyclic_mul(s);
+
+                let mut matrix = vec![vec![0_u64; degree]; degree];
+
+                for (column, ciphertext) in ciphertexts.iter().enumerate() {
+                    let plaintext = ciphertext
+                        .c0()
+                        .residue(limb_index)
+                        .add(&ciphertext.c1().residue(limb_index).negacyclic_mul(s))
+                        .add(
+                            &ciphertext
+                                .c2()
+                                .residue(limb_index)
+                                .negacyclic_mul(&s_squared),
+                        );
+
+                    for (row, matrix_row) in matrix.iter_mut().enumerate() {
+                        matrix_row[column] = plaintext.coefficients()[row];
+                    }
+                }
+
+                matrix
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rns_park_ccmm_quadratic_identity_products() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 19 + 23 * row as u64 + 29 * col as u64 + 3 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let mut identity = vec![vec![0_u64; degree]; degree];
+        for (index, row) in identity.iter_mut().enumerate() {
+            row[index] = 1;
+        }
+
+        let matrix_ciphertexts = encrypt_rns_coefficient_columns(&matrix, 0xC4B3_0000);
+        let identity_ciphertexts = encrypt_rns_coefficient_columns(&identity, 0xC4B4_0000);
+        let keys = park_rns_galois_keys(0xC4B5_0000);
+
+        let right = rns_ccmm_quadratic(&matrix_ciphertexts, &identity_ciphertexts, &keys);
+
+        let left = rns_ccmm_quadratic(&identity_ciphertexts, &matrix_ciphertexts, &keys);
+
+        let right_by_limb = decrypt_rns_quadratic_columns(&right);
+        let left_by_limb = decrypt_rns_quadratic_columns(&left);
+
+        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+            let expected: Vec<Vec<u64>> = matrix
+                .iter()
+                .map(|row| row.iter().map(|&value| value % modulus.value()).collect())
+                .collect();
+
+            assert_eq!(
+                right_by_limb[limb_index],
+                expected,
+                "RNS Park quadratic CC-MM failed M x I at limb \
+                 {limb_index}, modulus {}",
+                modulus.value()
+            );
+
+            assert_eq!(
+                left_by_limb[limb_index],
+                expected,
+                "RNS Park quadratic CC-MM failed I x M at limb \
+                 {limb_index}, modulus {}",
+                modulus.value()
+            );
+        }
+    }
+
+    #[test]
+    fn rns_park_ccmm_quadratic_basis_products() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+        let keys = park_rns_galois_keys(0xC4B6_0000);
+
+        for i in 0..degree {
+            for j in 0..degree {
+                let mut lhs = vec![vec![0_u64; degree]; degree];
+                lhs[i][j] = 1;
+
+                let lhs_ciphertexts =
+                    encrypt_rns_coefficient_columns(&lhs, 0xC4B7_0000 ^ (degree * i + j) as u64);
+
+                for k in 0..degree {
+                    for l in 0..degree {
+                        let mut rhs = vec![vec![0_u64; degree]; degree];
+                        rhs[k][l] = 1;
+
+                        let rhs_ciphertexts = encrypt_rns_coefficient_columns(
+                            &rhs,
+                            0xC4B8_0000 ^ (degree * k + l) as u64,
+                        );
+
+                        let product = rns_ccmm_quadratic(&lhs_ciphertexts, &rhs_ciphertexts, &keys);
+
+                        let actual_by_limb = decrypt_rns_quadratic_columns(&product);
+
+                        let mut expected = vec![vec![0_u64; degree]; degree];
+
+                        if j == k {
+                            expected[i][l] = 1;
+                        }
+
+                        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+                            assert_eq!(
+                                actual_by_limb[limb_index],
+                                expected,
+                                "RNS Park quadratic CC-MM failed \
+                                 E_{{{i},{j}}} E_{{{k},{l}}} at limb \
+                                 {limb_index}, modulus {}",
+                                modulus.value()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rns_park_ccmm_quadratic_matches_asymmetric_clear_product() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let lhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 3 + 11 * row as u64 + 7 * col as u64 + 2 * row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        5 + 13 * row as u64
+                            + 17 * col as u64
+                            + 3 * row as u64 * col as u64
+                            + row as u64 * row as u64
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs_ciphertexts = encrypt_rns_coefficient_columns(&lhs, 0xC4B0_0000);
+        let rhs_ciphertexts = encrypt_rns_coefficient_columns(&rhs, 0xC4B1_0000);
+
+        let keys = park_rns_galois_keys(0xC4B2_0000);
+
+        let product = rns_ccmm_quadratic(&lhs_ciphertexts, &rhs_ciphertexts, &keys);
+
+        assert_eq!(product.len(), degree);
+
+        let actual_by_limb = decrypt_rns_quadratic_columns(&product);
+
+        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+            let expected = park_matrix_mul(&lhs, &rhs, modulus.value());
+
+            assert_eq!(
+                actual_by_limb[limb_index],
+                expected,
+                "RNS Park quadratic CC-MM mismatch at limb {limb_index}, \
+                 modulus {}",
+                modulus.value()
+            );
+        }
     }
 
     #[test]
