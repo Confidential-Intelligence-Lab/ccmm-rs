@@ -13,8 +13,9 @@
 use std::hint::black_box;
 
 use ccmm_rs::ccmm::park::{
-    rns_ccmm_quadratic_with_backend_measured, rns_transpose_measured, ParkCcmmMeasurement,
-    ParkCmtMeasurement, ParkModPpMmBackend,
+    rns_ccmm_quadratic_with_backend_measured, rns_transpose_measured,
+    rns_transpose_measured_with_ntt_key_switch, ParkCcmmMeasurement, ParkCmtMeasurement,
+    ParkModPpMmBackend,
 };
 use ccmm_rs::ccmm::park::{rns_tweak, rns_tweak_native};
 use ccmm_rs::ckks::RnsGaloisKey;
@@ -271,6 +272,43 @@ fn characterize_cmt(
     summarize_cmt(&samples)
 }
 
+fn characterize_cmt_ntt(
+    degree: usize,
+    ciphertexts: &[RnsRlweCiphertext],
+    galois_keys: &[RnsGaloisKey],
+    plan: &RnsNttPlan,
+) -> CmtSummary {
+    for _ in 0..WARMUPS {
+        let (output, measurement) = rns_transpose_measured_with_ntt_key_switch(
+            black_box(ciphertexts),
+            black_box(galois_keys),
+            black_box(plan),
+        );
+
+        assert_eq!(measurement.degree, degree);
+        assert_eq!(measurement.rns_limbs, MODULI.len());
+        assert_eq!(measurement.automorphism_calls, degree - 1);
+        assert_eq!(measurement.key_switch_calls, degree - 1);
+
+        black_box(output);
+    }
+
+    let mut samples = Vec::with_capacity(REPEATS);
+
+    for _ in 0..REPEATS {
+        let (output, measurement) = rns_transpose_measured_with_ntt_key_switch(
+            black_box(ciphertexts),
+            black_box(galois_keys),
+            black_box(plan),
+        );
+
+        black_box(output);
+        samples.push(measurement);
+    }
+
+    summarize_cmt(&samples)
+}
+
 fn characterize_tweak(ciphertexts: &[RnsRlweCiphertext], native: bool) -> u128 {
     for _ in 0..WARMUPS {
         let output = if native {
@@ -389,6 +427,12 @@ automorphism_pct,tweak_pct"
     );
 
     println!(
+        "CMT_KS_CSV_HEADER=degree,rns_limbs,reference_total_us,\
+ntt_total_us,reference_ks_us,ntt_ks_us,ks_speedup,cmt_speedup,\
+reference_ks_pct,ntt_ks_pct"
+    );
+
+    println!(
         "TWEAK_CSV_HEADER=degree,rns_limbs,oracle_us,native_us,\
 speedup_native_vs_oracle"
     );
@@ -433,6 +477,17 @@ speedup_native_vs_oracle"
 
         let cmt = characterize_cmt(degree, &cmt_input, &keys);
 
+        let cmt_ntt = characterize_cmt_ntt(degree, &cmt_input, &keys, &plan);
+
+        assert!(
+            cmt_ntt.total_ns > 0,
+            "NTT-backed C-MT timing must be nonzero"
+        );
+        assert!(
+            cmt_ntt.key_switch_ns > 0,
+            "NTT-backed key-switch timing must be nonzero"
+        );
+
         let tweak_ns = cmt.first_tweak_ns + cmt.second_tweak_ns;
 
         let tweak_oracle_ns = characterize_tweak(&cmt_input, false);
@@ -451,6 +506,21 @@ speedup_native_vs_oracle"
             us(tweak_oracle_ns),
             us(tweak_native_ns),
             tweak_oracle_ns as f64 / tweak_native_ns as f64,
+        );
+
+        println!(
+            "CMT_KS_RESULT,{},{},{:.3},{:.3},{:.3},{:.3},\
+{:.6},{:.6},{:.3},{:.3}",
+            degree,
+            MODULI.len(),
+            us(cmt.total_ns),
+            us(cmt_ntt.total_ns),
+            us(cmt.key_switch_ns),
+            us(cmt_ntt.key_switch_ns),
+            cmt.key_switch_ns as f64 / cmt_ntt.key_switch_ns as f64,
+            cmt.total_ns as f64 / cmt_ntt.total_ns as f64,
+            pct(cmt.key_switch_ns, cmt.total_ns),
+            pct(cmt_ntt.key_switch_ns, cmt_ntt.total_ns),
         );
 
         println!(

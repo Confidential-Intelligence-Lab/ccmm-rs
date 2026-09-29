@@ -782,6 +782,160 @@ pub fn rns_transpose_measured(
     (output, measurement)
 }
 
+/// Experimental measured Park C-MT using the NTT-backed RNS key-switch
+/// implementation.
+///
+/// This intentionally mirrors `rns_transpose_measured` exactly except for
+/// the key-switch polynomial-multiplication backend. It exists to measure
+/// that implementation choice without changing production Park C-MT.
+pub fn rns_transpose_measured_with_ntt_key_switch(
+    ciphertexts: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    plan: &crate::ring::RnsNttPlan,
+) -> (Vec<crate::grafting::RnsRlweCiphertext>, ParkCmtMeasurement) {
+    assert!(!ciphertexts.is_empty(), "RNS C-MT requires ciphertexts");
+
+    let degree = ciphertexts[0].degree();
+    let basis = ciphertexts[0].basis().clone();
+
+    assert_eq!(
+        ciphertexts.len(),
+        degree,
+        "Park Algorithm 4 requires N ciphertexts for ring degree N"
+    );
+    assert!(
+        degree.is_power_of_two(),
+        "Park RNS C-MT requires power-of-two ring degree"
+    );
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.degree() == degree),
+        "RNS C-MT ciphertext degrees must match"
+    );
+    assert!(
+        ciphertexts
+            .iter()
+            .all(|ciphertext| ciphertext.basis() == &basis),
+        "RNS C-MT ciphertext bases must match"
+    );
+    assert!(
+        basis
+            .moduli()
+            .iter()
+            .all(|modulus| modulus.value() % 2 == 1),
+        "Park RNS C-MT requires N invertible modulo every active modulus"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        degree,
+        "Park NTT C-MT plan degree must match ciphertext degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        basis.moduli(),
+        "Park NTT C-MT plan basis must match ciphertext basis"
+    );
+
+    let total_start = std::time::Instant::now();
+    let mut measurement = ParkCmtMeasurement::new(degree, basis.len());
+
+    let two_n = 2 * degree;
+
+    let stage_start = std::time::Instant::now();
+    let shifted_inputs: Vec<_> = ciphertexts
+        .iter()
+        .enumerate()
+        .map(|(i, ciphertext)| rns_ciphertext_mul_monomial(ciphertext, i))
+        .collect();
+    measurement.input_shift_ns = stage_start.elapsed().as_nanos();
+
+    let stage_start = std::time::Instant::now();
+    let aux = rns_tweak(&shifted_inputs);
+    measurement.first_tweak_ns = stage_start.elapsed().as_nanos();
+
+    let n_inverses: Vec<u64> = basis
+        .moduli()
+        .iter()
+        .map(|modulus| modular_inverse(degree as u64, modulus.value()))
+        .collect();
+
+    let mut transformed = Vec::with_capacity(degree);
+
+    for j in 0..degree {
+        let normalization_start = std::time::Instant::now();
+
+        let exponent = 2 * j + 1;
+        let inverse_exponent = modular_inverse(exponent as u64, two_n as u64) as usize;
+
+        assert_eq!(
+            inverse_exponent % 2,
+            1,
+            "inverse of odd RNS C-MT exponent must remain odd"
+        );
+
+        let source_index = (inverse_exponent - 1) / 2;
+
+        let normalized = rns_ciphertext_scalar_mul(&aux[source_index], &n_inverses);
+
+        measurement.normalization_ns += normalization_start.elapsed().as_nanos();
+
+        if exponent == 1 {
+            transformed.push(normalized);
+            continue;
+        }
+
+        let key = rns_galois_key_for_exponent(galois_keys, exponent);
+
+        let automorphism_start = std::time::Instant::now();
+
+        let automorphed = crate::ckks::apply_rns_automorphism(&normalized, key.exponent());
+
+        measurement.automorphism_ns += automorphism_start.elapsed().as_nanos();
+        measurement.automorphism_calls += 1;
+
+        let key_switch_start = std::time::Instant::now();
+
+        let switched =
+            crate::grafting::rns_key_switch_with_ntt(&automorphed, key.key_switch_key(), plan);
+
+        measurement.key_switch_ns += key_switch_start.elapsed().as_nanos();
+        measurement.key_switch_calls += 1;
+
+        transformed.push(switched);
+    }
+
+    let stage_start = std::time::Instant::now();
+    let second_tweak = rns_tweak(&transformed);
+    measurement.second_tweak_ns = stage_start.elapsed().as_nanos();
+
+    let stage_start = std::time::Instant::now();
+
+    let minus_one: Vec<u64> = basis
+        .moduli()
+        .iter()
+        .map(|modulus| modulus.value() - 1)
+        .collect();
+
+    let mut output = Vec::with_capacity(degree);
+    output.push(second_tweak[0].clone());
+
+    for output_index in 1..degree {
+        let source_index = degree - output_index;
+        let exponent = degree - output_index;
+
+        let corrected = rns_ciphertext_mul_monomial(&second_tweak[source_index], exponent);
+
+        output.push(rns_ciphertext_scalar_mul(&corrected, &minus_one));
+    }
+
+    measurement.correction_ns = stage_start.elapsed().as_nanos();
+    measurement.total_ns = total_start.elapsed().as_nanos();
+
+    (output, measurement)
+}
+
 /// Park Algorithm 4: ciphertext matrix transpose (C-MT).
 ///
 /// Input consists of `N` RLWE ciphertexts over a ring of degree `N`.
@@ -2961,6 +3115,52 @@ mod tests {
                 modulus.value()
             );
         }
+    }
+
+    #[test]
+    fn rns_cmt_ntt_key_switch_matches_reference_exactly() {
+        let degree = 8;
+        let moduli = park_rns_test_moduli();
+
+        let matrix: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| 1 + 17 * row as u64 + 5 * col as u64 + row as u64 * col as u64)
+                    .collect()
+            })
+            .collect();
+
+        let ciphertexts = encrypt_rns_coefficient_rows(&matrix, 0xC4E0_0000);
+
+        let keys = park_rns_galois_keys(0xC4E1_0000);
+
+        let plan = crate::ring::RnsNttPlan::new(moduli.to_vec(), degree);
+
+        let (reference, reference_measurement) = rns_transpose_measured(&ciphertexts, &keys);
+
+        let (ntt, ntt_measurement) =
+            rns_transpose_measured_with_ntt_key_switch(&ciphertexts, &keys, &plan);
+
+        assert_eq!(
+            ntt, reference,
+            "NTT-backed Park C-MT must match reference exactly"
+        );
+
+        assert_eq!(
+            ntt_measurement.automorphism_calls,
+            reference_measurement.automorphism_calls,
+        );
+
+        assert_eq!(
+            ntt_measurement.key_switch_calls,
+            reference_measurement.key_switch_calls,
+        );
+
+        assert_eq!(
+            ntt_measurement.key_switch_calls,
+            degree - 1,
+            "NTT-backed C-MT must execute one key switch per non-identity automorphism"
+        );
     }
 
     #[test]
