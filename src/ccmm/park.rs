@@ -592,6 +592,25 @@ pub fn ccmm_quadratic(
         .collect()
 }
 
+/// Multiplies two column-wise Park matrix ciphertext bundles and
+/// relinearizes each output column back to a rank-1 RLWE ciphertext.
+///
+/// This completes the relinearization portion of Park Algorithm 8,
+/// Step 5. Rescaling is deliberately left to the CKKS/RNS integration
+/// layer.
+pub fn ccmm_relinearized(
+    params: crate::rlwe::RlweParameters,
+    lhs: &[RlweCiphertext],
+    rhs: &[RlweCiphertext],
+    galois_keys: &[crate::ckks::GaloisKey],
+    multiplication_key: &crate::eval::MultiplicationKey,
+) -> Vec<RlweCiphertext> {
+    ccmm_quadratic(params, lhs, rhs, galois_keys)
+        .iter()
+        .map(|product| crate::eval::relinearize(params, product, multiplication_key))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;
@@ -1405,6 +1424,182 @@ mod tests {
                     assert_eq!(
                         actual, expected,
                         "Park basis product E_{{{i},{j}}} E_{{{j},{k}}} failed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn park_ccmm_relinearization_preserves_quadratic_decryption() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+        let degree = params.degree();
+        let q = params.modulus().value();
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_5345_4352);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5033_425f_4741_4c4f);
+
+        let mut multiplication_key_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_5245_4c49);
+        let multiplication_key = crate::eval::MultiplicationKey::generate_with_rng(
+            params,
+            &secret,
+            16,
+            &mut multiplication_key_rng,
+        );
+
+        let lhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (3 + 7 * row as u64 + 11 * col as u64 + 5 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (13 + 17 * row as u64 + 19 * col as u64 + 3 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs = encrypt_coefficient_columns(params, &secret, &lhs_plain, 0x5033_425f_4c48_5301);
+        let rhs = encrypt_coefficient_columns(params, &secret, &rhs_plain, 0x5033_425f_5248_5301);
+
+        let quadratic = ccmm_quadratic(params, &lhs, &rhs, &galois_keys);
+        let relinearized = ccmm_relinearized(params, &lhs, &rhs, &galois_keys, &multiplication_key);
+
+        assert_eq!(quadratic.len(), degree);
+        assert_eq!(relinearized.len(), degree);
+
+        for column in 0..degree {
+            let before = crate::rlwe::decrypt_quadratic_raw(params, &secret, &quadratic[column]);
+
+            let after = decrypt_raw(params, &secret, &relinearized[column]);
+
+            assert_eq!(
+                after, before,
+                "Park relinearization changed decrypted output column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn park_ccmm_relinearized_matches_asymmetric_clear_product() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+        let degree = params.degree();
+        let q = params.modulus().value();
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_4153_594d);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5033_425f_474b_4153);
+
+        let mut multiplication_key_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_4d4b_4153);
+        let multiplication_key = crate::eval::MultiplicationKey::generate_with_rng(
+            params,
+            &secret,
+            16,
+            &mut multiplication_key_rng,
+        );
+
+        let lhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (5 + 7 * row as u64 + 13 * col as u64 + 3 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rhs_plain: Vec<Vec<u64>> = (0..degree)
+            .map(|row| {
+                (0..degree)
+                    .map(|col| {
+                        (11 + 17 * row as u64 + 19 * col as u64 + 5 * row as u64 * col as u64) % q
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let expected = modular_matrix_mul(&lhs_plain, &rhs_plain, q);
+
+        let lhs = encrypt_coefficient_columns(params, &secret, &lhs_plain, 0x5033_425f_4c48_5302);
+        let rhs = encrypt_coefficient_columns(params, &secret, &rhs_plain, 0x5033_425f_5248_5302);
+
+        let output = ccmm_relinearized(params, &lhs, &rhs, &galois_keys, &multiplication_key);
+
+        let actual_rows = decrypt_coefficient_rows(params, &secret, &output);
+        let actual = transpose_cleartext(&actual_rows);
+
+        assert_eq!(
+            actual, expected,
+            "relinearized Park CC-MM diverged from asymmetric clear product"
+        );
+    }
+
+    #[test]
+    fn park_ccmm_relinearized_basis_products() {
+        let params = RlweParameters::new(8, Modulus::new(12_289), 16, 0);
+        let degree = params.degree();
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_4241_5349);
+        let secret = SecretKey::generate_with_rng(params, &mut secret_rng);
+
+        let galois_keys = park_galois_keys(params, &secret, 0x5033_425f_474b_4241);
+
+        let mut multiplication_key_rng = ChaCha20Rng::seed_from_u64(0x5033_425f_4d4b_4241);
+        let multiplication_key = crate::eval::MultiplicationKey::generate_with_rng(
+            params,
+            &secret,
+            16,
+            &mut multiplication_key_rng,
+        );
+
+        for i in 0..degree {
+            for j in 0..degree {
+                for k in 0..degree {
+                    let mut lhs_plain = vec![vec![0_u64; degree]; degree];
+                    let mut rhs_plain = vec![vec![0_u64; degree]; degree];
+                    let mut expected = vec![vec![0_u64; degree]; degree];
+
+                    lhs_plain[i][j] = 1;
+                    rhs_plain[j][k] = 1;
+                    expected[i][k] = 1;
+
+                    let case = ((i * degree + j) * degree + k) as u64;
+
+                    let lhs = encrypt_coefficient_columns(
+                        params,
+                        &secret,
+                        &lhs_plain,
+                        0x5033_425f_4c00_0000 ^ case,
+                    );
+
+                    let rhs = encrypt_coefficient_columns(
+                        params,
+                        &secret,
+                        &rhs_plain,
+                        0x5033_425f_5200_0000 ^ case,
+                    );
+
+                    let output =
+                        ccmm_relinearized(params, &lhs, &rhs, &galois_keys, &multiplication_key);
+
+                    let actual_rows = decrypt_coefficient_rows(params, &secret, &output);
+                    let actual = transpose_cleartext(&actual_rows);
+
+                    assert_eq!(
+                        actual, expected,
+                        "relinearized Park basis product failed \
+                         E_{{{i},{j}}} * E_{{{j},{k}}} = E_{{{i},{k}}}"
                     );
                 }
             }
