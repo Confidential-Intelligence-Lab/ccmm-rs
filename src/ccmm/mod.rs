@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod cpmm;
 pub mod multiply;
 pub mod park;
