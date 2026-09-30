@@ -1292,6 +1292,22 @@ fn park_matrix_add(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatr
         .collect()
 }
 
+fn park_matrix_add_assign(lhs: &mut ParkMatrix, rhs: &[Vec<u64>], modulus: u64) {
+    assert_eq!(lhs.len(), rhs.len());
+    assert!(!lhs.is_empty());
+    assert_eq!(lhs[0].len(), rhs[0].len());
+
+    let modulus_u128 = u128::from(modulus);
+
+    for (lhs_row, rhs_row) in lhs.iter_mut().zip(rhs.iter()) {
+        assert_eq!(lhs_row.len(), rhs_row.len());
+
+        for (lhs_value, &rhs_value) in lhs_row.iter_mut().zip(rhs_row.iter()) {
+            *lhs_value = ((u128::from(*lhs_value) + u128::from(rhs_value)) % modulus_u128) as u64;
+        }
+    }
+}
+
 /// Execution backend for Park's modular plaintext/plaintext matrix
 /// multiplication primitive.
 ///
@@ -1818,9 +1834,17 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
         measurement.physical_mod_pp_mm_calls += 1;
     }
 
+    // Step 1 output is no longer needed once all four Step 2 products have
+    // been computed for every limb.
+    drop(rhs_transposed);
+
     // Algorithm 8, Steps 3 and 4. C00 and C10 enter C-MT packed by rows.
     let c00_bundle = park_rns_synthetic_a_bundle_from_rows(&c00_by_limb, moduli);
     let c10_bundle = park_rns_synthetic_a_bundle_from_rows(&c10_by_limb, moduli);
+
+    // The synthetic bundles now own the information required by the two C-MTs.
+    drop(c00_by_limb);
+    drop(c10_by_limb);
 
     let cmt_start = std::time::Instant::now();
     let d01 = rns_transpose(&c00_bundle, galois_keys);
@@ -1832,11 +1856,46 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
     measurement.cmt_ns += cmt_start.elapsed().as_nanos();
     measurement.cmt_calls += 1;
 
-    // Reconstruct each output column independently in every RNS limb:
+    drop(c00_bundle);
+    drop(c10_bundle);
+
+    // Reconstruct the three quadratic components.
+    //
+    // Extract D0..D3 exactly once per RNS limb. The previous implementation
+    // repeated these O(N^2) extractions inside the output-column loop, turning
+    // reconstruction into an accidental O(N^3) data-movement path.
     //
     //     c2 = D0
     //     c1 = D1 + D2 + C01
     //     c0 = D3 + C11.
+    let mut c0_by_limb = Vec::with_capacity(moduli.len());
+    let mut c1_by_limb = Vec::with_capacity(moduli.len());
+    let mut c2_by_limb = Vec::with_capacity(moduli.len());
+
+    for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+        let q = modulus.value();
+
+        let d0 = park_rns_components_by_columns(&d01, limb_index, true);
+        let mut d1 = park_rns_components_by_columns(&d01, limb_index, false);
+        let d2 = park_rns_components_by_columns(&d23, limb_index, true);
+        let mut d3 = park_rns_components_by_columns(&d23, limb_index, false);
+
+        park_matrix_add_assign(&mut d1, &d2, q);
+        park_matrix_add_assign(&mut d1, &c01_by_limb[limb_index], q);
+        park_matrix_add_assign(&mut d3, &c11_by_limb[limb_index], q);
+
+        c2_by_limb.push(d0);
+        c1_by_limb.push(d1);
+        c0_by_limb.push(d3);
+    }
+
+    // D01/D23 and the retained C01/C11 matrices have now been folded into
+    // the final quadratic component matrices.
+    drop(d01);
+    drop(d23);
+    drop(c01_by_limb);
+    drop(c11_by_limb);
+
     let output: Vec<_> = (0..degree)
         .map(|column| {
             let mut c0_residues = Vec::with_capacity(moduli.len());
@@ -1844,30 +1903,25 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
             let mut c2_residues = Vec::with_capacity(moduli.len());
 
             for (limb_index, modulus) in moduli.iter().copied().enumerate() {
-                let q = modulus.value();
-
-                let d0 = park_rns_components_by_columns(&d01, limb_index, true);
-                let d1 = park_rns_components_by_columns(&d01, limb_index, false);
-                let d2 = park_rns_components_by_columns(&d23, limb_index, true);
-                let d3 = park_rns_components_by_columns(&d23, limb_index, false);
-
-                let c1_matrix =
-                    park_matrix_add(&park_matrix_add(&d1, &d2, q), &c01_by_limb[limb_index], q);
-                let c0_matrix = park_matrix_add(&d3, &c11_by_limb[limb_index], q);
-
                 c0_residues.push(Polynomial::new(
                     modulus,
-                    (0..degree).map(|row| c0_matrix[row][column]).collect(),
+                    (0..degree)
+                        .map(|row| c0_by_limb[limb_index][row][column])
+                        .collect(),
                 ));
 
                 c1_residues.push(Polynomial::new(
                     modulus,
-                    (0..degree).map(|row| c1_matrix[row][column]).collect(),
+                    (0..degree)
+                        .map(|row| c1_by_limb[limb_index][row][column])
+                        .collect(),
                 ));
 
                 c2_residues.push(Polynomial::new(
                     modulus,
-                    (0..degree).map(|row| d0[row][column]).collect(),
+                    (0..degree)
+                        .map(|row| c2_by_limb[limb_index][row][column])
+                        .collect(),
                 ));
             }
 
