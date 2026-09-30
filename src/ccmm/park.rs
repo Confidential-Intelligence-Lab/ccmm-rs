@@ -3374,6 +3374,153 @@ mod tests {
         }
     }
 
+    fn polynomial_coset_nonzero_counts(
+        polynomial: &crate::ring::Polynomial,
+        logical_order: usize,
+    ) -> Vec<usize> {
+        let degree = polynomial.degree();
+
+        assert!(logical_order.is_power_of_two());
+        assert!(logical_order <= degree);
+        assert_eq!(degree % logical_order, 0);
+
+        let coset_count = degree / logical_order;
+
+        (0..coset_count)
+            .map(|coset| {
+                (0..logical_order)
+                    .filter(|&logical_index| {
+                        polynomial.coefficients()[coset + logical_index * coset_count] != 0
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    fn embedded_ciphertext_coset_case(degree: usize, moduli: Vec<crate::ring::Modulus>, seed: u64) {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let n = 8_usize;
+
+        assert!(degree >= n);
+        assert_eq!(degree % n, 0);
+
+        let stride = degree / n;
+
+        let secret_coefficients: Vec<i8> = (0..degree)
+            .map(|index| match index % 5 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            })
+            .collect();
+
+        for (limb_index, modulus) in moduli.iter().copied().enumerate() {
+            let params = crate::rlwe::RlweParameters::new(degree, modulus, 2, 0);
+
+            let secret_key = crate::rlwe::SecretKey::from_polynomial(crate::ring::Polynomial::new(
+                modulus,
+                secret_coefficients
+                    .iter()
+                    .map(|&value| match value {
+                        -1 => modulus.value() - 1,
+                        0 => 0,
+                        1 => 1,
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ));
+
+            // Logical degree-8 plaintext embedded in R_N using
+            // Y = X^(N/8). Only coset zero is populated.
+            let mut coefficients = vec![0_u64; degree];
+
+            for logical_index in 0..n {
+                coefficients[logical_index * stride] =
+                    (17 + 13 * logical_index as u64) % modulus.value();
+            }
+
+            let plaintext = crate::ring::Polynomial::new(modulus, coefficients);
+
+            let plaintext_cosets = polynomial_coset_nonzero_counts(&plaintext, n);
+
+            assert!(
+                plaintext_cosets[0] > 0,
+                "embedded plaintext must populate logical coset zero"
+            );
+
+            assert!(
+                plaintext_cosets[1..].iter().all(|&count| count == 0),
+                "embedded plaintext must be confined to coset zero"
+            );
+
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ limb_index as u64);
+
+            let ciphertext =
+                crate::rlwe::encrypt_raw_with_rng(params, &secret_key, &plaintext, &mut rng);
+
+            let a_cosets = polynomial_coset_nonzero_counts(ciphertext.a(), n);
+
+            let b_cosets = polynomial_coset_nonzero_counts(ciphertext.b(), n);
+
+            let a_nonzero_cosets = a_cosets.iter().filter(|&&count| count > 0).count();
+
+            let b_nonzero_cosets = b_cosets.iter().filter(|&&count| count > 0).count();
+
+            println!(
+                "P6B_COSETS,N={},n={},stride={},limb={},modulus={},\
+                 plaintext_nonzero_cosets={},a_nonzero_cosets={},\
+                 b_nonzero_cosets={}",
+                degree,
+                n,
+                stride,
+                limb_index,
+                modulus.value(),
+                plaintext_cosets.iter().filter(|&&count| count > 0).count(),
+                a_nonzero_cosets,
+                b_nonzero_cosets,
+            );
+
+            // This is the architectural property P6b.2 must preserve:
+            // ordinary degree-N RLWE encryption does not remain inside the
+            // logical Y-subring even when the plaintext begins there.
+            assert!(
+                a_nonzero_cosets > 1,
+                "RLWE a(X) unexpectedly remained in one logical coset"
+            );
+
+            assert!(
+                b_nonzero_cosets > 1,
+                "RLWE b(X) unexpectedly remained in one logical coset"
+            );
+        }
+    }
+
+    #[test]
+    fn rns_embedded_plaintext_ciphertext_coset_structure_n64() {
+        embedded_ciphertext_coset_case(
+            64,
+            vec![
+                crate::ring::Modulus::new(12_289),
+                crate::ring::Modulus::new(40_961),
+                crate::ring::Modulus::new(65_537),
+            ],
+            0xC4F9_0000,
+        );
+    }
+
+    #[test]
+    fn rns_embedded_plaintext_ciphertext_coset_structure_n4096() {
+        let profile = crate::ckks::research_profile_4096();
+
+        embedded_ciphertext_coset_case(
+            4096,
+            profile.modulus_basis().moduli().to_vec(),
+            0xC4FA_0000,
+        );
+    }
+
     #[test]
     fn rns_cmt_embedded_matches_existing_path_when_n_equals_degree() {
         let degree = 8;
