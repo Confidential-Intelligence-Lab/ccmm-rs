@@ -1306,6 +1306,14 @@ pub enum ParkModPpMmBackend {
     /// O(N^3) CPU implementation that transposes the right operand once
     /// so each output entry is computed from two contiguous rows.
     TransposedRhs,
+
+    /// Exact modular matrix multiplication using a u128 accumulator.
+    ///
+    /// Products are accumulated without modular reduction for as many
+    /// terms as can be proved safe from the modulus. For the research-4096
+    /// profile, a complete 4096-term dot product fits in one u128
+    /// accumulation interval.
+    WideAccumulator,
 }
 
 /// Runtime characterization of one Park RNS quadratic CC-MM execution.
@@ -1447,6 +1455,103 @@ fn park_matrix_mul_transposed_rhs(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u
     result
 }
 
+/// Maximum number of products `(q-1)^2` that can be summed exactly in u128
+/// before a modular reduction is required.
+///
+/// This bound depends only on the active modulus. Returning at least one
+/// guarantees progress even for very large u64 moduli.
+fn park_wide_accumulator_safe_terms(modulus: u64) -> usize {
+    assert!(modulus > 1, "Park Mod-PP-MM modulus must exceed one");
+
+    let max_value = u128::from(modulus - 1);
+    let max_product = max_value * max_value;
+
+    let safe = u128::MAX / max_product;
+
+    usize::try_from(safe).unwrap_or(usize::MAX).max(1)
+}
+
+/// Exact Park Mod-PP-MM using wide integer accumulation.
+///
+/// The right operand is transposed once for contiguous dot-product access.
+/// Within each dot product, products are accumulated in u128 and `% q` is
+/// performed only when the analytically safe accumulation interval is
+/// exhausted.
+///
+/// If the complete inner dimension fits in one interval, each output matrix
+/// element performs exactly one modular reduction after all multiply-adds.
+fn park_matrix_mul_wide_accumulator(
+    lhs: &[Vec<u64>],
+    rhs: &[Vec<u64>],
+    modulus: u64,
+) -> ParkMatrix {
+    assert!(!lhs.is_empty());
+    assert!(!rhs.is_empty());
+    assert!(modulus > 1);
+
+    let rows = lhs.len();
+    let inner = lhs[0].len();
+    let cols = rhs[0].len();
+
+    assert!(lhs.iter().all(|row| row.len() == inner));
+    assert_eq!(rhs.len(), inner);
+    assert!(rhs.iter().all(|row| row.len() == cols));
+
+    let mut rhs_transposed = vec![vec![0_u64; inner]; cols];
+
+    for (k, rhs_row) in rhs.iter().enumerate() {
+        for (col, &value) in rhs_row.iter().enumerate() {
+            rhs_transposed[col][k] = value;
+        }
+    }
+
+    let modulus_u128 = u128::from(modulus);
+    let safe_terms = park_wide_accumulator_safe_terms(modulus);
+
+    let mut result = vec![vec![0_u64; cols]; rows];
+
+    for (lhs_row, result_row) in lhs.iter().zip(result.iter_mut()) {
+        for (rhs_column, result_value) in rhs_transposed.iter().zip(result_row.iter_mut()) {
+            let mut residue = 0_u128;
+
+            for (lhs_chunk, rhs_chunk) in lhs_row
+                .chunks(safe_terms)
+                .zip(rhs_column.chunks(safe_terms))
+            {
+                let mut wide_sum = 0_u128;
+
+                for (&lhs_value, &rhs_value) in lhs_chunk.iter().zip(rhs_chunk.iter()) {
+                    wide_sum += u128::from(lhs_value) * u128::from(rhs_value);
+                }
+
+                let chunk_residue = wide_sum % modulus_u128;
+
+                // Both operands are residues below q, so this addition is
+                // trivially safe in u128 for every u64 modulus.
+                residue = (residue + chunk_residue) % modulus_u128;
+            }
+
+            *result_value = residue as u64;
+        }
+    }
+
+    result
+}
+
+/// Public Park Mod-PP-MM entry point.
+///
+/// This exposes the plaintext kernel independently of Algorithm 8 so backend
+/// implementations can be characterized without paying homomorphic setup,
+/// C-MT, key-switching, or reconstruction costs.
+pub fn park_mod_pp_mm(
+    lhs: &[Vec<u64>],
+    rhs: &[Vec<u64>],
+    modulus: u64,
+    backend: ParkModPpMmBackend,
+) -> Vec<Vec<u64>> {
+    park_matrix_mul_with_backend(lhs, rhs, modulus, backend)
+}
+
 /// Dispatches one Park Mod-PP-MM operation to the selected implementation.
 ///
 /// Keeping this dispatch below Algorithm 8 makes the homomorphic algorithm
@@ -1461,6 +1566,7 @@ fn park_matrix_mul_with_backend(
     match backend {
         ParkModPpMmBackend::Reference => park_matrix_mul_reference(lhs, rhs, modulus),
         ParkModPpMmBackend::TransposedRhs => park_matrix_mul_transposed_rhs(lhs, rhs, modulus),
+        ParkModPpMmBackend::WideAccumulator => park_matrix_mul_wide_accumulator(lhs, rhs, modulus),
     }
 }
 
@@ -4112,6 +4218,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn deterministic_mod_matrix(rows: usize, cols: usize, modulus: u64, salt: u64) -> ParkMatrix {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        salt.wrapping_add(17 * row as u64)
+                            .wrapping_add(29 * col as u64)
+                            .wrapping_add(5 * row as u64 * col as u64)
+                            % modulus
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn park_wide_accumulator_bound_covers_research_4096_dot_products() {
+        let profile = crate::ckks::research_profile_4096();
+
+        for modulus in profile.modulus_basis().moduli() {
+            let safe = park_wide_accumulator_safe_terms(modulus.value());
+
+            assert!(
+                safe >= profile.degree(),
+                "research-4096 modulus {} allows only {} unreduced \
+                 products, expected at least {}",
+                modulus.value(),
+                safe,
+                profile.degree(),
+            );
+        }
+    }
+
+    #[test]
+    fn park_wide_accumulator_bound_is_conservative() {
+        for modulus in [
+            3_u64,
+            97,
+            12_289,
+            65_537,
+            0x7ffff6001,
+            0xfffffdc001,
+            0x1ffffff18001,
+            0x3ffffffdf0001,
+            0x7fffffffba0001,
+            u64::MAX - 58,
+        ] {
+            let terms = park_wide_accumulator_safe_terms(modulus);
+
+            let max_value = u128::from(modulus - 1);
+            let product = max_value * max_value;
+
+            assert!(terms >= 1);
+
+            if let Ok(terms_u128) = u128::try_from(terms) {
+                assert!(
+                    product.checked_mul(terms_u128).is_some(),
+                    "safe accumulation bound overflowed for modulus={modulus}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn park_wide_accumulator_matches_reference_rectangular() {
+        let modulus = 65_537;
+
+        for (rows, inner, cols) in [
+            (1_usize, 1_usize, 1_usize),
+            (2, 3, 4),
+            (3, 7, 5),
+            (8, 8, 8),
+            (11, 5, 13),
+        ] {
+            let lhs = deterministic_mod_matrix(rows, inner, modulus, 0x1234);
+
+            let rhs = deterministic_mod_matrix(inner, cols, modulus, 0x5678);
+
+            let expected = park_matrix_mul_reference(&lhs, &rhs, modulus);
+
+            let actual = park_matrix_mul_wide_accumulator(&lhs, &rhs, modulus);
+
+            assert_eq!(
+                actual, expected,
+                "wide Park Mod-PP-MM mismatch for \
+                 {rows}x{inner} * {inner}x{cols}"
+            );
+        }
+    }
+
+    #[test]
+    fn park_wide_accumulator_matches_reference_at_research_moduli() {
+        let profiles = [
+            crate::ckks::research_profile_4096(),
+            crate::ckks::research_profile_8192(),
+            crate::ckks::research_profile_16384(),
+            crate::ckks::research_profile_32768(),
+            crate::ckks::research_profile_65536(),
+        ];
+
+        for profile in profiles {
+            for modulus in profile.modulus_basis().moduli() {
+                let q = modulus.value();
+
+                let lhs = deterministic_mod_matrix(8, 13, q, q ^ 0xA5A5);
+
+                let rhs = deterministic_mod_matrix(13, 7, q, q ^ 0x5A5A);
+
+                let reference = park_matrix_mul_reference(&lhs, &rhs, q);
+
+                let wide = park_matrix_mul_wide_accumulator(&lhs, &rhs, q);
+
+                assert_eq!(
+                    wide,
+                    reference,
+                    "wide accumulator diverged for profile {} \
+                     modulus {}",
+                    profile.name(),
+                    q,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn park_wide_accumulator_handles_maximal_residues() {
+        let modulus = 0x7ffff6001_u64;
+        let value = modulus - 1;
+
+        let lhs = vec![vec![value; 32]; 4];
+        let rhs = vec![vec![value; 3]; 32];
+
+        let expected = park_matrix_mul_reference(&lhs, &rhs, modulus);
+
+        let actual = park_matrix_mul_wide_accumulator(&lhs, &rhs, modulus);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

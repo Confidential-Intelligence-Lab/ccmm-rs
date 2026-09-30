@@ -344,6 +344,7 @@ fn backend_name(backend: ParkModPpMmBackend) -> &'static str {
     match backend {
         ParkModPpMmBackend::Reference => "Reference",
         ParkModPpMmBackend::TransposedRhs => "TransposedRhs",
+        ParkModPpMmBackend::WideAccumulator => "WideAccumulator",
     }
 }
 
