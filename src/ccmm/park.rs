@@ -3374,6 +3374,203 @@ mod tests {
         }
     }
 
+    /// Reference decomposition
+    ///
+    ///     R_N = direct_sum_{r=0}^{s-1} X^r R_n,
+    ///
+    /// where Y = X^s and s = N/n.
+    ///
+    /// Output coset r contains coefficients
+    ///
+    ///     p[r], p[r+s], ..., p[r+(n-1)s].
+    fn park_coset_decompose_reference(
+        polynomial: &crate::ring::Polynomial,
+        logical_order: usize,
+    ) -> Vec<crate::ring::Polynomial> {
+        let degree = polynomial.degree();
+
+        assert!(logical_order > 0);
+        assert!(logical_order.is_power_of_two());
+        assert!(degree.is_power_of_two());
+        assert!(logical_order <= degree);
+        assert_eq!(degree % logical_order, 0);
+
+        let coset_count = degree / logical_order;
+        let modulus = polynomial.modulus();
+
+        (0..coset_count)
+            .map(|coset| {
+                crate::ring::Polynomial::new(
+                    modulus,
+                    (0..logical_order)
+                        .map(|logical_index| {
+                            polynomial.coefficients()[coset + logical_index * coset_count]
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Inverse of `park_coset_decompose_reference`.
+    fn park_coset_reassemble_reference(
+        cosets: &[crate::ring::Polynomial],
+    ) -> crate::ring::Polynomial {
+        assert!(!cosets.is_empty());
+
+        let coset_count = cosets.len();
+        let logical_order = cosets[0].degree();
+        let degree = coset_count * logical_order;
+        let modulus = cosets[0].modulus();
+
+        assert!(
+            cosets
+                .iter()
+                .all(|coset| { coset.degree() == logical_order && coset.modulus() == modulus }),
+            "Park cosets must share logical degree and modulus"
+        );
+
+        let mut coefficients = vec![0_u64; degree];
+
+        for (coset_index, coset) in cosets.iter().enumerate() {
+            for logical_index in 0..logical_order {
+                coefficients[coset_index + logical_index * coset_count] =
+                    coset.coefficients()[logical_index];
+            }
+        }
+
+        crate::ring::Polynomial::new(modulus, coefficients)
+    }
+
+    /// Multiplication by Y in R_n = Z_q[Y]/(Y^n + 1).
+    fn park_coset_mul_y_reference(polynomial: &crate::ring::Polynomial) -> crate::ring::Polynomial {
+        let modulus = polynomial.modulus();
+        let q = modulus.value();
+        let n = polynomial.degree();
+
+        let mut coefficients = vec![0_u64; n];
+
+        for index in 0..n {
+            let value = polynomial.coefficients()[index];
+
+            if index + 1 < n {
+                coefficients[index + 1] = value;
+            } else if value != 0 {
+                coefficients[0] = q - value;
+            }
+        }
+
+        crate::ring::Polynomial::new(modulus, coefficients)
+    }
+
+    /// Reference multiplication in the R_n-module decomposition of R_N.
+    ///
+    /// If
+    ///
+    ///     p(X) = sum_r X^r p_r(Y)
+    ///     q(X) = sum_t X^t q_t(Y),
+    ///
+    /// with Y=X^s, then a pair (r,t) contributes to coset r+t when
+    /// r+t<s and to coset r+t-s multiplied by Y when r+t>=s.
+    fn park_coset_mul_reference(
+        lhs: &[crate::ring::Polynomial],
+        rhs: &[crate::ring::Polynomial],
+    ) -> Vec<crate::ring::Polynomial> {
+        assert!(!lhs.is_empty());
+        assert_eq!(lhs.len(), rhs.len());
+
+        let coset_count = lhs.len();
+        let logical_order = lhs[0].degree();
+        let modulus = lhs[0].modulus();
+
+        assert!(
+            lhs.iter()
+                .chain(rhs.iter())
+                .all(|coset| { coset.degree() == logical_order && coset.modulus() == modulus }),
+            "Park module multiplication requires compatible cosets"
+        );
+
+        let mut output = (0..coset_count)
+            .map(|_| crate::ring::Polynomial::zero(modulus, logical_order))
+            .collect::<Vec<_>>();
+
+        for (r, lhs_coset) in lhs.iter().enumerate() {
+            for (t, rhs_coset) in rhs.iter().enumerate() {
+                let product = lhs_coset.negacyclic_mul(rhs_coset);
+                let sum = r + t;
+
+                let (destination, contribution) = if sum < coset_count {
+                    (sum, product)
+                } else {
+                    (sum - coset_count, park_coset_mul_y_reference(&product))
+                };
+
+                output[destination] = output[destination].add(&contribution);
+            }
+        }
+
+        output
+    }
+
+    fn park_coset_algebra_case(degree: usize, logical_order: usize, modulus: crate::ring::Modulus) {
+        assert_eq!(degree % logical_order, 0);
+
+        let q = modulus.value();
+
+        let lhs = crate::ring::Polynomial::new(
+            modulus,
+            (0..degree)
+                .map(|index| (17 + 29 * index as u64 + 7 * index as u64 * index as u64) % q)
+                .collect(),
+        );
+
+        let rhs = crate::ring::Polynomial::new(
+            modulus,
+            (0..degree)
+                .map(|index| (23 + 31 * index as u64 + 11 * index as u64 * index as u64) % q)
+                .collect(),
+        );
+
+        let lhs_cosets = park_coset_decompose_reference(&lhs, logical_order);
+
+        let rhs_cosets = park_coset_decompose_reference(&rhs, logical_order);
+
+        assert_eq!(
+            park_coset_reassemble_reference(&lhs_cosets),
+            lhs,
+            "Park coset decomposition/reassembly failed for lhs"
+        );
+
+        assert_eq!(
+            park_coset_reassemble_reference(&rhs_cosets),
+            rhs,
+            "Park coset decomposition/reassembly failed for rhs"
+        );
+
+        let module_product = park_coset_mul_reference(&lhs_cosets, &rhs_cosets);
+
+        let reassembled = park_coset_reassemble_reference(&module_product);
+
+        let direct = lhs.negacyclic_mul(&rhs);
+
+        assert_eq!(
+            reassembled, direct,
+            "Park coset module multiplication disagrees with \
+             direct R_N negacyclic multiplication for \
+             n={logical_order}, N={degree}"
+        );
+    }
+
+    #[test]
+    fn park_coset_decomposition_roundtrips_n8_n64() {
+        park_coset_algebra_case(64, 8, crate::ring::Modulus::new(12_289));
+    }
+
+    #[test]
+    fn park_coset_module_multiplication_matches_ring_n8_n64() {
+        park_coset_algebra_case(64, 8, crate::ring::Modulus::new(65_537));
+    }
+
     fn polynomial_coset_nonzero_counts(
         polynomial: &crate::ring::Polynomial,
         logical_order: usize,
