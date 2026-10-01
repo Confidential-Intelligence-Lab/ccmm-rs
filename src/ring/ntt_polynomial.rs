@@ -81,6 +81,24 @@ impl NttPolynomial {
         }
     }
 
+    /// Pointwise addition in the NTT domain.
+    pub fn add(&self, rhs: &Self) -> Self {
+        self.assert_compatible(rhs);
+
+        let values = self
+            .values
+            .iter()
+            .zip(&rhs.values)
+            .map(|(&lhs, &rhs)| self.modulus.add(lhs, rhs))
+            .collect();
+
+        Self {
+            modulus: self.modulus,
+            degree: self.degree,
+            values,
+        }
+    }
+
     /// Converts the NTT representation back to coefficient form.
     pub fn to_polynomial(&self, plan: &NttPlan) -> Polynomial {
         assert_eq!(

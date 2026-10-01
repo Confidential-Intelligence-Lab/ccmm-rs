@@ -284,6 +284,42 @@ pub fn apply_rns_galois_automorphism(
     crate::grafting::rns_key_switch::rns_key_switch(&transformed, galois_key.key_switch_key())
 }
 
+/// NTT-backed RNS Galois automorphism.
+///
+/// Semantics are identical to `apply_rns_galois_automorphism`; the
+/// post-automorphism key switch uses the supplied RNS NTT plan.
+pub fn apply_rns_galois_automorphism_with_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &RnsGaloisKey,
+    plan: &crate::ring::RnsNttPlan,
+) -> RnsRlweCiphertext {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "RNS NTT plan basis must match RNS Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match RNS Galois ciphertext degree"
+    );
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    crate::grafting::rns_key_switch::rns_key_switch_with_ntt(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+    )
+}
+
 /// Applies an RNS Galois automorphism to a leveled CKKS ciphertext.
 ///
 /// The active CKKS level, basis, and scale are preserved. Only the

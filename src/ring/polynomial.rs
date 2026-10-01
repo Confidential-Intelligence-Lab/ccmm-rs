@@ -133,6 +133,50 @@ impl Polynomial {
         }
     }
 
+    /// Multiplies by `sign * X^exponent` in `Z_q[X] / (X^N + 1)`.
+    ///
+    /// This is a signed coefficient permutation and therefore runs in
+    /// O(N), rather than using general negacyclic polynomial multiplication.
+    ///
+    /// `sign` must be either `1` or `-1`. The exponent is reduced modulo
+    /// `2N`, using `X^N = -1` and hence `X^(2N) = 1`.
+    pub fn mul_monomial_signed(&self, exponent: usize, sign: i8) -> Self {
+        assert!(
+            sign == 1 || sign == -1,
+            "monomial sign must be either 1 or -1"
+        );
+
+        let n = self.degree();
+        let exponent = exponent % (2 * n);
+        let shift = exponent % n;
+        let exponent_negates = exponent >= n;
+        let external_negates = sign == -1;
+
+        let mut coefficients = vec![0_u64; n];
+
+        for (source, &coefficient) in self.coefficients.iter().enumerate() {
+            let sum = source + shift;
+            let (destination, wrap_negates) = if sum >= n {
+                (sum - n, true)
+            } else {
+                (sum, false)
+            };
+
+            let negate = exponent_negates ^ external_negates ^ wrap_negates;
+
+            coefficients[destination] = if negate {
+                self.modulus.neg(coefficient)
+            } else {
+                coefficient
+            };
+        }
+
+        Self {
+            modulus: self.modulus,
+            coefficients,
+        }
+    }
+
     /// Naive negacyclic multiplication in
     ///
     /// `Z_q[X] / (X^N + 1)`.
@@ -269,6 +313,52 @@ mod tests {
         let rhs = Polynomial::new(q, vec![1, 2, 3]);
 
         let _ = lhs.add(&rhs);
+    }
+
+    #[test]
+    fn signed_monomial_multiplication_matches_naive_negacyclic_product() {
+        const DEGREE: usize = 8;
+
+        let modulus = Modulus::new(97);
+
+        let polynomial = Polynomial::new(
+            modulus,
+            (0..DEGREE)
+                .map(|index| ((index * 17 + 11) % 97) as u64)
+                .collect(),
+        );
+
+        for sign in [-1_i8, 1_i8] {
+            for exponent in 0..(4 * DEGREE) {
+                let reduced = exponent % (2 * DEGREE);
+                let shift = reduced % DEGREE;
+
+                let mut monomial = vec![0_u64; DEGREE];
+
+                let mut coefficient = 1_u64;
+
+                if reduced >= DEGREE {
+                    coefficient = modulus.neg(coefficient);
+                }
+
+                if sign == -1 {
+                    coefficient = modulus.neg(coefficient);
+                }
+
+                monomial[shift] = coefficient;
+
+                let reference = polynomial.negacyclic_mul(&Polynomial::new(modulus, monomial));
+
+                let optimized = polynomial.mul_monomial_signed(exponent, sign);
+
+                assert_eq!(
+                    optimized, reference,
+                    "signed monomial mismatch for exponent={exponent}, sign={sign}"
+                );
+            }
+        }
+
+        println!("SIGNED_MONOMIAL_EQUIVALENCE=PASS");
     }
 
     #[test]

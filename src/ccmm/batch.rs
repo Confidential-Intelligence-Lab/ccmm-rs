@@ -1381,15 +1381,12 @@ mod sinc_tests {
     ) -> crate::ring::Polynomial {
         let degree = polynomial.degree();
         let period = 2_i128 * degree as i128;
-        let normalized = (i128::from(exponent)).rem_euclid(period) as usize;
+        let normalized = i128::from(exponent).rem_euclid(period) as usize;
+
         let shift = normalized % degree;
-        let negative = normalized >= degree;
+        let sign = if normalized >= degree { -1_i8 } else { 1_i8 };
 
-        let modulus = polynomial.modulus();
-        let mut monomial = vec![0_u64; degree];
-        monomial[shift] = if negative { modulus.value() - 1 } else { 1 };
-
-        polynomial.negacyclic_mul(&crate::ring::Polynomial::new(modulus, monomial))
+        polynomial.mul_monomial_signed(shift, sign)
     }
 
     fn batch_rlwe_mul_monomial_signed(
@@ -1548,6 +1545,7 @@ mod sinc_tests {
         ciphertexts: &[crate::grafting::RnsRlweCiphertext],
         scalar_degree: usize,
         galois_keys: &[crate::ckks::RnsGaloisKey],
+        plan: &crate::ring::RnsNttPlan,
     ) -> Vec<crate::grafting::RnsRlweCiphertext> {
         let dimension = ciphertexts.len();
 
@@ -1579,7 +1577,11 @@ mod sinc_tests {
                     ciphertexts[inverse_index].clone()
                 } else {
                     let key = batch_galois_key_for_exponent(galois_keys, exponent);
-                    crate::ckks::apply_rns_galois_automorphism(&ciphertexts[inverse_index], key)
+                    crate::ckks::apply_rns_galois_automorphism_with_ntt(
+                        &ciphertexts[inverse_index],
+                        key,
+                        plan,
+                    )
                 }
             })
             .collect()
@@ -1589,10 +1591,42 @@ mod sinc_tests {
         ciphertexts: &[crate::grafting::RnsRlweCiphertext],
         scalar_degree: usize,
         galois_keys: &[crate::ckks::RnsGaloisKey],
+        plan: &crate::ring::RnsNttPlan,
     ) -> Vec<crate::grafting::RnsRlweCiphertext> {
+        let total_start = std::time::Instant::now();
+
+        let phase_start = std::time::Instant::now();
         let crt = batch_large_crt(ciphertexts, scalar_degree);
-        let transformed = batch_scrambled_auto(&crt, scalar_degree, galois_keys);
-        batch_large_inv_crt(&transformed, scalar_degree)
+        let crt_elapsed = phase_start.elapsed();
+
+        let phase_start = std::time::Instant::now();
+        let transformed = batch_scrambled_auto(&crt, scalar_degree, galois_keys, plan);
+        let scrambled_auto_elapsed = phase_start.elapsed();
+
+        let phase_start = std::time::Instant::now();
+        let output = batch_large_inv_crt(&transformed, scalar_degree);
+        let inv_crt_elapsed = phase_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+
+        println!(
+            "BATCH_CMT_LARGE_CRT_MS={:.3}",
+            crt_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CMT_SCRAMBLED_AUTO_MS={:.3}",
+            scrambled_auto_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CMT_LARGE_INV_CRT_MS={:.3}",
+            inv_crt_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CMT_TOTAL_MS={:.3}",
+            total_elapsed.as_secs_f64() * 1.0e3
+        );
+
+        output
     }
 
     fn raw_cc_product(
@@ -1725,6 +1759,65 @@ mod sinc_tests {
     ///     (2d x d) * (d x 2d) -> (2d x 2d)
     ///
     /// Entries are scalar-ring RNS polynomials, not ciphertexts.
+    fn batch_ccmm_modular_product_ntt(
+        lhs: &[Vec<crate::ring::RnsPolynomial>],
+        rhs_transposed: &[Vec<crate::ring::RnsPolynomial>],
+        plan: &crate::ring::RnsNttPlan,
+    ) -> Vec<Vec<crate::ring::RnsPolynomial>> {
+        assert!(!lhs.is_empty(), "Batch CCMM lhs must not be empty");
+        assert!(
+            !rhs_transposed.is_empty(),
+            "Batch CCMM rhs must not be empty"
+        );
+
+        let inner = lhs[0].len();
+
+        assert!(inner > 0);
+        assert!(lhs.iter().all(|row| row.len() == inner));
+
+        assert_eq!(
+            rhs_transposed.len(),
+            inner,
+            "Batch CCMM modular inner dimensions must match"
+        );
+
+        let output_columns = rhs_transposed[0].len();
+
+        assert!(output_columns > 0);
+        assert!(rhs_transposed.iter().all(|row| row.len() == output_columns));
+
+        // Transform each matrix entry exactly once.
+        let lhs_ntt: Vec<Vec<crate::ring::RnsNttPolynomial>> = lhs
+            .iter()
+            .map(|row| row.iter().map(|entry| plan.forward(entry)).collect())
+            .collect();
+
+        let rhs_ntt: Vec<Vec<crate::ring::RnsNttPolynomial>> = rhs_transposed
+            .iter()
+            .map(|row| row.iter().map(|entry| plan.forward(entry)).collect())
+            .collect();
+
+        (0..lhs_ntt.len())
+            .map(|row| {
+                (0..output_columns)
+                    .map(|column| {
+                        let mut accumulator = lhs_ntt[row][0].pointwise_mul(&rhs_ntt[0][column]);
+
+                        for (lhs_entry, rhs_row) in lhs_ntt[row].iter().zip(rhs_ntt.iter()).skip(1)
+                        {
+                            let product = lhs_entry.pointwise_mul(&rhs_row[column]);
+
+                            accumulator = accumulator.add(&product);
+                        }
+
+                        // One inverse NTT per output polynomial.
+                        plan.inverse(&accumulator)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn batch_ccmm_modular_product(
         lhs: &[Vec<crate::ring::RnsPolynomial>],
         rhs_transposed: &[Vec<crate::ring::RnsPolynomial>],
@@ -2096,6 +2189,74 @@ mod sinc_tests {
     }
 
     #[test]
+    fn batch_galois_ntt_matches_reference_exactly() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        const DEGREE: usize = 16;
+
+        let moduli = vec![
+            crate::ring::Modulus::new(193),
+            crate::ring::Modulus::new(257),
+        ];
+
+        let basis = crate::ring::ModulusBasis::new(moduli.clone());
+        let plan = crate::ring::RnsNttPlan::new(moduli, DEGREE);
+
+        let secret: Vec<i8> = (0..DEGREE)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 1,
+            })
+            .collect();
+
+        let values: Vec<u128> = (0..DEGREE)
+            .map(|index| ((index * 13 + 7) % 31) as u128)
+            .collect();
+
+        let plaintext =
+            crate::ring::RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &values);
+
+        let mut encrypt_rng = ChaCha20Rng::seed_from_u64(0xB5A0_0001);
+
+        let ciphertext = crate::grafting::encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            crate::rlwe::ErrorDistribution::BoundedUniform { bound: 0 },
+            &secret,
+            &plan,
+            &mut encrypt_rng,
+        );
+
+        let layout = crate::grafting::RnsGadgetLayout::new(basis, vec![1, 1]);
+
+        let exponent = 5;
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xB5A0_0002);
+
+        let key = crate::ckks::RnsGaloisKey::generate_with_rng(
+            DEGREE,
+            2,
+            0,
+            &secret,
+            exponent,
+            layout,
+            &mut key_rng,
+        );
+
+        let reference = crate::ckks::apply_rns_galois_automorphism(&ciphertext, &key);
+
+        let optimized =
+            crate::ckks::apply_rns_galois_automorphism_with_ntt(&ciphertext, &key, &plan);
+
+        assert_eq!(optimized, reference);
+
+        println!("BATCH_GALOIS_NTT_EQUIVALENCE=PASS");
+    }
+
+    #[test]
     fn batch_cmt_small_encrypted_transpose_is_exact() {
         use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
@@ -2196,7 +2357,8 @@ mod sinc_tests {
             })
             .collect();
 
-        let transposed = batch_ciphertext_transpose(&ciphertexts, SCALAR_DEGREE, &galois_keys);
+        let transposed =
+            batch_ciphertext_transpose(&ciphertexts, SCALAR_DEGREE, &galois_keys, &plan);
 
         assert_eq!(transposed.len(), DIMENSION);
 
@@ -2279,6 +2441,52 @@ mod sinc_tests {
         );
 
         println!("BATCH_LARGE_CRT_INVERSE_ROUNDTRIP=PASS");
+    }
+
+    #[test]
+    fn batch_ccmm_ntt_modular_product_matches_reference() {
+        const DIMENSION: usize = 4;
+        const INNER: usize = 4;
+        const DEGREE: usize = 8;
+
+        let moduli = vec![
+            crate::ring::Modulus::new(193),
+            crate::ring::Modulus::new(257),
+        ];
+
+        let plan = crate::ring::RnsNttPlan::new(moduli.clone(), DEGREE);
+
+        fn make_poly(moduli: &[crate::ring::Modulus], seed: usize) -> crate::ring::RnsPolynomial {
+            let coefficients: Vec<u128> = (0..DEGREE)
+                .map(|index| ((seed + 1) * 17 + index * 11) as u128)
+                .collect();
+
+            crate::ring::RnsPolynomial::from_coefficients(moduli.to_vec(), &coefficients)
+        }
+
+        let lhs: Vec<Vec<_>> = (0..2 * DIMENSION)
+            .map(|row| {
+                (0..INNER)
+                    .map(|column| make_poly(&moduli, row * INNER + column))
+                    .collect()
+            })
+            .collect();
+
+        let rhs: Vec<Vec<_>> = (0..INNER)
+            .map(|row| {
+                (0..2 * DIMENSION)
+                    .map(|column| make_poly(&moduli, 100 + row * 2 * DIMENSION + column))
+                    .collect()
+            })
+            .collect();
+
+        let reference = batch_ccmm_modular_product(&lhs, &rhs, &plan);
+
+        let optimized = batch_ccmm_modular_product_ntt(&lhs, &rhs, &plan);
+
+        assert_eq!(optimized, reference);
+
+        println!("BATCH_CCMM_NTT_MODULAR_PRODUCT_EQUIVALENCE=PASS");
     }
 
     #[test]
@@ -2394,7 +2602,7 @@ mod sinc_tests {
         // ------------------------------------------------------------------
 
         // C-MT rhs.
-        let rhs_t = batch_ciphertext_transpose(&rhs, SCALAR_DEGREE, &galois_keys);
+        let rhs_t = batch_ciphertext_transpose(&rhs, SCALAR_DEGREE, &galois_keys, &large_plan);
 
         // MatrixCutter::slice:
         //
@@ -2445,9 +2653,11 @@ mod sinc_tests {
         assert_eq!(latter_t.len(), DIMENSION);
 
         // Authors' second pair of C-MTs.
-        let former = batch_ciphertext_transpose(&former_t, SCALAR_DEGREE, &galois_keys);
+        let former =
+            batch_ciphertext_transpose(&former_t, SCALAR_DEGREE, &galois_keys, &large_plan);
 
-        let latter = batch_ciphertext_transpose(&latter_t, SCALAR_DEGREE, &galois_keys);
+        let latter =
+            batch_ciphertext_transpose(&latter_t, SCALAR_DEGREE, &galois_keys, &large_plan);
 
         // addCtSkCt produces the degree-2 ciphertext.
         let quadratic: Vec<_> = former
@@ -2575,6 +2785,7 @@ mod sinc_tests {
     }
 
     fn ccmm_batch_capability(dimension: usize, scalar_degree: usize) -> f64 {
+        let total_start = std::time::Instant::now();
         use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
@@ -2627,10 +2838,12 @@ mod sinc_tests {
             })
             .collect();
 
+        let phase_start = std::time::Instant::now();
         let lhs_sinc = super::sinc_encode_batch(&lhs_complex, scalar_degree);
 
         let rhs_sinc = super::sinc_encode_batch(&rhs_complex, scalar_degree);
 
+        let encode_elapsed = phase_start.elapsed();
         assert_eq!(lhs_sinc.large_degree(), LARGE_DEGREE);
         assert_eq!(rhs_sinc.large_degree(), LARGE_DEGREE);
 
@@ -2680,10 +2893,12 @@ mod sinc_tests {
                     .collect()
             };
 
+        let phase_start = std::time::Instant::now();
         let lhs = encrypt_columns(lhs_sinc.columns(), 0x4343_4d4d_4c48_5300);
 
         let rhs = encrypt_columns(rhs_sinc.columns(), 0x4343_4d4d_5248_5300);
 
+        let encrypt_elapsed = phase_start.elapsed();
         assert_eq!(lhs.len(), dimension);
         assert_eq!(rhs.len(), dimension);
 
@@ -2693,6 +2908,7 @@ mod sinc_tests {
         // h_i = 2 * Ns * i + 1, i = 1..d-1.
         // ----------------------------------------------------------
 
+        let phase_start = std::time::Instant::now();
         let galois_layout = crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
 
         let galois_keys: Vec<crate::ckks::RnsGaloisKey> = (1..dimension)
@@ -2700,27 +2916,34 @@ mod sinc_tests {
             .map(|exponent| {
                 let mut rng = ChaCha20Rng::seed_from_u64(0x434d_5400_0000_0000 ^ exponent as u64);
 
-                crate::ckks::RnsGaloisKey::generate_with_rng(
-                    LARGE_DEGREE,
-                    2,
-                    0,
+                crate::ckks::RnsGaloisKey::generate_with_ntt_rng(
+                    crate::grafting::RnsKeygenConfig {
+                        degree: LARGE_DEGREE,
+                        plaintext_modulus: 2,
+                        noise_bound: 0,
+                        layout: galois_layout.clone(),
+                        plan: &large_plan,
+                    },
                     &secret,
                     exponent,
-                    galois_layout.clone(),
                     &mut rng,
                 )
             })
             .collect();
 
         assert_eq!(galois_keys.len(), dimension - 1,);
+        let galois_keygen_elapsed = phase_start.elapsed();
 
         // ----------------------------------------------------------
         // Authors' CCMM pipeline.
         // ----------------------------------------------------------
 
+        let phase_start = std::time::Instant::now();
         // 1. C-MT(rhs).
-        let rhs_t = batch_ciphertext_transpose(&rhs, scalar_degree, &galois_keys);
+        let rhs_t = batch_ciphertext_transpose(&rhs, scalar_degree, &galois_keys, &large_plan);
 
+        let rhs_cmt_elapsed = phase_start.elapsed();
+        let phase_start = std::time::Instant::now();
         // 2. MatrixCutter::slice:
         //
         //        lhs   -> 2d x d
@@ -2742,15 +2965,19 @@ mod sinc_tests {
 
         assert!(rhs_t_mod_t.iter().all(|row| { row.len() == 2 * dimension }));
 
+        let slice_transpose_elapsed = phase_start.elapsed();
         // 4. Modular polynomial MM:
         //
         //      (2d x d)(d x 2d) -> 2d x 2d
-        let product_mod = batch_ccmm_modular_product(&lhs_mod, &rhs_t_mod_t, &scalar_plan);
+        let phase_start = std::time::Instant::now();
+        let product_mod = batch_ccmm_modular_product_ntt(&lhs_mod, &rhs_t_mod_t, &scalar_plan);
 
         assert_eq!(product_mod.len(), 2 * dimension,);
 
         assert!(product_mod.iter().all(|row| { row.len() == 2 * dimension }));
 
+        let modular_mm_elapsed = phase_start.elapsed();
+        let phase_start = std::time::Instant::now();
         // 5. Former/latter d x 2d blocks.
         let (former_mod, latter_mod) = batch_ccmm_split_former_latter(&product_mod, dimension);
 
@@ -2769,11 +2996,17 @@ mod sinc_tests {
         assert_eq!(former_t.len(), dimension);
         assert_eq!(latter_t.len(), dimension);
 
+        let reconstruction_elapsed = phase_start.elapsed();
+        let phase_start = std::time::Instant::now();
         // 8. Authors' second pair of C-MTs.
-        let former = batch_ciphertext_transpose(&former_t, scalar_degree, &galois_keys);
+        let former =
+            batch_ciphertext_transpose(&former_t, scalar_degree, &galois_keys, &large_plan);
 
-        let latter = batch_ciphertext_transpose(&latter_t, scalar_degree, &galois_keys);
+        let latter =
+            batch_ciphertext_transpose(&latter_t, scalar_degree, &galois_keys, &large_plan);
 
+        let second_cmt_elapsed = phase_start.elapsed();
+        let phase_start = std::time::Instant::now();
         // 9. addCtSkCt -> degree-2 ciphertext.
         let quadratic: Vec<_> = former
             .iter()
@@ -2783,10 +3016,12 @@ mod sinc_tests {
 
         assert_eq!(quadratic.len(), dimension,);
 
+        let add_ct_sk_ct_elapsed = phase_start.elapsed();
         // ----------------------------------------------------------
         // Relinearization.
         // ----------------------------------------------------------
 
+        let phase_start = std::time::Instant::now();
         let multiplication_layout =
             crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
 
@@ -2801,6 +3036,9 @@ mod sinc_tests {
             &mut multiplication_key_rng,
         );
 
+        let multiplication_keygen_elapsed = phase_start.elapsed();
+
+        let phase_start = std::time::Instant::now();
         let relinearized: Vec<_> = quadratic
             .iter()
             .map(|product| {
@@ -2809,6 +3047,7 @@ mod sinc_tests {
             .collect();
 
         assert_eq!(relinearized.len(), dimension,);
+        let relinearization_elapsed = phase_start.elapsed();
 
         // ----------------------------------------------------------
         // CKKS product semantics:
@@ -2818,6 +3057,7 @@ mod sinc_tests {
         // one rescale removes q1.
         // ----------------------------------------------------------
 
+        let phase_start = std::time::Instant::now();
         let output_ciphertexts: Vec<crate::ckks::RnsCkksCiphertext> = relinearized
             .into_iter()
             .map(|rlwe| {
@@ -2832,6 +3072,7 @@ mod sinc_tests {
             .collect();
 
         assert_eq!(output_ciphertexts.len(), dimension,);
+        let rescale_elapsed = phase_start.elapsed();
 
         assert!(output_ciphertexts
             .iter()
@@ -2839,6 +3080,7 @@ mod sinc_tests {
 
         // Full-row CCMM decode.  Unlike CPMM, dimension is d,
         // not d/2.
+        let phase_start = std::time::Instant::now();
         let decoded = decode_large_columns(&output_ciphertexts, &secret, scalar_degree, dimension);
 
         let actual = super::sinc_decode_batch(&decoded);
@@ -2847,6 +3089,7 @@ mod sinc_tests {
         assert_eq!(actual[0].len(), dimension);
         assert_eq!(actual[0][0].len(), dimension);
 
+        let decrypt_decode_elapsed = phase_start.elapsed();
         let mut squared_error = 0.0_f64;
         let mut squared_reference = 0.0_f64;
         let mut maximum_absolute_error = 0.0_f64;
@@ -2869,6 +3112,65 @@ mod sinc_tests {
         }
 
         let relative_error = (squared_error / squared_reference).sqrt();
+
+        let total_elapsed = total_start.elapsed();
+
+        println!(
+            "BATCH_CCMM_PHASE_ENCODE_MS={:.3}",
+            encode_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_ENCRYPT_MS={:.3}",
+            encrypt_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_GALOIS_KEYGEN_MS={:.3}",
+            galois_keygen_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_RHS_CMT_MS={:.3}",
+            rhs_cmt_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_SLICE_TRANSPOSE_MS={:.3}",
+            slice_transpose_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_MODULAR_MM_MS={:.3}",
+            modular_mm_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_RECONSTRUCTION_MS={:.3}",
+            reconstruction_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_SECOND_CMT_MS={:.3}",
+            second_cmt_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_ADD_CTSKCT_MS={:.3}",
+            add_ct_sk_ct_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_MULT_KEYGEN_MS={:.3}",
+            multiplication_keygen_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_RELINEARIZATION_MS={:.3}",
+            relinearization_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_RESCALE_MS={:.3}",
+            rescale_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_PHASE_DECRYPT_DECODE_MS={:.3}",
+            decrypt_decode_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!(
+            "BATCH_CCMM_TOTAL_MS={:.3}",
+            total_elapsed.as_secs_f64() * 1.0e3
+        );
 
         println!("BATCH_CCMM_DIMENSION={dimension}");
         println!("BATCH_CCMM_SCALAR_DEGREE={scalar_degree}");

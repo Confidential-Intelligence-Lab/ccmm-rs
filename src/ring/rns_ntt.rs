@@ -126,6 +126,32 @@ impl RnsNttPolynomial {
         &self.residues[index]
     }
 
+    /// Addition in the NTT domain across the full RNS basis.
+    pub fn add(&self, rhs: &Self) -> Self {
+        assert_eq!(
+            self.degree, rhs.degree,
+            "RNS NTT polynomial degrees must match"
+        );
+
+        assert_eq!(
+            self.moduli, rhs.moduli,
+            "RNS NTT polynomial bases must match"
+        );
+
+        let residues = self
+            .residues
+            .iter()
+            .zip(&rhs.residues)
+            .map(|(lhs, rhs)| lhs.add(rhs))
+            .collect();
+
+        Self {
+            degree: self.degree,
+            moduli: self.moduli.clone(),
+            residues,
+        }
+    }
+
     pub fn pointwise_mul(&self, rhs: &Self) -> Self {
         assert_eq!(
             self.degree, rhs.degree,
