@@ -24,7 +24,7 @@ pub use batched_gemm::{
     BatchedGemmOperationCount, BatchedGemmShape, BatchedGemmSpec,
 };
 
-pub use batch_gemm::{batch_gemm_ccmm, batch_gemm_cpmm, batch_gemv_cpmm};
+pub use batch_gemm::{batch_dot_cpmm, batch_gemm_ccmm, batch_gemm_cpmm, batch_gemv_cpmm};
 
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;

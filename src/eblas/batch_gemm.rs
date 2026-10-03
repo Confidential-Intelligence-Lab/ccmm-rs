@@ -106,6 +106,31 @@ pub fn batch_gemv_cpmm(
     output.remove(0)
 }
 
+/// Executes packed ciphertext/plaintext DOT through the Batch CPMM mechanism.
+///
+/// Each logical encrypted vector must be represented as the first row of its
+/// square left-operand matrix, with every remaining row zero. Each logical
+/// public vector uses the GEMV plaintext embedding: the vector occupies the
+/// first column of the square right operand and every remaining column is zero.
+///
+/// The existing packed GEMV execution therefore produces a logical vector
+/// `[x^T * y, 0, ..., 0]^T` for every packed batch. This function returns that
+/// packed ciphertext representation; scalar extraction remains part of SinC
+/// decoding outside the eBLAS execution boundary.
+///
+/// This is a semantic DOT adapter over the validated Batch CPMM GEMV path, not
+/// a specialized lower-complexity DOT kernel.
+pub fn batch_dot_cpmm(
+    geometry: BatchGemmGeometry,
+    lhs: &[RnsCkksCiphertext],
+    rhs: &[Vec<RnsPolynomial>],
+    scalar_plan: &RnsNttPlan,
+    chain: &ModulusChain,
+    scale: f64,
+) -> RnsCkksCiphertext {
+    batch_gemv_cpmm(geometry, lhs, rhs, scalar_plan, chain, scale)
+}
+
 /// Executes packed ciphertext/ciphertext GEMM through the Batch CCMM mechanism.
 ///
 /// Encoding, encryption, evaluation-key generation/preparation, decryption,
