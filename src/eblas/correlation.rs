@@ -15,7 +15,7 @@
 use crate::eblas::{
     gemm_cc_decomposed, gemm_cp_decomposed, gemm_pp, BatchGemmGeometry,
     DecomposedCcmmExecutionContext, DecomposedCpmmExecutionContext, GemmShape, GemmSpec,
-    MatrixShape, PrivacyMode,
+    MatrixShape, NhwcShape, PrivacyMode,
 };
 use crate::matrix::BatchMatrix;
 
@@ -63,6 +63,130 @@ impl Correlation1dShape {
     /// Number of valid correlation positions.
     pub const fn output_length(self) -> usize {
         self.output_length
+    }
+}
+
+/// Shape contract for valid two-dimensional correlation over NHWC input.
+///
+/// Input uses canonical `[B,H,W,C]` layout. Filters use logical
+/// `[Kh,Kw,C,F]` layout. Valid correlation produces
+/// `[B,H-Kh+1,W-Kw+1,F]`.
+///
+/// The structured operation lowers to one logical GEMM:
+///
+/// ```text
+/// [B*OH*OW, Kh*Kw*C] * [Kh*Kw*C, F]
+/// ```
+///
+/// No kernel reversal is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Correlation2dShape {
+    input: NhwcShape,
+    kernel_height: usize,
+    kernel_width: usize,
+    filters: usize,
+    output: NhwcShape,
+}
+
+impl Correlation2dShape {
+    /// Creates a valid two-dimensional correlation shape.
+    pub fn new(
+        input: NhwcShape,
+        kernel_height: usize,
+        kernel_width: usize,
+        filters: usize,
+    ) -> Self {
+        assert!(
+            kernel_height > 0,
+            "eBLAS 2D correlation kernel height must be positive"
+        );
+        assert!(
+            kernel_width > 0,
+            "eBLAS 2D correlation kernel width must be positive"
+        );
+        assert!(
+            filters > 0,
+            "eBLAS 2D correlation filter count must be positive"
+        );
+        assert!(
+            kernel_height <= input.height(),
+            "eBLAS 2D correlation kernel height cannot exceed input height"
+        );
+        assert!(
+            kernel_width <= input.width(),
+            "eBLAS 2D correlation kernel width cannot exceed input width"
+        );
+
+        let output_height = input.height() - kernel_height + 1;
+        let output_width = input.width() - kernel_width + 1;
+
+        let _ = kernel_height
+            .checked_mul(kernel_width)
+            .and_then(|value| value.checked_mul(input.channels()))
+            .expect("eBLAS 2D correlation inner dimension overflow");
+
+        let output = NhwcShape::new(input.batches(), output_height, output_width, filters);
+
+        Self {
+            input,
+            kernel_height,
+            kernel_width,
+            filters,
+            output,
+        }
+    }
+
+    pub const fn input(self) -> NhwcShape {
+        self.input
+    }
+
+    pub const fn kernel_height(self) -> usize {
+        self.kernel_height
+    }
+
+    pub const fn kernel_width(self) -> usize {
+        self.kernel_width
+    }
+
+    pub const fn filters(self) -> usize {
+        self.filters
+    }
+
+    pub const fn output(self) -> NhwcShape {
+        self.output
+    }
+
+    pub const fn output_height(self) -> usize {
+        self.output.height()
+    }
+
+    pub const fn output_width(self) -> usize {
+        self.output.width()
+    }
+
+    /// Logical GEMM row count: `B * OH * OW`.
+    pub fn rows(self) -> usize {
+        self.output
+            .batches()
+            .checked_mul(self.output.height())
+            .and_then(|value| value.checked_mul(self.output.width()))
+            .expect("eBLAS 2D correlation row count overflow")
+    }
+
+    /// Logical GEMM reduction dimension: `Kh * Kw * C`.
+    pub fn inner(self) -> usize {
+        self.kernel_height
+            .checked_mul(self.kernel_width)
+            .and_then(|value| value.checked_mul(self.input.channels()))
+            .expect("eBLAS 2D correlation inner dimension overflow")
+    }
+
+    /// Logical matrix multiplication induced by this correlation.
+    pub fn gemm_shape(self) -> GemmShape {
+        GemmShape::new(
+            MatrixShape::new(self.rows(), self.inner()),
+            MatrixShape::new(self.inner(), self.filters),
+        )
     }
 }
 
@@ -179,6 +303,151 @@ pub fn correlate_1d_pp(
     let (gemm_shape, windows) = correlation_1d_gemm_operand(shape, signal, kernel);
 
     gemm_pp(GemmSpec::new(gemm_shape, PrivacyMode::Pp), &windows, kernel)
+}
+
+/// Lowers valid NHWC correlation and `[Kh,Kw,C,F]` filters to GEMM operands.
+///
+/// The lhs row order is canonical `[batch, output_row, output_col]`.
+/// The reduction order is `[kernel_row, kernel_col, channel]`.
+/// The rhs column order is the filter index.
+fn correlation_2d_gemm_operands(
+    shape: Correlation2dShape,
+    input: &[f64],
+    filters: &[f64],
+) -> (GemmShape, BatchMatrix<f64>, BatchMatrix<f64>) {
+    let input_shape = shape.input();
+
+    assert_eq!(
+        input.len(),
+        input_shape.elements(),
+        "eBLAS 2D correlation input length does not match its NHWC shape"
+    );
+
+    let expected_filter_elements = shape
+        .inner()
+        .checked_mul(shape.filters())
+        .expect("eBLAS 2D correlation filter element count overflow");
+
+    assert_eq!(
+        filters.len(),
+        expected_filter_elements,
+        "eBLAS 2D correlation filter length does not match [Kh,Kw,C,F]"
+    );
+
+    let mut windows = BatchMatrix::<f64>::new(shape.rows(), shape.inner(), 1);
+
+    for batch in 0..input_shape.batches() {
+        for output_row in 0..shape.output_height() {
+            for output_col in 0..shape.output_width() {
+                let logical_row = ((batch * shape.output_height() + output_row)
+                    * shape.output_width())
+                    + output_col;
+
+                for kernel_row in 0..shape.kernel_height() {
+                    for kernel_col in 0..shape.kernel_width() {
+                        for channel in 0..input_shape.channels() {
+                            let inner = ((kernel_row * shape.kernel_width() + kernel_col)
+                                * input_shape.channels())
+                                + channel;
+
+                            let input_row = output_row + kernel_row;
+                            let input_col = output_col + kernel_col;
+
+                            let input_index = (((batch * input_shape.height() + input_row)
+                                * input_shape.width()
+                                + input_col)
+                                * input_shape.channels())
+                                + channel;
+
+                            windows.set(0, logical_row, inner, input[input_index]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut lowered_filters = BatchMatrix::<f64>::new(shape.inner(), shape.filters(), 1);
+
+    for kernel_row in 0..shape.kernel_height() {
+        for kernel_col in 0..shape.kernel_width() {
+            for channel in 0..input_shape.channels() {
+                let inner = ((kernel_row * shape.kernel_width() + kernel_col)
+                    * input_shape.channels())
+                    + channel;
+
+                for filter in 0..shape.filters() {
+                    let filter_index = ((((kernel_row * shape.kernel_width()) + kernel_col)
+                        * input_shape.channels()
+                        + channel)
+                        * shape.filters())
+                        + filter;
+
+                    lowered_filters.set(0, inner, filter, filters[filter_index]);
+                }
+            }
+        }
+    }
+
+    (shape.gemm_shape(), windows, lowered_filters)
+}
+
+/// Restores canonical NHWC storage from the lowered `[B*OH*OW,F]` output.
+fn correlation_2d_output_nhwc(shape: Correlation2dShape, matrix: &BatchMatrix<f64>) -> Vec<f64> {
+    assert_eq!(
+        matrix.batches(),
+        1,
+        "eBLAS 2D correlation lowered output must contain one matrix batch"
+    );
+    assert_eq!(
+        matrix.rows(),
+        shape.rows(),
+        "eBLAS 2D correlation lowered output row count mismatch"
+    );
+    assert_eq!(
+        matrix.cols(),
+        shape.filters(),
+        "eBLAS 2D correlation lowered output filter count mismatch"
+    );
+
+    let mut output = Vec::with_capacity(shape.output().elements());
+
+    for batch in 0..shape.output().batches() {
+        for output_row in 0..shape.output_height() {
+            for output_col in 0..shape.output_width() {
+                let logical_row = ((batch * shape.output_height() + output_row)
+                    * shape.output_width())
+                    + output_col;
+
+                for filter in 0..shape.filters() {
+                    output.push(*matrix.get(0, logical_row, filter));
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// Computes valid two-dimensional plaintext/plaintext correlation.
+///
+/// Input storage is canonical NHWC `[B,H,W,C]`. Filter storage is canonical
+/// `[Kh,Kw,C,F]`. The returned vector is canonical NHWC
+/// `[B,OH,OW,F]`.
+///
+/// Correlation is implemented through deterministic lowering to one logical
+/// GEMM. The filters are used in supplied order and are not reversed.
+pub fn correlate_2d_pp(shape: Correlation2dShape, input: &[f64], filters: &[f64]) -> Vec<f64> {
+    let (gemm_shape, windows, lowered_filters) =
+        correlation_2d_gemm_operands(shape, input, filters);
+
+    let output = gemm_pp(
+        GemmSpec::new(gemm_shape, PrivacyMode::Pp),
+        &windows,
+        &lowered_filters,
+    );
+
+    correlation_2d_output_nhwc(shape, &output)
 }
 
 #[cfg(test)]
@@ -552,5 +821,86 @@ mod tests {
     fn cc_reduction_decomposition_matches_pp() {
         // 64 x 67 * 67 x 1: two K products accumulated into one output tile.
         run_cc_case(130, 67, 23, 33, 0x5238_2003);
+    }
+
+    #[test]
+    fn correlation_2d_shape_exposes_valid_geometry() {
+        let shape = Correlation2dShape::new(NhwcShape::new(1, 4, 5, 2), 2, 3, 4);
+
+        assert_eq!(shape.output(), NhwcShape::new(1, 3, 3, 4));
+        assert_eq!(shape.rows(), 9);
+        assert_eq!(shape.inner(), 12);
+        assert_eq!(
+            shape.gemm_shape(),
+            GemmShape::new(MatrixShape::new(9, 12), MatrixShape::new(12, 4),)
+        );
+    }
+
+    #[test]
+    fn correlation_2d_pp_matches_exact_single_channel_reference() {
+        let shape = Correlation2dShape::new(NhwcShape::new(1, 3, 3, 1), 2, 2, 1);
+
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+
+        // [Kh=2, Kw=2, C=1, F=1], supplied without reversal:
+        //
+        // [1 2]
+        // [3 4]
+        let filters = vec![1.0, 2.0, 3.0, 4.0];
+
+        let output = correlate_2d_pp(shape, &input, &filters);
+
+        assert_eq!(shape.output(), NhwcShape::new(1, 2, 2, 1));
+        assert_eq!(output, vec![37.0, 47.0, 67.0, 77.0]);
+    }
+
+    #[test]
+    fn correlation_2d_pp_preserves_channels_and_multiple_filters() {
+        let shape = Correlation2dShape::new(NhwcShape::new(1, 2, 2, 2), 1, 1, 2);
+
+        // Four NHWC pixels:
+        // [1,10], [2,20], [3,30], [4,40].
+        let input = vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0];
+
+        // [Kh=1,Kw=1,C=2,F=2]:
+        //
+        // filter 0 = [1,2]
+        // filter 1 = [10,20]
+        let filters = vec![1.0, 10.0, 2.0, 20.0];
+
+        let output = correlate_2d_pp(shape, &input, &filters);
+
+        assert_eq!(
+            output,
+            vec![21.0, 210.0, 42.0, 420.0, 63.0, 630.0, 84.0, 840.0,]
+        );
+    }
+
+    #[test]
+    fn correlation_2d_pp_flattens_multiple_nhwc_batches_into_logical_rows() {
+        let shape = Correlation2dShape::new(NhwcShape::new(2, 1, 1, 2), 1, 1, 1);
+
+        // batch 0 pixel [1,2], batch 1 pixel [3,4].
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+
+        // One 1x1 two-channel filter [10,1].
+        let filters = vec![10.0, 1.0];
+
+        let output = correlate_2d_pp(shape, &input, &filters);
+
+        assert_eq!(shape.rows(), 2);
+        assert_eq!(output, vec![12.0, 34.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel height cannot exceed input height")]
+    fn correlation_2d_shape_rejects_tall_kernel() {
+        let _ = Correlation2dShape::new(NhwcShape::new(1, 2, 3, 1), 3, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel width cannot exceed input width")]
+    fn correlation_2d_shape_rejects_wide_kernel() {
+        let _ = Correlation2dShape::new(NhwcShape::new(1, 3, 2, 1), 1, 3, 1);
     }
 }
