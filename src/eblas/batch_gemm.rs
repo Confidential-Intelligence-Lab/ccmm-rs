@@ -173,6 +173,74 @@ pub fn batch_gemm_ccmm(
     crate::ccmm::batch::batch_ccmm_execute(lhs, rhs, geometry.dimension(), context)
 }
 
+/// Executes packed ciphertext/ciphertext GEMV through the Batch CCMM mechanism.
+///
+/// `lhs` is the encrypted packed representation of a batch of square matrices.
+/// `rhs` is the encrypted packed representation of a `d x d` embedding whose
+/// first column contains the logical encrypted vectors and whose remaining
+/// columns are zero.
+///
+/// CCMM therefore computes `[A * x, 0, ..., 0]`. This adapter returns only the
+/// first packed ciphertext column, which is the logical GEMV result.
+///
+/// Packing, encryption, evaluation-key preparation, decryption, and SinC
+/// decoding remain outside the eBLAS execution boundary.
+///
+/// This is a semantic GEMV adapter over the existing square CCMM mechanism,
+/// not a specialized lower-complexity GEMV kernel.
+pub fn batch_gemv_ccmm(
+    geometry: BatchGemmGeometry,
+    lhs: &[RnsRlweCiphertext],
+    rhs: &[RnsRlweCiphertext],
+    context: &BatchCcmmExecutionContext<'_>,
+) -> RnsCkksCiphertext {
+    let dimension = geometry.dimension();
+
+    assert_eq!(
+        lhs.len(),
+        dimension,
+        "eBLAS Batch CCMM GEMV left operand must contain d ciphertext columns"
+    );
+    assert_eq!(
+        rhs.len(),
+        dimension,
+        "eBLAS Batch CCMM GEMV encrypted embedding must contain d ciphertext columns"
+    );
+
+    let mut output = batch_gemm_ccmm(geometry, lhs, rhs, context);
+
+    assert_eq!(
+        output.len(),
+        dimension,
+        "eBLAS Batch CCMM GEMV square embedding returned unexpected output width"
+    );
+
+    output.remove(0)
+}
+
+/// Executes packed ciphertext/ciphertext DOT through the Batch CCMM mechanism.
+///
+/// Each logical encrypted left vector must be represented as the first row of
+/// its square left-operand matrix, with every remaining row zero. Each logical
+/// encrypted right vector must be represented as the first column of its square
+/// right-operand matrix, with every remaining column zero.
+///
+/// The existing packed CCMM GEMV execution therefore produces
+/// `[x^T * y, 0, ..., 0]^T` for every packed batch. This function returns that
+/// packed ciphertext representation; scalar extraction remains part of SinC
+/// decoding outside the eBLAS execution boundary.
+///
+/// This is a semantic DOT adapter over the validated Batch CCMM GEMV path, not
+/// a specialized lower-complexity DOT kernel.
+pub fn batch_dot_ccmm(
+    geometry: BatchGemmGeometry,
+    lhs: &[RnsRlweCiphertext],
+    rhs: &[RnsRlweCiphertext],
+    context: &BatchCcmmExecutionContext<'_>,
+) -> RnsCkksCiphertext {
+    batch_gemv_ccmm(geometry, lhs, rhs, context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

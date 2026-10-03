@@ -8276,6 +8276,459 @@ mod sinc_tests {
         relative_error
     }
 
+    fn ccmm_batch_gemv_dot_capability(
+        dimension: usize,
+        scalar_degree: usize,
+        dot: bool,
+    ) -> (f64, f64, f64) {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        const LARGE_DEGREE: usize = 8192;
+
+        let batch_count = scalar_degree / 2;
+        let scale = sd3b_scale();
+
+        assert_eq!(
+            dimension * scalar_degree,
+            LARGE_DEGREE,
+            "Batch CCMM requires d * Ns = N"
+        );
+
+        let lhs_source =
+            deterministic_cpmm_input(batch_count, dimension, if dot { 23 } else { 19 });
+        let rhs_source =
+            deterministic_cpmm_input(batch_count, dimension, if dot { 29 } else { 21 });
+
+        let (lhs_clear, rhs_clear, expected_vectors, expected_scalars) = if dot {
+            let lhs_vectors: Vec<Vec<f64>> = lhs_source
+                .iter()
+                .map(|matrix| (0..dimension).map(|column| matrix[0][column]).collect())
+                .collect();
+
+            let rhs_vectors: Vec<Vec<f64>> = rhs_source
+                .iter()
+                .map(|matrix| (0..dimension).map(|row| matrix[row][0]).collect())
+                .collect();
+
+            let expected_scalars: Vec<f64> = lhs_vectors
+                .iter()
+                .zip(&rhs_vectors)
+                .map(|(lhs, rhs)| (0..dimension).map(|index| lhs[index] * rhs[index]).sum())
+                .collect();
+
+            let lhs_clear: Vec<Vec<Vec<f64>>> = lhs_vectors
+                .iter()
+                .map(|vector| {
+                    (0..dimension)
+                        .map(|row| {
+                            if row == 0 {
+                                vector.clone()
+                            } else {
+                                vec![0.0_f64; dimension]
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let rhs_clear: Vec<Vec<Vec<f64>>> = rhs_vectors
+                .iter()
+                .map(|vector| {
+                    (0..dimension)
+                        .map(|row| {
+                            let mut embedded_row = vec![0.0_f64; dimension];
+                            embedded_row[0] = vector[row];
+                            embedded_row
+                        })
+                        .collect()
+                })
+                .collect();
+
+            (lhs_clear, rhs_clear, Vec::new(), expected_scalars)
+        } else {
+            let vectors: Vec<Vec<f64>> = rhs_source
+                .iter()
+                .map(|matrix| (0..dimension).map(|row| matrix[row][0]).collect())
+                .collect();
+
+            let expected_vectors: Vec<Vec<f64>> = lhs_source
+                .iter()
+                .zip(&vectors)
+                .map(|(matrix, vector)| {
+                    (0..dimension)
+                        .map(|row| {
+                            (0..dimension)
+                                .map(|inner| matrix[row][inner] * vector[inner])
+                                .sum()
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let rhs_clear: Vec<Vec<Vec<f64>>> = vectors
+                .iter()
+                .map(|vector| {
+                    (0..dimension)
+                        .map(|row| {
+                            let mut embedded_row = vec![0.0_f64; dimension];
+                            embedded_row[0] = vector[row];
+                            embedded_row
+                        })
+                        .collect()
+                })
+                .collect();
+
+            (lhs_source, rhs_clear, expected_vectors, Vec::new())
+        };
+
+        let to_complex = |matrices: &[Vec<Vec<f64>>]| {
+            matrices
+                .iter()
+                .map(|matrix| {
+                    matrix
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|&value| num_complex::Complex64::new(value, 0.0))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let lhs_complex = to_complex(&lhs_clear);
+        let rhs_complex = to_complex(&rhs_clear);
+
+        let lhs_sinc = super::sinc_encode_batch(&lhs_complex, scalar_degree);
+        let rhs_sinc = super::sinc_encode_batch(&rhs_complex, scalar_degree);
+
+        assert_eq!(lhs_sinc.large_degree(), LARGE_DEGREE);
+        assert_eq!(rhs_sinc.large_degree(), LARGE_DEGREE);
+        assert_eq!(lhs_sinc.dimension(), dimension);
+        assert_eq!(rhs_sinc.dimension(), dimension);
+        assert_eq!(lhs_sinc.num_columns(), dimension);
+        assert_eq!(rhs_sinc.num_columns(), dimension);
+
+        let basis = crate::ring::ModulusBasis::new(sd3b_moduli());
+        let chain = crate::ring::ModulusChain::from_top_basis(basis.clone());
+
+        let large_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), LARGE_DEGREE);
+        let prepared_large_plan = crate::ring::PreparedRnsNttPlan::new(&large_plan);
+
+        let scalar_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), scalar_degree);
+        let prepared_scalar_plan = crate::ring::PreparedRnsNttPlan::new(&scalar_plan);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(
+            0x4343_4d4d_5644_0000 ^ dimension as u64 ^ if dot { 0x444f_5400 } else { 0x4745_4d56 },
+        );
+
+        let mut secret: Vec<i8> = (0..LARGE_DEGREE)
+            .map(|_| secret_rng.gen_range(-1_i8..=1_i8))
+            .collect();
+
+        if secret.iter().all(|&value| value == 0) {
+            secret[0] = 1;
+        }
+
+        let encrypt_columns =
+            |columns: &[Vec<f64>], seed: u64| -> Vec<crate::grafting::RnsRlweCiphertext> {
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(column, coefficients)| {
+                        let plaintext = quantize_coefficients(coefficients, &basis, scale);
+
+                        let mut rng = ChaCha20Rng::seed_from_u64(seed ^ column as u64);
+
+                        crate::grafting::encrypt_rns_raw_with_distribution_ntt_rng(
+                            &plaintext,
+                            2,
+                            crate::rlwe::ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                            &secret,
+                            &large_plan,
+                            &mut rng,
+                        )
+                    })
+                    .collect()
+            };
+
+        let lhs = encrypt_columns(
+            lhs_sinc.columns(),
+            0x4343_5644_4c48_5300 ^ if dot { 1 } else { 0 },
+        );
+        let rhs = encrypt_columns(
+            rhs_sinc.columns(),
+            0x4343_5644_5248_5300 ^ if dot { 1 } else { 0 },
+        );
+
+        let galois_layout = crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
+
+        let galois_keys: Vec<crate::ckks::RnsGaloisKey> = (1..dimension)
+            .map(|index| 2 * scalar_degree * index + 1)
+            .map(|exponent| {
+                let mut rng = ChaCha20Rng::seed_from_u64(0x434d_5400_5644_0000 ^ exponent as u64);
+
+                crate::ckks::RnsGaloisKey::generate_with_ntt_rng(
+                    crate::grafting::RnsKeygenConfig {
+                        degree: LARGE_DEGREE,
+                        plaintext_modulus: 2,
+                        noise_bound: 0,
+                        layout: galois_layout.clone(),
+                        plan: &large_plan,
+                    },
+                    &secret,
+                    exponent,
+                    &mut rng,
+                )
+            })
+            .collect();
+
+        let prepared_galois_keys: Vec<crate::ckks::PreparedRnsGaloisKey> = galois_keys
+            .iter()
+            .map(|key| crate::ckks::PreparedRnsGaloisKey::new(key, &large_plan))
+            .collect();
+
+        let multiplication_layout =
+            crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
+
+        let mut multiplication_key_rng = ChaCha20Rng::seed_from_u64(0x4343_5644_524c_4b00);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_ntt_rng(
+            crate::grafting::RnsKeygenConfig {
+                degree: LARGE_DEGREE,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: multiplication_layout,
+                plan: &large_plan,
+            },
+            &secret,
+            &mut multiplication_key_rng,
+        );
+
+        let prepared_multiplication_key =
+            crate::grafting::PreparedRnsMultiplicationKey::new(&multiplication_key, &large_plan);
+
+        let context = super::BatchCcmmExecutionContext {
+            scalar_plan: &scalar_plan,
+            prepared_scalar_plan: &prepared_scalar_plan,
+            prepared_large_plan: &prepared_large_plan,
+            prepared_galois_keys: &prepared_galois_keys,
+            prepared_multiplication_key: &prepared_multiplication_key,
+            chain: &chain,
+            scale,
+        };
+
+        let geometry = crate::eblas::BatchGemmGeometry::new(
+            crate::eblas::BatchGemmMechanism::Ccmm,
+            dimension,
+            scalar_degree,
+            LARGE_DEGREE,
+        );
+
+        let operation_start = std::time::Instant::now();
+
+        let output = if dot {
+            crate::eblas::batch_dot_ccmm(geometry, &lhs, &rhs, &context)
+        } else {
+            crate::eblas::batch_gemv_ccmm(geometry, &lhs, &rhs, &context)
+        };
+
+        let operation_elapsed = operation_start.elapsed();
+
+        assert_eq!(
+            output.level(),
+            1,
+            "Batch CCMM GEMV/DOT must consume exactly one modulus level"
+        );
+        assert_eq!(
+            output.rlwe().degree(),
+            LARGE_DEGREE,
+            "Batch CCMM GEMV/DOT must preserve the large-ring degree"
+        );
+        assert!(
+            output.scale().is_finite() && output.scale() > 0.0,
+            "Batch CCMM GEMV/DOT output scale must be finite and positive"
+        );
+
+        let decoded = decode_large_columns(
+            std::slice::from_ref(&output),
+            &secret,
+            scalar_degree,
+            dimension,
+        );
+
+        let actual = super::sinc_decode_batch(&decoded);
+
+        assert_eq!(actual.len(), batch_count);
+
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs_error = 0.0_f64;
+        let mut max_structural_zero = 0.0_f64;
+        let mut max_imaginary = 0.0_f64;
+
+        for batch in 0..batch_count {
+            let matrix = &actual[batch];
+
+            assert_eq!(matrix.len(), dimension);
+            assert!(
+                matrix.iter().all(|row| row.len() == 1),
+                "Batch CCMM GEMV/DOT must decode exactly one logical column"
+            );
+
+            for (row, matrix_row) in matrix.iter().enumerate() {
+                let value = matrix_row[0];
+
+                assert!(
+                    value.re.is_finite() && value.im.is_finite(),
+                    "Batch CCMM GEMV/DOT decoded a non-finite value"
+                );
+
+                max_imaginary = max_imaginary.max(value.im.abs());
+
+                let expected = if dot {
+                    if row == 0 {
+                        expected_scalars[batch]
+                    } else {
+                        0.0
+                    }
+                } else {
+                    expected_vectors[batch][row]
+                };
+
+                let error = value.re - expected;
+
+                if !dot || row == 0 {
+                    squared_error += error * error;
+                    squared_reference += expected * expected;
+                    max_abs_error = max_abs_error.max(error.abs());
+                } else {
+                    max_structural_zero = max_structural_zero.max(value.norm());
+                }
+            }
+        }
+
+        assert!(
+            squared_reference > 0.0,
+            "Batch CCMM GEMV/DOT reference norm must be nonzero"
+        );
+
+        let relative_l2 = (squared_error / squared_reference).sqrt();
+        let prefix = if dot {
+            "BATCH_CCMM_DOT"
+        } else {
+            "BATCH_CCMM_GEMV"
+        };
+
+        println!("{prefix}_DIMENSION={dimension}");
+        println!("{prefix}_SCALAR_DEGREE={scalar_degree}");
+        println!("{prefix}_BATCH_COUNT={batch_count}");
+        println!(
+            "{prefix}_OUTPUT_VALUES={}",
+            if dot {
+                batch_count
+            } else {
+                batch_count * dimension
+            }
+        );
+        println!(
+            "{prefix}_MATRIX_MULT_MS={:.3}",
+            operation_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!("{prefix}_REL_L2={relative_l2:.12e}");
+        println!("{prefix}_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("{prefix}_MAX_STRUCTURAL_ZERO={max_structural_zero:.12e}");
+        println!("{prefix}_MAX_IMAGINARY={max_imaginary:.12e}");
+
+        (
+            relative_l2,
+            max_abs_error,
+            max_structural_zero.max(max_imaginary),
+        )
+    }
+
+    #[test]
+    fn batch_ccmm_gemv_d64_matches_clear_reference() {
+        let (relative_l2, max_abs_error, residual) = ccmm_batch_gemv_dot_capability(64, 128, false);
+
+        println!("BATCH_CCMM_GEMV_D64_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CCMM_GEMV_D64_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("BATCH_CCMM_GEMV_D64_MAX_RESIDUAL={residual:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CCMM GEMV d=64 relative L2 error {relative_l2:e}"
+        );
+        assert!(
+            residual < 1.0e-3,
+            "authors-scale Batch CCMM GEMV d=64 residual {residual:e}"
+        );
+
+        println!("BATCH_CCMM_GEMV_D64_STATUS=PASS");
+    }
+
+    #[test]
+    fn batch_ccmm_gemv_d128_matches_clear_reference() {
+        let (relative_l2, max_abs_error, residual) = ccmm_batch_gemv_dot_capability(128, 64, false);
+
+        println!("BATCH_CCMM_GEMV_D128_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CCMM_GEMV_D128_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("BATCH_CCMM_GEMV_D128_MAX_RESIDUAL={residual:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CCMM GEMV d=128 relative L2 error {relative_l2:e}"
+        );
+        assert!(
+            residual < 1.0e-3,
+            "authors-scale Batch CCMM GEMV d=128 residual {residual:e}"
+        );
+
+        println!("BATCH_CCMM_GEMV_D128_STATUS=PASS");
+    }
+
+    #[test]
+    fn batch_ccmm_dot_d64_matches_clear_reference() {
+        let (relative_l2, max_abs_error, residual) = ccmm_batch_gemv_dot_capability(64, 128, true);
+
+        println!("BATCH_CCMM_DOT_D64_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CCMM_DOT_D64_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("BATCH_CCMM_DOT_D64_MAX_RESIDUAL={residual:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CCMM DOT d=64 relative L2 error {relative_l2:e}"
+        );
+        assert!(
+            residual < 1.0e-3,
+            "authors-scale Batch CCMM DOT d=64 residual {residual:e}"
+        );
+
+        println!("BATCH_CCMM_DOT_D64_STATUS=PASS");
+    }
+
+    #[test]
+    fn batch_ccmm_dot_d128_matches_clear_reference() {
+        let (relative_l2, max_abs_error, residual) = ccmm_batch_gemv_dot_capability(128, 64, true);
+
+        println!("BATCH_CCMM_DOT_D128_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CCMM_DOT_D128_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("BATCH_CCMM_DOT_D128_MAX_RESIDUAL={residual:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CCMM DOT d=128 relative L2 error {relative_l2:e}"
+        );
+        assert!(
+            residual < 1.0e-3,
+            "authors-scale Batch CCMM DOT d=128 residual {residual:e}"
+        );
+
+        println!("BATCH_CCMM_DOT_D128_STATUS=PASS");
+    }
+
     #[test]
     fn batch_ccmm_end_to_end_authors_d64() {
         let relative_error = ccmm_batch_capability(64, 128);
