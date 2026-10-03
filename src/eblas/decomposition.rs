@@ -211,6 +211,116 @@ impl GemmDecompositionPlan {
     }
 }
 
+/// Shape-only placement of one logical tile product inside a square native
+/// execution extent.
+///
+/// Logical data occupies the upper-left region of each native operand/output.
+/// Elements outside the logical region are padding owned by a later
+/// representation/execution layer. This type does not allocate or materialize
+/// padded matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeGemmTileMapping {
+    product: GemmTileProduct,
+    native_dimension: usize,
+}
+
+impl NativeGemmTileMapping {
+    /// Creates a mapping into a square `native_dimension x native_dimension`
+    /// execution extent.
+    pub fn new(product: GemmTileProduct, native_dimension: usize) -> Self {
+        assert!(
+            native_dimension > 0,
+            "eBLAS native GEMM tile dimension must be positive"
+        );
+
+        let lhs = product.lhs();
+        let rhs = product.rhs();
+        let output = product.output();
+
+        assert!(
+            lhs.rows() <= native_dimension
+                && lhs.cols() <= native_dimension
+                && rhs.rows() <= native_dimension
+                && rhs.cols() <= native_dimension
+                && output.rows() <= native_dimension
+                && output.cols() <= native_dimension,
+            "eBLAS logical GEMM tile does not fit native square extent"
+        );
+
+        Self {
+            product,
+            native_dimension,
+        }
+    }
+
+    /// Logical tile product represented by this mapping.
+    pub const fn product(self) -> GemmTileProduct {
+        self.product
+    }
+
+    /// Square native execution dimension.
+    pub const fn native_dimension(self) -> usize {
+        self.native_dimension
+    }
+
+    /// Logical left-hand operand shape.
+    pub const fn lhs_logical(self) -> MatrixShape {
+        self.product.lhs()
+    }
+
+    /// Logical right-hand operand shape.
+    pub const fn rhs_logical(self) -> MatrixShape {
+        self.product.rhs()
+    }
+
+    /// Logical output contribution shape.
+    pub const fn output_logical(self) -> MatrixShape {
+        self.product.output()
+    }
+
+    /// Square native operand/output shape.
+    pub fn native_shape(self) -> MatrixShape {
+        MatrixShape::new(self.native_dimension, self.native_dimension)
+    }
+
+    fn native_elements(self) -> usize {
+        self.native_dimension
+            .checked_mul(self.native_dimension)
+            .expect("eBLAS native GEMM tile element count overflow")
+    }
+
+    /// Number of zero-padding elements required by the left operand.
+    pub fn lhs_padding_elements(self) -> usize {
+        self.native_elements()
+            .checked_sub(self.lhs_logical().elements())
+            .expect("eBLAS native GEMM lhs padding underflow")
+    }
+
+    /// Number of zero-padding elements required by the right operand.
+    pub fn rhs_padding_elements(self) -> usize {
+        self.native_elements()
+            .checked_sub(self.rhs_logical().elements())
+            .expect("eBLAS native GEMM rhs padding underflow")
+    }
+
+    /// Number of non-logical elements in the native output extent.
+    ///
+    /// A later execution layer may discard these elements rather than
+    /// materializing them as an assembled logical output.
+    pub fn output_padding_elements(self) -> usize {
+        self.native_elements()
+            .checked_sub(self.output_logical().elements())
+            .expect("eBLAS native GEMM output padding underflow")
+    }
+
+    /// Returns whether any operand or output requires padding.
+    pub fn requires_padding(self) -> bool {
+        self.lhs_padding_elements() != 0
+            || self.rhs_padding_elements() != 0
+            || self.output_padding_elements() != 0
+    }
+}
+
 /// Static accounting for one GEMM decomposition.
 ///
 /// These counts describe decomposition structure only. They do not estimate
@@ -341,6 +451,71 @@ mod tests {
             .sum::<usize>();
 
         assert_eq!(decomposed_products, logical.scalar_products());
+    }
+
+    #[test]
+    fn exact_native_mapping_requires_no_padding() {
+        let plan = GemmDecompositionPlan::new(shape(128, 128, 128), 128);
+        let product = plan.product(0, 0, 0);
+
+        let mapping = NativeGemmTileMapping::new(product, 128);
+
+        assert_eq!(mapping.product(), product);
+        assert_eq!(mapping.native_dimension(), 128);
+        assert_eq!(mapping.native_shape(), MatrixShape::new(128, 128));
+        assert_eq!(mapping.lhs_logical(), MatrixShape::new(128, 128));
+        assert_eq!(mapping.rhs_logical(), MatrixShape::new(128, 128));
+        assert_eq!(mapping.output_logical(), MatrixShape::new(128, 128));
+        assert_eq!(mapping.lhs_padding_elements(), 0);
+        assert_eq!(mapping.rhs_padding_elements(), 0);
+        assert_eq!(mapping.output_padding_elements(), 0);
+        assert!(!mapping.requires_padding());
+    }
+
+    #[test]
+    fn boundary_mapping_accounts_for_padding_exactly() {
+        let plan = GemmDecompositionPlan::new(shape(200, 300, 100), 128);
+        let product = plan.product(1, 2, 0);
+
+        assert_eq!(product.lhs(), MatrixShape::new(72, 44));
+        assert_eq!(product.rhs(), MatrixShape::new(44, 100));
+        assert_eq!(product.output(), MatrixShape::new(72, 100));
+
+        let mapping = NativeGemmTileMapping::new(product, 128);
+
+        assert_eq!(mapping.lhs_padding_elements(), 128 * 128 - 72 * 44);
+        assert_eq!(mapping.rhs_padding_elements(), 128 * 128 - 44 * 100);
+        assert_eq!(mapping.output_padding_elements(), 128 * 128 - 72 * 100);
+        assert!(mapping.requires_padding());
+    }
+
+    #[test]
+    fn native_mapping_preserves_logical_shapes() {
+        let plan = GemmDecompositionPlan::new(shape(129, 257, 257), 128);
+
+        for product in plan.products() {
+            let mapping = NativeGemmTileMapping::new(product, 128);
+
+            assert_eq!(mapping.lhs_logical(), product.lhs());
+            assert_eq!(mapping.rhs_logical(), product.rhs());
+            assert_eq!(mapping.output_logical(), product.output());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit native square extent")]
+    fn native_mapping_rejects_oversized_logical_tile() {
+        let product = GemmDecompositionPlan::new(shape(128, 128, 128), 128).product(0, 0, 0);
+
+        let _ = NativeGemmTileMapping::new(product, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "native GEMM tile dimension must be positive")]
+    fn native_mapping_rejects_zero_dimension() {
+        let product = GemmDecompositionPlan::new(shape(1, 1, 1), 1).product(0, 0, 0);
+
+        let _ = NativeGemmTileMapping::new(product, 0);
     }
 
     #[test]

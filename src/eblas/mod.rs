@@ -19,7 +19,9 @@ pub mod batch_gemm;
 pub mod decomposition;
 pub mod gemm;
 pub use backend_policy::select_cc_backend;
-pub use decomposition::{GemmDecompositionCount, GemmDecompositionPlan, GemmTileProduct};
+pub use decomposition::{
+    GemmDecompositionCount, GemmDecompositionPlan, GemmTileProduct, NativeGemmTileMapping,
+};
 
 pub use batched_gemm::{
     batched_gemm_cc, batched_gemm_cc_auto, batched_gemm_cp, batched_gemm_pc, batched_gemm_pp,
