@@ -2,8 +2,8 @@ use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
 };
 use ccmm_rs::eblas::{
-    dot_cc, dot_cp, dot_pp, gemv_cc, gemv_cp, gemv_pp, DotShape, GemmBackend, GemvShape,
-    MatrixShape,
+    dot_cc, dot_cp, dot_pc, dot_pp, gemv_cc, gemv_cp, gemv_pc, gemv_pp, DotShape, GemmBackend,
+    GemvShape, MatrixShape,
 };
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
@@ -96,14 +96,29 @@ fn decode_scalar(
         .map(|x| centered(x, modulus) as f64 / ciphertext.scale())
         .collect();
     let slots = embedding.coefficients_to_slots(&coefficients);
+    assert!(
+        !slots.is_empty()
+            && slots
+                .iter()
+                .all(|slot| slot.re.is_finite() && slot.im.is_finite()),
+        "decoded slots must be nonempty and finite"
+    );
     slots.iter().map(|slot| slot.re).sum::<f64>() / slots.len() as f64
 }
 
 fn max_error(actual: &[f64], expected: &[f64]) -> f64 {
+    assert_eq!(actual.len(), expected.len(), "validation length mismatch");
+    assert!(!actual.is_empty(), "validation must not be empty");
     actual
         .iter()
         .zip(expected)
-        .map(|(a, b)| (a - b).abs())
+        .map(|(a, b)| {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "non-finite validation value"
+            );
+            (a - b).abs()
+        })
         .fold(0.0_f64, f64::max)
 }
 
@@ -121,7 +136,35 @@ fn decode_matrix(
     out
 }
 
-fn main() {
+fn assert_pc_output_contract(
+    actual: &RnsCkksCiphertextMatrix,
+    cp_reference: &RnsCkksCiphertextMatrix,
+    encrypted_input: &RnsCkksCiphertext,
+    shape: MatrixShape,
+) {
+    assert_eq!((actual.rows(), actual.cols()), (shape.rows(), shape.cols()));
+    assert_eq!(
+        (cp_reference.rows(), cp_reference.cols()),
+        (shape.rows(), shape.cols())
+    );
+    for col in 0..shape.cols() {
+        for row in 0..shape.rows() {
+            let output = actual.get(row, col);
+            let reference = cp_reference.get(row, col);
+            assert_eq!(output.rlwe().degree(), encrypted_input.rlwe().degree());
+            assert_eq!(output.basis(), reference.basis());
+            assert_eq!(
+                output.basis().moduli().len() + 1,
+                encrypted_input.basis().moduli().len(),
+                "PC output must consume one modulus level"
+            );
+            assert!(output.scale().is_finite() && output.scale() > 0.0);
+            assert_eq!(output.scale(), reference.scale());
+        }
+    }
+}
+
+fn run_validation() {
     let profile = research_profile_4096();
     let chain = profile.modulus_chain();
     let degree = profile.degree();
@@ -160,6 +203,16 @@ fn main() {
     let vector_pp = BatchMatrix::from_vec_column_major(3, 1, 1, vector_values.clone());
     let gemv_ref = gemv_pp(gemv_shape, &matrix_pp, &vector_pp);
     let gemv_expected = gemv_ref.raw().to_vec();
+
+    let matrix_pt = RnsCkksPlaintextMatrix::from_vec_column_major(
+        2,
+        3,
+        scale,
+        matrix_values
+            .iter()
+            .map(|&v| encode_rns(v, &embedding, &basis, scale))
+            .collect(),
+    );
 
     let matrix_ct = RnsCkksCiphertextMatrix::from_vec_column_major(
         2,
@@ -216,6 +269,13 @@ fn main() {
     );
 
     let gemv_cp_result = gemv_cp(gemv_shape, &matrix_ct, &vector_pt, &chain, &plan);
+    let gemv_pc_result = gemv_pc(gemv_shape, &matrix_pt, &vector_ct, &chain, &plan);
+    assert_pc_output_contract(
+        &gemv_pc_result,
+        &gemv_cp_result,
+        vector_ct.get(0, 0),
+        gemv_shape.output(),
+    );
     let gemv_cc_scalar = gemv_cc(
         gemv_shape,
         GemmBackend::CcScalar,
@@ -239,6 +299,10 @@ fn main() {
         &decode_matrix(&gemv_cp_result, &secret, &embedding),
         &gemv_expected,
     );
+    let gemv_pc_error = max_error(
+        &decode_matrix(&gemv_pc_result, &secret, &embedding),
+        &gemv_expected,
+    );
     let gemv_scalar_error = max_error(
         &decode_matrix(&gemv_cc_scalar, &secret, &embedding),
         &gemv_expected,
@@ -256,6 +320,16 @@ fn main() {
     let rhs_pp = BatchMatrix::from_vec_column_major(4, 1, 1, rhs_values.clone());
     let dot_ref = dot_pp(dot_shape, &lhs_pp, &rhs_pp);
     let dot_expected = dot_ref.raw().to_vec();
+
+    let lhs_pt = RnsCkksPlaintextMatrix::from_vec_column_major(
+        1,
+        4,
+        scale,
+        lhs_values
+            .iter()
+            .map(|&v| encode_rns(v, &embedding, &basis, scale))
+            .collect(),
+    );
 
     let lhs_ct = RnsCkksCiphertextMatrix::from_vec_column_major(
         1,
@@ -312,6 +386,13 @@ fn main() {
     );
 
     let dot_cp_result = dot_cp(dot_shape, &lhs_ct, &rhs_pt, &chain, &plan);
+    let dot_pc_result = dot_pc(dot_shape, &lhs_pt, &rhs_ct, &chain, &plan);
+    assert_pc_output_contract(
+        &dot_pc_result,
+        &dot_cp_result,
+        rhs_ct.get(0, 0),
+        MatrixShape::new(1, 1),
+    );
     let dot_cc_scalar = dot_cc(
         dot_shape,
         GemmBackend::CcScalar,
@@ -335,6 +416,10 @@ fn main() {
         &decode_matrix(&dot_cp_result, &secret, &embedding),
         &dot_expected,
     );
+    let dot_pc_error = max_error(
+        &decode_matrix(&dot_pc_result, &secret, &embedding),
+        &dot_expected,
+    );
     let dot_scalar_error = max_error(
         &decode_matrix(&dot_cc_scalar, &secret, &embedding),
         &dot_expected,
@@ -346,27 +431,62 @@ fn main() {
 
     for error in [
         gemv_cp_error,
+        gemv_pc_error,
         gemv_scalar_error,
         gemv_structured_error,
         dot_cp_error,
+        dot_pc_error,
         dot_scalar_error,
         dot_structured_error,
     ] {
-        assert!(error <= TOLERANCE);
+        assert!(
+            error.is_finite() && error <= TOLERANCE,
+            "max error: {error:.12e}"
+        );
     }
 
-    println!("R3_5C_EBLAS_GEMV_DOT_VERSION=1");
+    println!("R3_5C_EBLAS_GEMV_DOT_VERSION=2");
+    println!("PRIVACY_MODES=PP,CP,PC,CC");
+    println!("DECODE_METRIC=MAX_ABS_ERROR_OF_SLOT_MEAN_REAL_SCALARS");
     println!("PROFILE={}", profile.name());
     println!("GEMV_M=2");
     println!("GEMV_K=3");
     println!("GEMV_CP_MAX_ERROR={gemv_cp_error:.12e}");
+    println!("GEMV_PC_MAX_ERROR={gemv_pc_error:.12e}");
+    println!("GEMV_PC_STATE_STATUS=PASS");
     println!("GEMV_CC_SCALAR_MAX_ERROR={gemv_scalar_error:.12e}");
     println!("GEMV_CC_STRUCTURED_MAX_ERROR={gemv_structured_error:.12e}");
     println!("GEMV_STATUS=PASS");
     println!("DOT_K=4");
     println!("DOT_CP_MAX_ERROR={dot_cp_error:.12e}");
+    println!("DOT_PC_MAX_ERROR={dot_pc_error:.12e}");
+    println!("DOT_PC_STATE_STATUS=PASS");
     println!("DOT_CC_SCALAR_MAX_ERROR={dot_scalar_error:.12e}");
     println!("DOT_CC_STRUCTURED_MAX_ERROR={dot_structured_error:.12e}");
     println!("DOT_STATUS=PASS");
     println!("R3_5C_EBLAS_GEMV_DOT_STATUS=PASS");
+}
+
+fn main() {
+    run_validation();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gemv_dot_all_privacy_modes_match_reference() {
+        super::run_validation();
+    }
+
+    #[test]
+    #[should_panic(expected = "validation length mismatch")]
+    fn error_metric_rejects_length_mismatch() {
+        super::max_error(&[0.0], &[0.0, 1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite validation value")]
+    fn error_metric_rejects_nan() {
+        super::max_error(&[f64::NAN], &[0.0]);
+    }
 }

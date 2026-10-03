@@ -5,8 +5,8 @@
 //! arithmetic. Specialized kernels may replace these reductions later.
 
 use crate::eblas::{
-    gemm_cc, gemm_cc_auto, gemm_cp, gemm_pp, GemmBackend, GemmShape, GemmSpec, MatrixShape,
-    PrivacyMode,
+    gemm_cc, gemm_cc_auto, gemm_cp, gemm_pc, gemm_pp, GemmBackend, GemmShape, GemmSpec,
+    MatrixShape, PrivacyMode,
 };
 use crate::grafting::BoundedRnsMultiplicationKey;
 use crate::matrix::{BatchMatrix, RnsCkksCiphertextMatrix, RnsCkksPlaintextMatrix};
@@ -109,6 +109,20 @@ pub fn gemv_cp(
     gemm_cp(shape.as_gemm(PrivacyMode::Cp), matrix, vector, chain, plan)
 }
 
+/// Executes plaintext/ciphertext GEMV through the existing PC GEMM path.
+///
+/// The public matrix remains the left operand and the encrypted vector remains
+/// the right operand. Representation transposes are handled by [`gemm_pc`].
+pub fn gemv_pc(
+    shape: GemvShape,
+    matrix: &RnsCkksPlaintextMatrix,
+    vector: &RnsCkksCiphertextMatrix,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    gemm_pc(shape.as_gemm(PrivacyMode::Pc), matrix, vector, chain, plan)
+}
+
 pub fn gemv_cc(
     shape: GemvShape,
     backend: GemmBackend,
@@ -162,6 +176,20 @@ pub fn dot_cp(
     gemm_cp(shape.as_gemm(PrivacyMode::Cp), lhs, rhs, chain, plan)
 }
 
+/// Computes `x^T y` with a public left vector and an encrypted right vector.
+///
+/// Inputs retain the existing DOT convention: a `1 x K` left operand and a
+/// `K x 1` right operand. Execution delegates to the existing PC GEMM path.
+pub fn dot_pc(
+    shape: DotShape,
+    lhs: &RnsCkksPlaintextMatrix,
+    rhs: &RnsCkksCiphertextMatrix,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    gemm_pc(shape.as_gemm(PrivacyMode::Pc), lhs, rhs, chain, plan)
+}
+
 pub fn dot_cc(
     shape: DotShape,
     backend: GemmBackend,
@@ -204,8 +232,29 @@ pub fn dot_cc_auto(
 #[cfg(test)]
 mod tests {
     use super::{dot_pp, gemv_pp, DotShape, GemvShape};
-    use crate::eblas::MatrixShape;
+    use crate::eblas::{MatrixShape, PrivacyMode};
     use crate::matrix::BatchMatrix;
+
+    #[test]
+    fn pc_gemv_contract_preserves_operand_order() {
+        let shape = GemvShape::new(MatrixShape::new(2, 3), MatrixShape::new(3, 1));
+        let spec = shape.as_gemm(PrivacyMode::Pc);
+
+        assert_eq!(spec.privacy(), PrivacyMode::Pc);
+        assert_eq!(spec.shape().lhs(), MatrixShape::new(2, 3));
+        assert_eq!(spec.shape().rhs(), MatrixShape::new(3, 1));
+        assert_eq!(spec.shape().output(), MatrixShape::new(2, 1));
+    }
+
+    #[test]
+    fn pc_dot_contract_preserves_operand_order() {
+        let spec = DotShape::new(3).as_gemm(PrivacyMode::Pc);
+
+        assert_eq!(spec.privacy(), PrivacyMode::Pc);
+        assert_eq!(spec.shape().lhs(), MatrixShape::new(1, 3));
+        assert_eq!(spec.shape().rhs(), MatrixShape::new(3, 1));
+        assert_eq!(spec.shape().output(), MatrixShape::new(1, 1));
+    }
 
     #[test]
     fn pp_gemv_matches_reference() {

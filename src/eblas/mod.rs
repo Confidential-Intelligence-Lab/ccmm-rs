@@ -29,8 +29,8 @@ pub use batch_gemm::{batch_gemm_ccmm, batch_gemm_cpmm};
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
 pub use gemv::{
-    dot_cc, dot_cc_auto, dot_cp, dot_pp, gemv_cc, gemv_cc_auto, gemv_cp, gemv_pp, DotShape,
-    GemvShape,
+    dot_cc, dot_cc_auto, dot_cp, dot_pc, dot_pp, gemv_cc, gemv_cc_auto, gemv_cp, gemv_pc, gemv_pp,
+    DotShape, GemvShape,
 };
 
 pub mod level1;
