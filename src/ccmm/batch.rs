@@ -7,7 +7,7 @@
 //! Black-box validation against the bundled HEaaN implementation establishes
 //! the exact coefficient mapping:
 //!
-//!     large[j * d + r] = scalar[r][j]
+//! `large[j * d + r] = scalar[r][j]`
 //!
 //! where:
 //!   * `r` is the scalar-ring part / matrix-row index,
@@ -97,7 +97,7 @@ use num_complex::Complex64;
 /// For `d` parts of scalar degree `N_s`, the output degree is `d * N_s` and
 /// every residue limb satisfies
 ///
-///     large[j * d + r] = parts[r][j].
+/// `large[j * d + r] = parts[r][j]`.
 ///
 /// The operation is performed independently in every RNS residue. No CRT
 /// reconstruction is involved.
@@ -297,11 +297,11 @@ pub fn split_rns_rlwe_ciphertext(
 /// If the scalar ring has degree `N_s` and the logical matrix dimension is
 /// `d`, each large-ring column has degree
 ///
-///     N_l = d * N_s.
+/// `N_l = d * N_s`.
 ///
 /// The row-polynomial mapping matches HEaaN `RingSwitchHelper::combine`:
 ///
-///     large[j * d + r] = scalar_row[r][j].
+/// `large[j * d + r] = scalar_row[r][j]`.
 #[derive(Debug, Clone)]
 pub struct SinCBatchPlaintext {
     scalar_degree: usize,
@@ -525,7 +525,7 @@ pub fn sinc_decode_batch(plaintext: &SinCBatchPlaintext) -> Vec<Vec<Vec<Complex6
 /// For a real d x d matrix M with even d, returns the complex
 /// (d/2) x d matrix H defined by
 ///
-///     H[r][c] = M[r][c] + i M[r + d/2][c].
+/// `H[r][c] = M[r][c] + i M[r + d/2][c]`.
 ///
 pub fn as_half_row(matrix: &[Vec<f64>]) -> Vec<Vec<Complex64>> {
     let dimension = matrix.len();

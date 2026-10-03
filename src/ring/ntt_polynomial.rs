@@ -124,7 +124,7 @@ impl NttPolynomial {
     ///
     /// For NTT evaluation point
     ///
-    ///     r_k = psi^(2k + 1),
+    /// `r_k = psi^(2k + 1)`,
     ///
     /// multiplication by `X^e` is pointwise multiplication by `r_k^e`.
     ///
