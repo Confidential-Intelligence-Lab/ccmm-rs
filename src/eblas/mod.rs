@@ -11,6 +11,7 @@
 //! packages.
 
 pub mod backend_policy;
+pub mod correlation;
 
 pub mod batched_gemm;
 
@@ -129,6 +130,8 @@ pub enum EblasOperation {
     Gemv,
     /// Vector dot product.
     Dot,
+    /// Valid correlation.
+    Correlation,
     /// Element-wise addition.
     Add,
     /// Public-scalar scaling.
