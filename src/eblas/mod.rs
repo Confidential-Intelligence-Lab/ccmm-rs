@@ -19,6 +19,7 @@ pub mod batch_mapping;
 
 pub mod decomposition;
 pub mod gemm;
+pub mod native_representation;
 pub use backend_policy::select_cc_backend;
 pub use decomposition::{
     GemmDecompositionCount, GemmDecompositionPlan, GemmTileProduct, NativeGemmTileMapping,
@@ -33,6 +34,9 @@ pub use batch_gemm::{batch_dot_cpmm, batch_gemm_ccmm, batch_gemm_cpmm, batch_gem
 pub use batch_mapping::BatchGemmTileBinding;
 
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
+pub use native_representation::{
+    crop_native_output_tile, pad_native_lhs_tile, pad_native_rhs_tile,
+};
 pub mod gemv;
 pub use gemv::{
     dot_cc, dot_cc_auto, dot_cp, dot_pc, dot_pp, gemv_cc, gemv_cc_auto, gemv_cp, gemv_pc, gemv_pp,
