@@ -15,6 +15,7 @@ pub mod backend_policy;
 pub mod batched_gemm;
 
 pub mod batch_gemm;
+pub mod batch_mapping;
 
 pub mod decomposition;
 pub mod gemm;
@@ -29,6 +30,7 @@ pub use batched_gemm::{
 };
 
 pub use batch_gemm::{batch_dot_cpmm, batch_gemm_ccmm, batch_gemm_cpmm, batch_gemv_cpmm};
+pub use batch_mapping::BatchGemmTileBinding;
 
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
