@@ -2303,6 +2303,201 @@ pub fn batch_ccmm_execute(
     output_ciphertexts
 }
 
+/// Quantizes one real coefficient vector into the supplied RNS basis.
+///
+/// This is the representation boundary between floating-point CKKS
+/// coefficients and their integer RNS plaintext representation.
+fn quantize_real_coefficients(
+    coefficients: &[f64],
+    basis: &crate::ring::ModulusBasis,
+    scale: f64,
+) -> crate::ring::RnsPolynomial {
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "CKKS scale must be positive"
+    );
+
+    let residues = basis
+        .moduli()
+        .iter()
+        .copied()
+        .map(|modulus| {
+            let q = i128::from(modulus.value());
+
+            crate::ring::Polynomial::new(
+                modulus,
+                coefficients
+                    .iter()
+                    .map(|&value| {
+                        let signed = (value * scale).round() as i128;
+                        signed.rem_euclid(q) as u64
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    crate::ring::RnsPolynomial::from_residues(residues)
+}
+
+/// Quantizes the large-ring columns of a structural SinC plaintext.
+///
+/// SinC packing itself remains independent of the modulus basis and CKKS
+/// scale. This function supplies exactly that later CKKS/RNS representation
+/// step without performing encryption.
+pub fn quantize_sinc_batch_plaintext(
+    plaintext: &SinCBatchPlaintext,
+    basis: &crate::ring::ModulusBasis,
+    scale: f64,
+) -> Vec<crate::ring::RnsPolynomial> {
+    plaintext
+        .columns()
+        .iter()
+        .map(|coefficients| quantize_real_coefficients(coefficients, basis, scale))
+        .collect()
+}
+
+/// Encodes one physical batch of real square matrices as the scalar-ring
+/// plaintext representation required by Batch CPMM.
+///
+/// `matrices` is batch-major. Its batch count must equal `scalar_degree / 2`.
+/// Values occupying the same matrix coordinate across physical lanes are
+/// placed into canonical CKKS slots using the authors' bit-reversed lane
+/// ordering, transformed to coefficients, and quantized into the supplied RNS
+/// basis.
+///
+/// This function performs no encryption and no Batch CPMM execution.
+pub fn encode_cpmm_real_batch(
+    matrices: &[Vec<Vec<f64>>],
+    scalar_degree: usize,
+    basis: &crate::ring::ModulusBasis,
+    scale: f64,
+) -> Vec<Vec<crate::ring::RnsPolynomial>> {
+    assert!(
+        !matrices.is_empty(),
+        "Batch CPMM real batch must not be empty"
+    );
+    assert!(
+        scalar_degree > 0 && scalar_degree % 2 == 0,
+        "Batch CPMM scalar degree must be positive and even"
+    );
+
+    let batch_count = matrices.len();
+    let dimension = matrices[0].len();
+
+    assert!(
+        dimension > 0,
+        "Batch CPMM matrix dimension must be positive"
+    );
+    assert_eq!(
+        batch_count,
+        scalar_degree / 2,
+        "Batch CPMM real batch count must equal the CKKS slot count"
+    );
+    assert!(
+        batch_count.is_power_of_two(),
+        "Batch CPMM real batch count must be a power of two"
+    );
+    assert!(
+        matrices.iter().all(|matrix| {
+            matrix.len() == dimension && matrix.iter().all(|row| row.len() == dimension)
+        }),
+        "Batch CPMM real matrices must have one common square dimension"
+    );
+
+    let embedding = crate::ckks::CkksCanonicalEmbedding::new(scalar_degree);
+    let log_slots = batch_count.trailing_zeros();
+
+    (0..dimension)
+        .map(|row| {
+            (0..dimension)
+                .map(|col| {
+                    let mut slots = vec![num_complex::Complex64::new(0.0, 0.0); batch_count];
+
+                    for (slot, value) in slots.iter_mut().enumerate() {
+                        let source_batch = bit_reverse_index(slot, log_slots);
+                        *value = num_complex::Complex64::new(matrices[source_batch][row][col], 0.0);
+                    }
+
+                    let coefficients = embedding.slots_to_coefficients(&slots);
+                    quantize_real_coefficients(&coefficients, basis, scale)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Decrypts Batch CPMM large-ring output columns back into structural SinC
+/// coefficient form.
+///
+/// This is the inverse cryptographic representation boundary used after Batch
+/// CPMM execution. SinC slot decoding remains a separate structural step.
+pub fn decode_cpmm_large_columns(
+    ciphertexts: &[crate::ckks::RnsCkksCiphertext],
+    secret: &[i8],
+    scalar_degree: usize,
+    half_rows: usize,
+) -> SinCBatchPlaintext {
+    use num_traits::ToPrimitive;
+
+    assert!(
+        scalar_degree > 0,
+        "Batch CPMM scalar degree must be positive"
+    );
+    assert!(half_rows > 0, "Batch CPMM half-row count must be positive");
+    assert!(
+        !ciphertexts.is_empty(),
+        "Batch CPMM output must contain at least one ciphertext column"
+    );
+
+    let large_degree = scalar_degree
+        .checked_mul(half_rows)
+        .expect("Batch CPMM decoded large-ring degree overflow");
+
+    assert_eq!(
+        secret.len(),
+        large_degree,
+        "Batch CPMM decoding secret degree must match the large ring"
+    );
+
+    let mut columns = Vec::with_capacity(ciphertexts.len());
+
+    for ciphertext in ciphertexts {
+        assert_eq!(
+            ciphertext.rlwe().degree(),
+            large_degree,
+            "Batch CPMM output ciphertext degree must match the SinC geometry"
+        );
+
+        let plan = crate::ring::RnsNttPlan::new(
+            ciphertext.basis().moduli().to_vec(),
+            ciphertext.rlwe().degree(),
+        );
+
+        let plaintext = crate::grafting::decrypt_rns_raw_with_ntt(ciphertext.rlwe(), secret, &plan);
+
+        let modulus = crate::ring::composite_modulus_big(plaintext.basis());
+
+        let coefficients = crate::ring::reconstruct_coefficients_big(&plaintext)
+            .iter()
+            .map(|value| {
+                crate::ring::centered_representative_big(value, &modulus)
+                    .to_f64()
+                    .expect("decoded CKKS coefficient must fit f64")
+                    / ciphertext.scale()
+            })
+            .collect();
+
+        columns.push(coefficients);
+    }
+
+    SinCBatchPlaintext {
+        scalar_degree,
+        dimension: half_rows,
+        columns,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use num_complex::Complex64;
@@ -2940,27 +3135,7 @@ mod sinc_tests {
         basis: &crate::ring::ModulusBasis,
         scale: f64,
     ) -> crate::ring::RnsPolynomial {
-        let residues = basis
-            .moduli()
-            .iter()
-            .copied()
-            .map(|modulus| {
-                let q = i128::from(modulus.value());
-
-                crate::ring::Polynomial::new(
-                    modulus,
-                    coefficients
-                        .iter()
-                        .map(|&value| {
-                            let signed = (value * scale).round() as i128;
-                            signed.rem_euclid(q) as u64
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-
-        crate::ring::RnsPolynomial::from_residues(residues)
+        super::quantize_real_coefficients(coefficients, basis, scale)
     }
 
     fn encode_packed_real_matrix(
@@ -2969,34 +3144,7 @@ mod sinc_tests {
         basis: &crate::ring::ModulusBasis,
         scale: f64,
     ) -> Vec<Vec<crate::ring::RnsPolynomial>> {
-        let batch_count = matrices.len();
-        let dimension = matrices[0].len();
-
-        assert_eq!(batch_count, scalar_degree / 2);
-
-        let embedding = crate::ckks::CkksCanonicalEmbedding::new(scalar_degree);
-        let log_slots = batch_count.trailing_zeros();
-
-        (0..dimension)
-            .map(|row| {
-                (0..dimension)
-                    .map(|col| {
-                        let mut slots = vec![num_complex::Complex64::new(0.0, 0.0); batch_count];
-
-                        for (slot, value) in slots.iter_mut().enumerate() {
-                            let source_batch = super::bit_reverse_index(slot, log_slots);
-
-                            *value =
-                                num_complex::Complex64::new(matrices[source_batch][row][col], 0.0);
-                        }
-
-                        let coefficients = embedding.slots_to_coefficients(&slots);
-
-                        quantize_coefficients(&coefficients, basis, scale)
-                    })
-                    .collect()
-            })
-            .collect()
+        super::encode_cpmm_real_batch(matrices, scalar_degree, basis, scale)
     }
 
     fn raw_cp_product(
@@ -5427,39 +5575,7 @@ mod sinc_tests {
         scalar_degree: usize,
         half_rows: usize,
     ) -> super::SinCBatchPlaintext {
-        use num_traits::ToPrimitive;
-
-        let mut columns = Vec::with_capacity(ciphertexts.len());
-
-        for ciphertext in ciphertexts {
-            let plan = crate::ring::RnsNttPlan::new(
-                ciphertext.basis().moduli().to_vec(),
-                ciphertext.rlwe().degree(),
-            );
-
-            let plaintext =
-                crate::grafting::decrypt_rns_raw_with_ntt(ciphertext.rlwe(), secret, &plan);
-
-            let modulus = crate::ring::composite_modulus_big(plaintext.basis());
-
-            let coefficients = crate::ring::reconstruct_coefficients_big(&plaintext)
-                .iter()
-                .map(|value| {
-                    crate::ring::centered_representative_big(value, &modulus)
-                        .to_f64()
-                        .expect("decoded CKKS coefficient must fit f64")
-                        / ciphertext.scale()
-                })
-                .collect();
-
-            columns.push(coefficients);
-        }
-
-        super::SinCBatchPlaintext {
-            scalar_degree,
-            dimension: half_rows,
-            columns,
-        }
+        super::decode_cpmm_large_columns(ciphertexts, secret, scalar_degree, half_rows)
     }
 
     fn cpmm_batch_capability(dimension: usize, scalar_degree: usize) -> f64 {
