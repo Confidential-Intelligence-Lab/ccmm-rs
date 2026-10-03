@@ -13,8 +13,9 @@
 //! Unlike convolution, correlation does not reverse the kernel.
 
 use crate::eblas::{
-    gemm_cp_decomposed, gemm_pp, BatchGemmGeometry, DecomposedCpmmExecutionContext, GemmShape,
-    GemmSpec, MatrixShape, PrivacyMode,
+    gemm_cc_decomposed, gemm_cp_decomposed, gemm_pp, BatchGemmGeometry,
+    DecomposedCcmmExecutionContext, DecomposedCpmmExecutionContext, GemmShape, GemmSpec,
+    MatrixShape, PrivacyMode,
 };
 use crate::matrix::BatchMatrix;
 
@@ -145,6 +146,25 @@ pub fn correlate_1d_cp(
     gemm_cp_decomposed(gemm_shape, geometry, &windows, kernel, context)
 }
 
+/// Computes valid one-dimensional ciphertext/ciphertext correlation through
+/// decomposed Batch CCMM.
+///
+/// Correlation semantics and sliding-window lowering are identical to PP and
+/// CP execution. Both lowered operands cross the encrypted representation
+/// boundary; decomposition, SinC scheduling, CCMM execution, and logical
+/// reconstruction remain owned by the decomposed GEMM substrate.
+pub fn correlate_1d_cc(
+    shape: Correlation1dShape,
+    geometry: BatchGemmGeometry,
+    signal: &BatchMatrix<f64>,
+    kernel: &BatchMatrix<f64>,
+    context: &DecomposedCcmmExecutionContext<'_>,
+) -> BatchMatrix<f64> {
+    let (gemm_shape, windows) = correlation_1d_gemm_operand(shape, signal, kernel);
+
+    gemm_cc_decomposed(gemm_shape, geometry, &windows, kernel, context)
+}
+
 /// Computes valid one-dimensional plaintext/plaintext correlation.
 ///
 /// `signal` and `kernel` use column-vector representations with shapes
@@ -246,7 +266,12 @@ mod tests {
         BatchMatrix::from_vec_column_major(length, 1, 1, values)
     }
 
-    fn assert_close(actual: &BatchMatrix<f64>, expected: &BatchMatrix<f64>, tolerance: f64) {
+    fn assert_close(
+        actual: &BatchMatrix<f64>,
+        expected: &BatchMatrix<f64>,
+        tolerance: f64,
+        metric_prefix: &str,
+    ) {
         assert_eq!(actual.rows(), expected.rows());
         assert_eq!(actual.cols(), expected.cols());
         assert_eq!(actual.batches(), expected.batches());
@@ -271,7 +296,7 @@ mod tests {
             squared_error.sqrt()
         };
 
-        println!("CORRELATION_CP_REL_L2={rel_l2:.12e} CORRELATION_CP_MAX_ABS={max_abs:.12e}");
+        println!("CORRELATION_{metric_prefix}_REL_L2={rel_l2:.12e} CORRELATION_{metric_prefix}_MAX_ABS={max_abs:.12e}");
 
         assert!(
             rel_l2 <= tolerance,
@@ -341,7 +366,7 @@ mod tests {
             shape.output_length()
         );
 
-        assert_close(&actual, &expected, 1.0e-3);
+        assert_close(&actual, &expected, 1.0e-3, "CP");
     }
 
     #[test]
@@ -375,5 +400,157 @@ mod tests {
         // same output tile, directly exercising encrypted reduction
         // accumulation for the correlation semantic operation.
         run_cp_case(130, 67, 3, 13, 0x5238_1003);
+    }
+
+    const CCMM_DIMENSION: usize = 64;
+    const CCMM_SCALAR_DEGREE: usize = 128;
+    const CCMM_LARGE_DEGREE: usize = 8192;
+
+    fn ccmm_moduli() -> Vec<crate::ring::Modulus> {
+        vec![
+            crate::ring::Modulus::new(68_712_923_137),
+            crate::ring::Modulus::new(268_238_849),
+        ]
+    }
+
+    fn ccmm_scale() -> f64 {
+        2.0_f64.powf(27.993302092216055)
+    }
+
+    fn run_cc_case(
+        signal_length: usize,
+        kernel_length: usize,
+        signal_salt: usize,
+        kernel_salt: usize,
+        seed: u64,
+    ) {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let shape = Correlation1dShape::new(signal_length, kernel_length);
+        let signal = deterministic_column(signal_length, signal_salt);
+        let kernel = deterministic_column(kernel_length, kernel_salt);
+
+        let expected = correlate_1d_pp(shape, &signal, &kernel);
+
+        let basis = crate::ring::ModulusBasis::new(ccmm_moduli());
+        let chain = crate::ring::ModulusChain::from_top_basis(basis.clone());
+
+        let large_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), CCMM_LARGE_DEGREE);
+        let prepared_large_plan = crate::ring::PreparedRnsNttPlan::new(&large_plan);
+
+        let scalar_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), CCMM_SCALAR_DEGREE);
+        let prepared_scalar_plan = crate::ring::PreparedRnsNttPlan::new(&scalar_plan);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x4343_434f_5252_0000 ^ seed);
+
+        let mut secret: Vec<i8> = (0..CCMM_LARGE_DEGREE)
+            .map(|_| secret_rng.gen_range(-1_i8..=1_i8))
+            .collect();
+
+        if secret.iter().all(|&value| value == 0) {
+            secret[0] = 1;
+        }
+
+        let galois_layout = crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
+
+        let galois_keys: Vec<crate::ckks::RnsGaloisKey> = (1..CCMM_DIMENSION)
+            .map(|index| 2 * CCMM_SCALAR_DEGREE * index + 1)
+            .map(|exponent| {
+                let mut rng =
+                    ChaCha20Rng::seed_from_u64(0x434d_5400_0000_0000 ^ exponent as u64 ^ seed);
+
+                crate::ckks::RnsGaloisKey::generate_with_ntt_rng(
+                    crate::grafting::RnsKeygenConfig {
+                        degree: CCMM_LARGE_DEGREE,
+                        plaintext_modulus: 2,
+                        noise_bound: 0,
+                        layout: galois_layout.clone(),
+                        plan: &large_plan,
+                    },
+                    &secret,
+                    exponent,
+                    &mut rng,
+                )
+            })
+            .collect();
+
+        let prepared_galois_keys: Vec<crate::ckks::PreparedRnsGaloisKey> = galois_keys
+            .iter()
+            .map(|key| crate::ckks::PreparedRnsGaloisKey::new(key, &large_plan))
+            .collect();
+
+        let multiplication_layout =
+            crate::grafting::RnsGadgetLayout::new(basis.clone(), vec![1, 1]);
+
+        let mut multiplication_key_rng = ChaCha20Rng::seed_from_u64(0x4343_4d4d_434f_5200 ^ seed);
+
+        let multiplication_key = crate::grafting::RnsMultiplicationKey::generate_with_ntt_rng(
+            crate::grafting::RnsKeygenConfig {
+                degree: CCMM_LARGE_DEGREE,
+                plaintext_modulus: 2,
+                noise_bound: 0,
+                layout: multiplication_layout,
+                plan: &large_plan,
+            },
+            &secret,
+            &mut multiplication_key_rng,
+        );
+
+        let prepared_multiplication_key =
+            crate::grafting::PreparedRnsMultiplicationKey::new(&multiplication_key, &large_plan);
+
+        let execution = crate::ccmm::batch::BatchCcmmExecutionContext {
+            scalar_plan: &scalar_plan,
+            prepared_scalar_plan: &prepared_scalar_plan,
+            prepared_large_plan: &prepared_large_plan,
+            prepared_galois_keys: &prepared_galois_keys,
+            prepared_multiplication_key: &prepared_multiplication_key,
+            chain: &chain,
+            scale: ccmm_scale(),
+        };
+
+        let context = DecomposedCcmmExecutionContext {
+            basis: &basis,
+            large_plan: &large_plan,
+            secret: &secret,
+            execution: &execution,
+            encryption_seed: 0x4343_454e_4352_5950 ^ seed,
+        };
+
+        let geometry = BatchGemmGeometry::new(
+            crate::eblas::BatchGemmMechanism::Ccmm,
+            CCMM_DIMENSION,
+            CCMM_SCALAR_DEGREE,
+            CCMM_LARGE_DEGREE,
+        );
+
+        let actual = correlate_1d_cc(shape, geometry, &signal, &kernel, &context);
+
+        println!(
+            "CORRELATION_CC_CASE=N{} K{} OUT{}",
+            signal_length,
+            kernel_length,
+            shape.output_length()
+        );
+
+        assert_close(&actual, &expected, 1.0e-3, "CC");
+    }
+
+    #[test]
+    fn cc_small_semantic_case_matches_pp() {
+        run_cc_case(8, 3, 21, 31, 0x5238_2001);
+    }
+
+    #[test]
+    fn cc_output_boundary_decomposition_matches_pp() {
+        // 66 x 5 * 5 x 1: two native output-row products at d=64.
+        run_cc_case(70, 5, 22, 32, 0x5238_2002);
+    }
+
+    #[test]
+    fn cc_reduction_decomposition_matches_pp() {
+        // 64 x 67 * 67 x 1: two K products accumulated into one output tile.
+        run_cc_case(130, 67, 23, 33, 0x5238_2003);
     }
 }
