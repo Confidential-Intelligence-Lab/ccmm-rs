@@ -1,7 +1,10 @@
 use rand::{CryptoRng, Rng, RngCore};
 
 use crate::grafting::RnsGadgetLayout;
-use crate::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
+use crate::ring::{
+    ModulusBasis, NttPolynomial, Polynomial, PreparedRnsNttPlan, RnsNttPlan, RnsNttPolynomial,
+    RnsPolynomial,
+};
 use crate::rlwe::{
     decrypt_raw_with_ntt, encrypt_raw_with_ntt_rng, encrypt_raw_with_rng, project_error,
     sample_error_coefficients, ErrorDistribution, RlweCiphertext, RlweParameters,
@@ -51,6 +54,123 @@ impl RnsRlweCiphertext {
 
     pub fn degree(&self) -> usize {
         self.limbs[0].b().degree()
+    }
+}
+
+/// An RNS RLWE ciphertext whose two polynomial components remain in the
+/// NTT domain across the complete RNS basis.
+///
+/// This representation is intended for evaluation pipelines that can consume
+/// key-switch output without immediately returning to coefficient form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RnsNttRlweCiphertext {
+    b: RnsNttPolynomial,
+    a: RnsNttPolynomial,
+}
+
+impl RnsNttRlweCiphertext {
+    pub fn new(b: RnsNttPolynomial, a: RnsNttPolynomial) -> Self {
+        assert_eq!(
+            b.degree(),
+            a.degree(),
+            "RNS NTT RLWE components must have the same degree"
+        );
+        assert_eq!(
+            b.moduli(),
+            a.moduli(),
+            "RNS NTT RLWE components must have the same basis"
+        );
+
+        Self { b, a }
+    }
+
+    pub fn b(&self) -> &RnsNttPolynomial {
+        &self.b
+    }
+
+    pub fn a(&self) -> &RnsNttPolynomial {
+        &self.a
+    }
+
+    pub fn degree(&self) -> usize {
+        self.b.degree()
+    }
+
+    pub fn moduli(&self) -> &[crate::ring::Modulus] {
+        self.b.moduli()
+    }
+
+    pub fn from_coefficient(ciphertext: &RnsRlweCiphertext, plan: &PreparedRnsNttPlan) -> Self {
+        assert_eq!(
+            ciphertext.degree(),
+            plan.degree(),
+            "RNS RLWE ciphertext degree must match prepared RNS NTT plan"
+        );
+        assert_eq!(
+            ciphertext.basis().moduli(),
+            plan.moduli(),
+            "RNS RLWE ciphertext basis must match prepared RNS NTT plan"
+        );
+
+        let b = RnsPolynomial::from_residues(
+            ciphertext
+                .limbs()
+                .iter()
+                .map(|limb| limb.b().clone())
+                .collect(),
+        );
+
+        let a = RnsPolynomial::from_residues(
+            ciphertext
+                .limbs()
+                .iter()
+                .map(|limb| limb.a().clone())
+                .collect(),
+        );
+
+        Self::new(plan.forward(&b), plan.forward(&a))
+    }
+
+    pub fn to_coefficient(&self, plan: &PreparedRnsNttPlan) -> RnsRlweCiphertext {
+        assert_eq!(
+            self.degree(),
+            plan.degree(),
+            "RNS NTT RLWE ciphertext degree must match prepared RNS NTT plan"
+        );
+        assert_eq!(
+            self.moduli(),
+            plan.moduli(),
+            "RNS NTT RLWE ciphertext basis must match prepared RNS NTT plan"
+        );
+
+        let b = plan.inverse(&self.b);
+        let a = plan.inverse(&self.a);
+
+        RnsRlweCiphertext::from_limbs(
+            b.residues()
+                .iter()
+                .zip(a.residues())
+                .map(|(b_limb, a_limb)| RlweCiphertext::new(b_limb.clone(), a_limb.clone()))
+                .collect(),
+        )
+    }
+
+    /// Adds two RNS NTT-domain RLWE ciphertexts componentwise.
+    pub fn add(&self, rhs: &Self) -> Self {
+        Self::new(self.b.add(&rhs.b), self.a.add(&rhs.a))
+    }
+
+    /// Subtracts two RNS NTT-domain RLWE ciphertexts componentwise.
+    pub fn sub(&self, rhs: &Self) -> Self {
+        Self::new(self.b.sub(&rhs.b), self.a.sub(&rhs.a))
+    }
+
+    /// Multiplies both ciphertext components by X^exponent in the NTT domain.
+    pub fn mul_monomial_signed(&self, plan: &RnsNttPlan, exponent: i64) -> Self {
+        Self::new(
+            self.b.mul_monomial_signed(plan, exponent),
+            self.a.mul_monomial_signed(plan, exponent),
+        )
     }
 }
 
@@ -1105,6 +1225,309 @@ pub fn rns_relinearize_with_ntt(
     RnsRlweCiphertext::from_limbs(output_limbs)
 }
 
+/// One multiplication-key RLWE ciphertext prepared in the NTT domain.
+///
+/// The outer representation is block-major and each block contains one
+/// `(b, a)` pair per RNS limb. This is an execution representation derived
+/// from a canonical [`RnsMultiplicationKey`]; it does not replace or modify
+/// the canonical coefficient-domain key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRnsMultiplicationKeyEntry {
+    limbs: Vec<(crate::ring::NttPolynomial, crate::ring::NttPolynomial)>,
+}
+
+impl PreparedRnsMultiplicationKeyEntry {
+    pub fn limb(&self, index: usize) -> &(crate::ring::NttPolynomial, crate::ring::NttPolynomial) {
+        &self.limbs[index]
+    }
+}
+
+/// NTT-prepared execution representation of an [`RnsMultiplicationKey`].
+///
+/// Preparing the key moves transforms of the static evaluation-key
+/// polynomials out of the online relinearization path. Gadget digits remain
+/// ciphertext-dependent and are therefore transformed during evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRnsMultiplicationKey {
+    layout: RnsGadgetLayout,
+    degree: usize,
+    entries: Vec<PreparedRnsMultiplicationKeyEntry>,
+}
+
+impl PreparedRnsMultiplicationKey {
+    pub fn new(multiplication_key: &RnsMultiplicationKey, plan: &RnsNttPlan) -> Self {
+        let layout = multiplication_key.layout().clone();
+
+        assert_eq!(
+            plan.moduli(),
+            layout.full_basis().moduli(),
+            "RNS NTT plan basis must match multiplication-key basis"
+        );
+
+        assert!(
+            !multiplication_key.entries().is_empty(),
+            "prepared RNS multiplication key requires at least one gadget block"
+        );
+
+        let degree = multiplication_key.entry(0).degree();
+
+        assert_eq!(
+            plan.degree(),
+            degree,
+            "RNS NTT plan degree must match multiplication-key degree"
+        );
+
+        let entries = multiplication_key
+            .entries()
+            .iter()
+            .map(|entry| {
+                assert_eq!(
+                    entry.basis(),
+                    layout.full_basis(),
+                    "RNS multiplication-key entry basis must match multiplication-key layout"
+                );
+                assert_eq!(
+                    entry.degree(),
+                    degree,
+                    "RNS multiplication-key entries must have the same degree"
+                );
+
+                let limbs = entry
+                    .limbs()
+                    .iter()
+                    .enumerate()
+                    .map(|(limb_index, limb)| {
+                        let limb_plan = plan.plan(limb_index);
+                        (
+                            crate::ring::NttPolynomial::from_polynomial(limb_plan, limb.b()),
+                            crate::ring::NttPolynomial::from_polynomial(limb_plan, limb.a()),
+                        )
+                    })
+                    .collect();
+
+                PreparedRnsMultiplicationKeyEntry { limbs }
+            })
+            .collect();
+
+        Self {
+            layout,
+            degree,
+            entries,
+        }
+    }
+
+    pub fn layout(&self) -> &RnsGadgetLayout {
+        &self.layout
+    }
+
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+
+    pub fn entries(&self) -> &[PreparedRnsMultiplicationKeyEntry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, index: usize) -> &PreparedRnsMultiplicationKeyEntry {
+        &self.entries[index]
+    }
+}
+
+/// Relinearizes a degree-2 RNS ciphertext using a pre-transformed
+/// multiplication key.
+///
+/// This has the same semantics as [`rns_relinearize_with_ntt`], but transforms
+/// of the static multiplication-key polynomials are performed once by
+/// [`PreparedRnsMultiplicationKey::new`]. Accumulation remains in the NTT
+/// domain until one final inverse transform per output component and limb.
+pub fn rns_relinearize_with_prepared_ntt(
+    product: &RnsQuadraticCiphertext,
+    prepared_key: &PreparedRnsMultiplicationKey,
+    plan: &RnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        product.c0().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+    assert_eq!(
+        product.c1().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+    assert_eq!(
+        product.c2().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "RNS NTT plan basis must match prepared multiplication-key basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        product.c0().degree(),
+        "RNS NTT plan degree must match quadratic ciphertext degree"
+    );
+    assert_eq!(
+        prepared_key.degree(),
+        product.c0().degree(),
+        "prepared RNS multiplication-key degree must match ciphertext degree"
+    );
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS multiplication-key entry count must match gadget block count"
+    );
+
+    let decomposition = layout.decompose(product.c2());
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b_ntt = crate::ring::NttPolynomial::from_polynomial(
+            limb_plan,
+            product.c0().residue(limb_index),
+        );
+        let mut a_ntt = crate::ring::NttPolynomial::from_polynomial(
+            limb_plan,
+            product.c1().residue(limb_index),
+        );
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let digit_ntt = crate::ring::NttPolynomial::from_polynomial(limb_plan, &digit);
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            b_ntt = b_ntt.add(&digit_ntt.pointwise_mul(key_b_ntt));
+            a_ntt = a_ntt.add(&digit_ntt.pointwise_mul(key_a_ntt));
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            b_ntt.to_polynomial(limb_plan),
+            a_ntt.to_polynomial(limb_plan),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// Relinearizes an RNS quadratic ciphertext using a prepared evaluation key
+/// and prepared dynamic NTT execution schedules.
+///
+/// This is mathematically identical to `rns_relinearize_with_prepared_ntt`;
+/// only the ciphertext-dependent forward/inverse transforms use
+/// `PreparedRnsNttPlan`.
+pub fn rns_relinearize_with_prepared_dynamic_ntt(
+    product: &RnsQuadraticCiphertext,
+    prepared_key: &PreparedRnsMultiplicationKey,
+    plan: &PreparedRnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        product.c0().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+
+    assert_eq!(
+        product.c1().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+
+    assert_eq!(
+        product.c2().basis(),
+        layout.full_basis(),
+        "quadratic ciphertext basis must match prepared multiplication key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "prepared RNS NTT plan basis must match prepared multiplication-key basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        product.c0().degree(),
+        "prepared RNS NTT plan degree must match quadratic ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.degree(),
+        product.c0().degree(),
+        "prepared RNS multiplication-key degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS multiplication-key entry count must match gadget block count"
+    );
+
+    let decomposition = layout.decompose(product.c2());
+
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b_ntt = NttPolynomial::from_prepared_values(
+            limb_plan,
+            limb_plan.forward(product.c0().residue(limb_index)),
+        );
+
+        let mut a_ntt = NttPolynomial::from_prepared_values(
+            limb_plan,
+            limb_plan.forward(product.c1().residue(limb_index)),
+        );
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let digit_ntt =
+                NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&digit));
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            limb_plan.inverse(b_ntt.values()),
+            limb_plan.inverse(a_ntt.values()),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
 /// Switches an RNS RLWE ciphertext from the source secret encoded by
 /// `key_switch_key` to its target secret.
 ///
@@ -1168,10 +1591,644 @@ pub fn rns_key_switch(
     RnsRlweCiphertext::from_limbs(output_limbs)
 }
 
-/// NTT-backed generic RNS key switching.
+/// One evaluation-key RLWE ciphertext prepared in the NTT domain.
 ///
-/// Semantics are identical to `rns_key_switch`; gadget-digit products use
-/// the corresponding per-limb negacyclic NTT plan.
+/// The outer key representation is block-major and each block contains one
+/// `(b, a)` pair per RNS limb. This is an execution representation derived
+/// from a canonical [`RnsKeySwitchKey`]; it does not replace or modify the
+/// canonical coefficient-domain key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRnsKeySwitchEntry {
+    limbs: Vec<(crate::ring::NttPolynomial, crate::ring::NttPolynomial)>,
+}
+
+impl PreparedRnsKeySwitchEntry {
+    pub fn limb(&self, index: usize) -> &(crate::ring::NttPolynomial, crate::ring::NttPolynomial) {
+        &self.limbs[index]
+    }
+}
+
+/// NTT-prepared execution representation of an [`RnsKeySwitchKey`].
+///
+/// Preparing the key moves transforms of the static evaluation-key
+/// polynomials out of the online key-switch path. Gadget digits remain
+/// ciphertext-dependent and are therefore transformed during evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRnsKeySwitchKey {
+    layout: RnsGadgetLayout,
+    degree: usize,
+    entries: Vec<PreparedRnsKeySwitchEntry>,
+}
+
+impl PreparedRnsKeySwitchKey {
+    pub fn new(key_switch_key: &RnsKeySwitchKey, plan: &RnsNttPlan) -> Self {
+        let layout = key_switch_key.layout().clone();
+
+        assert_eq!(
+            plan.moduli(),
+            layout.full_basis().moduli(),
+            "RNS NTT plan basis must match key-switch basis"
+        );
+
+        assert!(
+            !key_switch_key.entries().is_empty(),
+            "prepared RNS key-switch key requires at least one gadget block"
+        );
+
+        let degree = key_switch_key.entry(0).degree();
+
+        assert_eq!(
+            plan.degree(),
+            degree,
+            "RNS NTT plan degree must match key-switch degree"
+        );
+
+        let entries = key_switch_key
+            .entries()
+            .iter()
+            .map(|entry| {
+                assert_eq!(
+                    entry.basis(),
+                    layout.full_basis(),
+                    "RNS key-switch entry basis must match key-switch layout"
+                );
+                assert_eq!(
+                    entry.degree(),
+                    degree,
+                    "RNS key-switch entries must have the same degree"
+                );
+
+                let limbs = entry
+                    .limbs()
+                    .iter()
+                    .enumerate()
+                    .map(|(limb_index, limb)| {
+                        let limb_plan = plan.plan(limb_index);
+                        (
+                            crate::ring::NttPolynomial::from_polynomial(limb_plan, limb.b()),
+                            crate::ring::NttPolynomial::from_polynomial(limb_plan, limb.a()),
+                        )
+                    })
+                    .collect();
+
+                PreparedRnsKeySwitchEntry { limbs }
+            })
+            .collect();
+
+        Self {
+            layout,
+            degree,
+            entries,
+        }
+    }
+
+    pub fn layout(&self) -> &RnsGadgetLayout {
+        &self.layout
+    }
+
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+
+    pub fn entries(&self) -> &[PreparedRnsKeySwitchEntry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, index: usize) -> &PreparedRnsKeySwitchEntry {
+        &self.entries[index]
+    }
+}
+
+/// Generic RNS key switching using a pre-transformed evaluation key.
+///
+/// This has the same semantics as [`rns_key_switch_with_ntt`], but the
+/// coefficient-to-NTT transforms of the static evaluation-key polynomials
+/// are performed once by [`PreparedRnsKeySwitchKey::new`] rather than on
+/// every key-switch invocation.
+pub fn rns_key_switch_with_prepared_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &RnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match prepared key-switch layout"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "RNS NTT plan basis must match prepared key-switch basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.degree(),
+        ciphertext.degree(),
+        "prepared RNS key-switch degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS key-switch entry count must match gadget block count"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decomposition = layout.decompose(&a);
+
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b_ntt =
+            crate::ring::NttPolynomial::from_polynomial(limb_plan, ciphertext.limb(limb_index).b());
+
+        // O12e.2: zero is already zero in the NTT domain.
+        let mut a_ntt = crate::ring::NttPolynomial::zero(limb_plan);
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let digit_ntt = crate::ring::NttPolynomial::from_polynomial(limb_plan, &digit);
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            b_ntt.to_polynomial(limb_plan),
+            a_ntt.to_polynomial(limb_plan),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+pub fn rns_key_switch_with_prepared_dynamic_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &PreparedRnsNttPlan,
+) -> RnsRlweCiphertext {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match prepared key-switch layout"
+    );
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "prepared RNS NTT plan basis must match prepared key-switch basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "prepared RNS NTT plan degree must match ciphertext degree"
+    );
+    assert_eq!(
+        prepared_key.degree(),
+        ciphertext.degree(),
+        "prepared RNS key-switch degree must match ciphertext degree"
+    );
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS key-switch entry count must match gadget block count"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decomposition = layout.decompose(&a);
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b_ntt = NttPolynomial::from_prepared_values(
+            limb_plan,
+            limb_plan.forward(ciphertext.limb(limb_index).b()),
+        );
+
+        let zero = Polynomial::zero(modulus, ciphertext.degree());
+        let mut a_ntt = NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&zero));
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let digit_ntt =
+                NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&digit));
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            limb_plan.inverse(b_ntt.values()),
+            limb_plan.inverse(a_ntt.values()),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// Profiling variant of `rns_key_switch_with_prepared_dynamic_ntt`.
+///
+/// Arithmetic and output are identical to the prepared-dynamic path;
+/// only phase timings are returned.
+/// Applies an RNS key switch using prepared dynamic NTT execution while
+/// retaining the resulting RLWE ciphertext in the NTT domain.
+///
+/// Unlike the coefficient-domain prepared-dynamic path, this function does
+/// not perform the final inverse transforms. This permits downstream
+/// evaluation stages to consume the key-switch result without introducing
+/// an unnecessary NTT-to-coefficient representation boundary.
+pub fn rns_key_switch_with_prepared_dynamic_ntt_resident(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &PreparedRnsNttPlan,
+) -> RnsNttRlweCiphertext {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        ciphertext.degree(),
+        plan.degree(),
+        "RNS key-switch ciphertext degree must match prepared RNS NTT plan"
+    );
+
+    assert_eq!(
+        layout.full_basis().moduli(),
+        plan.moduli(),
+        "RNS key-switch basis must match prepared RNS NTT plan"
+    );
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS key-switch ciphertext basis must match prepared key basis"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decomposition = layout.decompose(&a);
+
+    let mut b_residues = Vec::with_capacity(layout.full_basis().len());
+    let mut a_residues = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+
+        let mut b_ntt = NttPolynomial::from_prepared_values(
+            limb_plan,
+            limb_plan.forward(ciphertext.limb(limb_index).b()),
+        );
+
+        // Zero has the same representation in coefficient and NTT domains.
+        let mut a_ntt =
+            NttPolynomial::from_prepared_values(limb_plan, vec![0_u64; ciphertext.degree()]);
+
+        for block_index in 0..layout.block_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            let digit_ntt =
+                NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&digit));
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+        }
+
+        b_residues.push(b_ntt);
+        a_residues.push(a_ntt);
+    }
+
+    RnsNttRlweCiphertext::new(
+        RnsNttPolynomial::from_residues(b_residues),
+        RnsNttPolynomial::from_residues(a_residues),
+    )
+}
+
+pub fn rns_key_switch_with_prepared_dynamic_ntt_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &PreparedRnsNttPlan,
+) -> (RnsRlweCiphertext, RnsPreparedKeySwitchProfile) {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match prepared key-switch layout"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "prepared RNS NTT plan basis must match prepared key-switch basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "prepared RNS NTT plan degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.degree(),
+        ciphertext.degree(),
+        "prepared RNS key-switch degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS key-switch entry count must match gadget block count"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decompose_start = std::time::Instant::now();
+
+    let decomposition = layout.decompose(&a);
+
+    let decompose_seconds = decompose_start.elapsed().as_secs_f64();
+
+    let mut profile = RnsPreparedKeySwitchProfile {
+        decompose_seconds,
+        ..Default::default()
+    };
+
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+
+        let limb_plan = plan.plan(limb_index);
+
+        let base_start = std::time::Instant::now();
+
+        let mut b_ntt = NttPolynomial::from_prepared_values(
+            limb_plan,
+            limb_plan.forward(ciphertext.limb(limb_index).b()),
+        );
+
+        // Zero is represented identically in coefficient and NTT
+        // domains. Avoid performing a transform for the additive
+        // identity.
+        let mut a_ntt =
+            NttPolynomial::from_prepared_values(limb_plan, vec![0_u64; ciphertext.degree()]);
+
+        profile.base_forward_seconds += base_start.elapsed().as_secs_f64();
+        profile.base_forward_count += 1;
+
+        for block_index in 0..layout.block_count() {
+            let prepare_start = std::time::Instant::now();
+
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            profile.digit_prepare_seconds += prepare_start.elapsed().as_secs_f64();
+
+            let forward_start = std::time::Instant::now();
+
+            let digit_ntt =
+                NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&digit));
+
+            profile.digit_forward_seconds += forward_start.elapsed().as_secs_f64();
+            profile.digit_forward_count += 1;
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            let mac_start = std::time::Instant::now();
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+
+            profile.mac_seconds += mac_start.elapsed().as_secs_f64();
+        }
+
+        let inverse_start = std::time::Instant::now();
+
+        let b = limb_plan.inverse(b_ntt.values());
+
+        let a = limb_plan.inverse(a_ntt.values());
+
+        profile.inverse_seconds += inverse_start.elapsed().as_secs_f64();
+        profile.inverse_count += 2;
+
+        output_limbs.push(RlweCiphertext::new(b, a));
+    }
+
+    (RnsRlweCiphertext::from_limbs(output_limbs), profile)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RnsPreparedKeySwitchProfile {
+    pub decompose_seconds: f64,
+    pub base_forward_seconds: f64,
+    pub digit_prepare_seconds: f64,
+    pub digit_forward_seconds: f64,
+    pub mac_seconds: f64,
+    pub inverse_seconds: f64,
+    pub base_forward_count: usize,
+    pub digit_forward_count: usize,
+    pub inverse_count: usize,
+}
+
+/// Profiling variant of `rns_key_switch_with_prepared_ntt`.
+///
+/// Arithmetic and output are identical; only phase timings are returned.
+pub fn rns_key_switch_with_prepared_ntt_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &RnsNttPlan,
+) -> (RnsRlweCiphertext, RnsPreparedKeySwitchProfile) {
+    let layout = prepared_key.layout();
+
+    assert_eq!(
+        ciphertext.basis(),
+        layout.full_basis(),
+        "RNS ciphertext basis must match prepared key-switch layout"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        layout.full_basis().moduli(),
+        "RNS NTT plan basis must match prepared key-switch basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.degree(),
+        ciphertext.degree(),
+        "prepared RNS key-switch degree must match ciphertext degree"
+    );
+
+    assert_eq!(
+        prepared_key.entries().len(),
+        layout.block_count(),
+        "prepared RNS key-switch entry count must match gadget block count"
+    );
+
+    let a = RnsPolynomial::from_residues(
+        ciphertext
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let decompose_start = std::time::Instant::now();
+
+    let decomposition = layout.decompose(&a);
+
+    let decompose_seconds = decompose_start.elapsed().as_secs_f64();
+
+    let mut profile = RnsPreparedKeySwitchProfile {
+        decompose_seconds,
+        ..Default::default()
+    };
+
+    let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
+
+    for limb_index in 0..layout.full_basis().len() {
+        let modulus = layout.full_basis().modulus(limb_index);
+
+        let limb_plan = plan.plan(limb_index);
+
+        let base_start = std::time::Instant::now();
+
+        let mut b_ntt =
+            crate::ring::NttPolynomial::from_polynomial(limb_plan, ciphertext.limb(limb_index).b());
+
+        // O12e.2: direct NTT-domain zero initialization.
+        let mut a_ntt = crate::ring::NttPolynomial::zero(limb_plan);
+
+        profile.base_forward_seconds += base_start.elapsed().as_secs_f64();
+
+        for block_index in 0..layout.block_count() {
+            let prepare_start = std::time::Instant::now();
+
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(block_index)
+                    .iter()
+                    .map(|&value| (value % u128::from(modulus.value())) as u64)
+                    .collect(),
+            );
+
+            profile.digit_prepare_seconds += prepare_start.elapsed().as_secs_f64();
+
+            let forward_start = std::time::Instant::now();
+
+            let digit_ntt = crate::ring::NttPolynomial::from_polynomial(limb_plan, &digit);
+
+            profile.digit_forward_seconds += forward_start.elapsed().as_secs_f64();
+
+            let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
+
+            let mac_start = std::time::Instant::now();
+
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+
+            a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+
+            profile.mac_seconds += mac_start.elapsed().as_secs_f64();
+        }
+
+        let inverse_start = std::time::Instant::now();
+
+        output_limbs.push(RlweCiphertext::new(
+            b_ntt.to_polynomial(limb_plan),
+            a_ntt.to_polynomial(limb_plan),
+        ));
+
+        profile.inverse_seconds += inverse_start.elapsed().as_secs_f64();
+    }
+
+    (RnsRlweCiphertext::from_limbs(output_limbs), profile)
+}
+
 pub fn rns_key_switch_with_ntt(
     ciphertext: &RnsRlweCiphertext,
     key_switch_key: &RnsKeySwitchKey,
@@ -1210,8 +2267,12 @@ pub fn rns_key_switch_with_ntt(
         let modulus = layout.full_basis().modulus(limb_index);
         let limb_plan = plan.plan(limb_index);
 
-        let mut b = ciphertext.limb(limb_index).b().clone();
-        let mut a_out = Polynomial::zero(modulus, ciphertext.degree());
+        let mut b_ntt =
+            crate::ring::NttPolynomial::from_polynomial(limb_plan, ciphertext.limb(limb_index).b());
+        let mut a_ntt = crate::ring::NttPolynomial::from_polynomial(
+            limb_plan,
+            &Polynomial::zero(modulus, ciphertext.degree()),
+        );
 
         for block_index in 0..layout.block_count() {
             let digit = Polynomial::new(
@@ -1225,11 +2286,20 @@ pub fn rns_key_switch_with_ntt(
 
             let evaluation_key = key_switch_key.entry(block_index).limb(limb_index);
 
-            b = b.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.b()));
-            a_out = a_out.add(&limb_plan.negacyclic_mul(&digit, evaluation_key.a()));
+            let digit_ntt = crate::ring::NttPolynomial::from_polynomial(limb_plan, &digit);
+            let key_b_ntt =
+                crate::ring::NttPolynomial::from_polynomial(limb_plan, evaluation_key.b());
+            let key_a_ntt =
+                crate::ring::NttPolynomial::from_polynomial(limb_plan, evaluation_key.a());
+
+            b_ntt = b_ntt.add(&digit_ntt.pointwise_mul(&key_b_ntt));
+            a_ntt = a_ntt.add(&digit_ntt.pointwise_mul(&key_a_ntt));
         }
 
-        output_limbs.push(RlweCiphertext::new(b, a_out));
+        output_limbs.push(RlweCiphertext::new(
+            b_ntt.to_polynomial(limb_plan),
+            a_ntt.to_polynomial(limb_plan),
+        ));
     }
 
     RnsRlweCiphertext::from_limbs(output_limbs)
@@ -1622,6 +2692,7 @@ mod tests {
         let basis = basis();
         let degree = 8;
         let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
 
         let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
         let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
@@ -1629,6 +2700,7 @@ mod tests {
         let mut key_rng = ChaCha20Rng::seed_from_u64(0xAC00);
         let key =
             RnsMultiplicationKey::generate_with_rng(degree, 2, 0, &secret, layout, &mut key_rng);
+        let prepared_key = PreparedRnsMultiplicationKey::new(&key, &plan);
 
         for seed in 0_u64..32 {
             let lhs_message = RnsPolynomial::from_coefficients(
@@ -1651,12 +2723,35 @@ mod tests {
 
             let product = rns_tensor_with_ntt(&lhs, &rhs, &plan);
 
+            let reference = rns_relinearize(&product, &key);
+            let ntt = rns_relinearize_with_ntt(&product, &key, &plan);
+            let prepared = rns_relinearize_with_prepared_ntt(&product, &prepared_key, &plan);
+
+            let prepared_dynamic =
+                rns_relinearize_with_prepared_dynamic_ntt(&product, &prepared_key, &prepared_plan);
+
             assert_eq!(
-                rns_relinearize_with_ntt(&product, &key, &plan),
-                rns_relinearize(&product, &key),
+                ntt, reference,
                 "NTT RNS relinearization diverged for seed {seed}"
             );
+            assert_eq!(
+                prepared, reference,
+                "prepared NTT RNS relinearization diverged for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic, reference,
+                "prepared dynamic-NTT RNS relinearization diverged for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic, prepared,
+                "prepared dynamic-NTT and prepared NTT RNS relinearization diverged for seed {seed}"
+            );
         }
+
+        println!("PREPARED_NTT_RNS_RELINEARIZATION_EQUIVALENCE=PASS");
+        println!("PREPARED_DYNAMIC_NTT_RNS_RELINEARIZATION_EQUIVALENCE=PASS");
     }
 
     #[test]
@@ -1947,6 +3042,115 @@ mod tests {
                 "NTT RNS key switch diverged for seed {seed}"
             );
         }
+    }
+
+    #[test]
+    fn prepared_ntt_rns_key_switch_matches_reference_exactly() {
+        let basis = basis();
+        let degree = 8;
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
+
+        let source_secret = [-1, 0, 1, 1, 0, -1, 1, 0];
+        let target_secret = [1, 0, -1, 0, 1, 1, 0, -1];
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let mut key_rng = ChaCha20Rng::seed_from_u64(0xAD50);
+        let key = RnsKeySwitchKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &source_secret,
+            &target_secret,
+            layout,
+            &mut key_rng,
+        );
+
+        let prepared = PreparedRnsKeySwitchKey::new(&key, &plan);
+
+        let message = RnsPolynomial::from_coefficients(
+            basis.moduli().to_vec(),
+            &[3_u128, 1, 4, 1, 5, 9, 2, 6],
+        );
+
+        for seed in 0_u64..32 {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0xAD60);
+
+            let ciphertext =
+                encrypt_rns_raw_with_ntt_rng(&message, 2, 0, &source_secret, &plan, &mut rng);
+
+            let reference = rns_key_switch(&ciphertext, &key);
+            let ntt = rns_key_switch_with_ntt(&ciphertext, &key, &plan);
+            let prepared_ntt = rns_key_switch_with_prepared_ntt(&ciphertext, &prepared, &plan);
+
+            let prepared_dynamic_ntt =
+                rns_key_switch_with_prepared_dynamic_ntt(&ciphertext, &prepared, &prepared_plan);
+
+            let resident_ntt = rns_key_switch_with_prepared_dynamic_ntt_resident(
+                &ciphertext,
+                &prepared,
+                &prepared_plan,
+            );
+
+            let resident_coefficient = resident_ntt.to_coefficient(&prepared_plan);
+
+            let (prepared_dynamic_profiled, _) = rns_key_switch_with_prepared_dynamic_ntt_profiled(
+                &ciphertext,
+                &prepared,
+                &prepared_plan,
+            );
+
+            assert_eq!(
+                ntt, reference,
+                "NTT RNS key switch diverged from reference for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_ntt, reference,
+                "prepared NTT RNS key switch diverged from reference for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_ntt, ntt,
+                "prepared and ordinary NTT key switches diverged for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic_ntt, reference,
+                "prepared dynamic-NTT key switch diverged from reference for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic_ntt, prepared_ntt,
+                "prepared dynamic-NTT and prepared NTT key switches diverged for seed {seed}"
+            );
+
+            assert_eq!(
+                resident_coefficient, reference,
+                "NTT-resident key switch diverged from reference after explicit inverse for seed {seed}"
+            );
+
+            assert_eq!(
+                resident_coefficient, prepared_dynamic_ntt,
+                "NTT-resident and prepared dynamic-NTT key switches diverged after explicit inverse for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic_profiled, reference,
+                "profiled prepared dynamic-NTT key switch diverged from reference for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared_dynamic_profiled, prepared_dynamic_ntt,
+                "profiled and unprofiled prepared dynamic-NTT key switches diverged for seed {seed}"
+            );
+        }
+
+        println!("PREPARED_NTT_RNS_KEY_SWITCH_EQUIVALENCE=PASS");
+        println!("PREPARED_DYNAMIC_NTT_RNS_KEY_SWITCH_EQUIVALENCE=PASS");
+        println!("NTT_RESIDENT_RNS_KEY_SWITCH_EQUIVALENCE=PASS");
+        println!("PREPARED_DYNAMIC_NTT_PROFILED_RNS_KEY_SWITCH_EQUIVALENCE=PASS");
     }
 
     #[test]

@@ -88,6 +88,16 @@ impl NttPlan {
         self.psi
     }
 
+    /// Multiplicative inverse of the primitive 2N-th root.
+    pub fn psi_inverse(self) -> u64 {
+        self.psi_inverse
+    }
+
+    /// Multiplicative inverse of the transform degree modulo q.
+    pub fn degree_inverse(self) -> u64 {
+        self.degree_inverse
+    }
+
     /// Reference forward negacyclic transform.
     ///
     /// Output entry `k` is the polynomial evaluated at

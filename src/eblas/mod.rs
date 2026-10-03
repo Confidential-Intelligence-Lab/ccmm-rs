@@ -14,6 +14,8 @@ pub mod backend_policy;
 
 pub mod batched_gemm;
 
+pub mod batch_gemm;
+
 pub mod gemm;
 pub use backend_policy::select_cc_backend;
 
@@ -21,6 +23,8 @@ pub use batched_gemm::{
     batched_gemm_cc, batched_gemm_cc_auto, batched_gemm_cp, batched_gemm_pc, batched_gemm_pp,
     BatchedGemmOperationCount, BatchedGemmShape, BatchedGemmSpec,
 };
+
+pub use batch_gemm::{batch_gemm_ccmm, batch_gemm_cpmm};
 
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub mod gemv;
@@ -129,6 +133,125 @@ pub enum GemmBackend {
     CcScalar,
     /// Matrix-structured ciphertext-ciphertext CCMM path.
     CcStructured,
+}
+
+/// Execution mechanism for packed/batched encrypted GEMM.
+///
+/// These mechanisms implement the same logical batched matrix-multiplication
+/// operation while using the SinC representation and the large-ring/scalar-ring
+/// decomposition employed by the Batch CPMM and Batch CCMM algorithms.
+///
+/// The mechanism is deliberately separate from [`PrivacyMode`]:
+///
+/// - [`BatchGemmMechanism::Cpmm`] realizes ciphertext/plaintext GEMM;
+/// - [`BatchGemmMechanism::Ccmm`] realizes ciphertext/ciphertext GEMM.
+///
+/// Keeping mechanism selection explicit makes characterization reproducible
+/// and allows the implementations to evolve without changing the eBLAS
+/// operation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchGemmMechanism {
+    /// Packed ciphertext/plaintext matrix multiplication.
+    Cpmm,
+    /// Packed ciphertext/ciphertext matrix multiplication.
+    Ccmm,
+}
+
+impl BatchGemmMechanism {
+    /// Operand-privacy contract required by this mechanism.
+    pub const fn privacy(self) -> PrivacyMode {
+        match self {
+            Self::Cpmm => PrivacyMode::Cp,
+            Self::Ccmm => PrivacyMode::Cc,
+        }
+    }
+}
+
+/// Geometry of one packed Batch GEMM execution.
+///
+/// Batch CPMM and Batch CCMM use related SinC representations but different
+/// large-ring decomposition geometries:
+///
+/// - CPMM: `(dimension / 2) * scalar_degree == large_degree`;
+/// - CCMM: `dimension * scalar_degree == large_degree`.
+///
+/// The number of simultaneously represented real matrix products is
+/// `scalar_degree / 2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchGemmGeometry {
+    mechanism: BatchGemmMechanism,
+    dimension: usize,
+    scalar_degree: usize,
+    large_degree: usize,
+}
+
+impl BatchGemmGeometry {
+    /// Creates a valid Batch GEMM geometry for the selected mechanism.
+    pub fn new(
+        mechanism: BatchGemmMechanism,
+        dimension: usize,
+        scalar_degree: usize,
+        large_degree: usize,
+    ) -> Self {
+        assert!(dimension > 0, "Batch GEMM dimension must be positive");
+        assert!(
+            scalar_degree > 0 && scalar_degree % 2 == 0,
+            "Batch GEMM scalar degree must be positive and even"
+        );
+
+        let decomposition_rows = match mechanism {
+            BatchGemmMechanism::Cpmm => {
+                assert!(dimension % 2 == 0, "Batch CPMM dimension must be even");
+                dimension / 2
+            }
+            BatchGemmMechanism::Ccmm => dimension,
+        };
+
+        assert_eq!(
+            decomposition_rows
+                .checked_mul(scalar_degree)
+                .expect("Batch GEMM geometry overflow"),
+            large_degree,
+            "Batch GEMM decomposition must match the large-ring degree"
+        );
+
+        Self {
+            mechanism,
+            dimension,
+            scalar_degree,
+            large_degree,
+        }
+    }
+
+    /// Selected packed matrix-multiplication mechanism.
+    pub const fn mechanism(self) -> BatchGemmMechanism {
+        self.mechanism
+    }
+
+    /// Operand-privacy contract implied by the selected mechanism.
+    pub const fn privacy(self) -> PrivacyMode {
+        self.mechanism.privacy()
+    }
+
+    /// Logical square-matrix dimension.
+    pub const fn dimension(self) -> usize {
+        self.dimension
+    }
+
+    /// Degree of each scalar-ring component.
+    pub const fn scalar_degree(self) -> usize {
+        self.scalar_degree
+    }
+
+    /// Degree of the packed large ring.
+    pub const fn large_degree(self) -> usize {
+        self.large_degree
+    }
+
+    /// Number of real matrix products represented simultaneously.
+    pub const fn batch_count(self) -> usize {
+        self.scalar_degree / 2
+    }
 }
 
 /// Dense matrix dimensions.
@@ -505,10 +628,43 @@ pub fn predicted_gemm_execution_trace(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn batch_gemm_authors_geometries_are_explicit() {
+        let cpmm_d64 = BatchGemmGeometry::new(BatchGemmMechanism::Cpmm, 64, 256, 8192);
+        assert_eq!(cpmm_d64.batch_count(), 128);
+        assert_eq!(cpmm_d64.privacy(), PrivacyMode::Cp);
+
+        let cpmm_d128 = BatchGemmGeometry::new(BatchGemmMechanism::Cpmm, 128, 128, 8192);
+        assert_eq!(cpmm_d128.batch_count(), 64);
+        assert_eq!(cpmm_d128.privacy(), PrivacyMode::Cp);
+
+        let ccmm_d64 = BatchGemmGeometry::new(BatchGemmMechanism::Ccmm, 64, 128, 8192);
+        assert_eq!(ccmm_d64.batch_count(), 64);
+        assert_eq!(ccmm_d64.privacy(), PrivacyMode::Cc);
+
+        let ccmm_d128 = BatchGemmGeometry::new(BatchGemmMechanism::Ccmm, 128, 64, 8192);
+        assert_eq!(ccmm_d128.batch_count(), 32);
+        assert_eq!(ccmm_d128.privacy(), PrivacyMode::Cc);
+    }
+
+    #[test]
+    #[should_panic(expected = "Batch GEMM decomposition must match the large-ring degree")]
+    fn batch_cpmm_rejects_ccmm_geometry() {
+        let _ = BatchGemmGeometry::new(BatchGemmMechanism::Cpmm, 64, 128, 8192);
+    }
+
+    #[test]
+    #[should_panic(expected = "Batch GEMM decomposition must match the large-ring degree")]
+    fn batch_ccmm_rejects_cpmm_geometry() {
+        let _ = BatchGemmGeometry::new(BatchGemmMechanism::Ccmm, 64, 256, 8192);
+    }
+
     use super::gemm_representation_profile;
     use super::{
-        gemm_execution_profile, predicted_gemm_execution_trace, GemmBackend, GemmOperationCount,
-        GemmShape, GemmSpec, MatrixLayout, MatrixShape, OperandPrivacy, PrivacyMode,
+        gemm_execution_profile, predicted_gemm_execution_trace, BatchGemmGeometry,
+        BatchGemmMechanism, GemmBackend, GemmOperationCount, GemmShape, GemmSpec, MatrixLayout,
+        MatrixShape, OperandPrivacy, PrivacyMode,
     };
 
     #[test]

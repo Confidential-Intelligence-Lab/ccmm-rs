@@ -1,6 +1,8 @@
 use rand::{CryptoRng, RngCore};
 
-use crate::grafting::{RnsGadgetLayout, RnsKeySwitchKey, RnsRlweCiphertext};
+use crate::grafting::{
+    PreparedRnsKeySwitchKey, RnsGadgetLayout, RnsKeySwitchKey, RnsRlweCiphertext,
+};
 use crate::rlwe::ErrorDistribution;
 
 use super::{apply_automorphism, apply_rns_automorphism};
@@ -265,6 +267,247 @@ impl RnsGaloisKey {
     pub fn layout(&self) -> &RnsGadgetLayout {
         self.key_switch_key.layout()
     }
+}
+
+/// Execution-prepared RNS Galois evaluation key.
+///
+/// The canonical [`RnsGaloisKey`] remains coefficient-domain and
+/// backend-independent. This representation pre-transforms its key-switch
+/// material for repeated NTT-backed evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRnsGaloisKey {
+    exponent: usize,
+    key_switch_key: PreparedRnsKeySwitchKey,
+}
+
+impl PreparedRnsGaloisKey {
+    pub fn new(galois_key: &RnsGaloisKey, plan: &crate::ring::RnsNttPlan) -> Self {
+        Self {
+            exponent: galois_key.exponent(),
+            key_switch_key: PreparedRnsKeySwitchKey::new(galois_key.key_switch_key(), plan),
+        }
+    }
+
+    pub fn exponent(&self) -> usize {
+        self.exponent
+    }
+
+    pub fn key_switch_key(&self) -> &PreparedRnsKeySwitchKey {
+        &self.key_switch_key
+    }
+
+    pub fn layout(&self) -> &RnsGadgetLayout {
+        self.key_switch_key.layout()
+    }
+}
+
+/// Applies an RNS Galois automorphism using a prepared NTT-domain
+/// evaluation key.
+/// Applies an RNS Galois automorphism and prepared key switch while
+/// retaining the switched ciphertext in the NTT domain.
+///
+/// This avoids the final inverse transforms performed by the ordinary
+/// coefficient-domain Galois path. Downstream NTT-domain operators may
+/// consume the returned ciphertext directly.
+pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::PreparedRnsNttPlan,
+) -> crate::grafting::RnsNttRlweCiphertext {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match prepared RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "prepared RNS NTT plan basis must match Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "prepared RNS NTT plan degree must match Galois ciphertext degree"
+    );
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    crate::grafting::rns_key_switch_with_prepared_dynamic_ntt_resident(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+    )
+}
+
+/// Profiling variant of the NTT-resident prepared-dynamic Galois path.
+///
+/// Returns `(ciphertext, automorphism_seconds, key_switch_seconds)`.
+pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::PreparedRnsNttPlan,
+) -> (crate::grafting::RnsNttRlweCiphertext, f64, f64) {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match prepared RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "prepared RNS NTT plan basis must match Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "prepared RNS NTT plan degree must match Galois ciphertext degree"
+    );
+
+    let start = std::time::Instant::now();
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    let automorphism_seconds = start.elapsed().as_secs_f64();
+
+    let start = std::time::Instant::now();
+
+    let output = crate::grafting::rns_key_switch_with_prepared_dynamic_ntt_resident(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+    );
+
+    let key_switch_seconds = start.elapsed().as_secs_f64();
+
+    (output, automorphism_seconds, key_switch_seconds)
+}
+
+pub fn apply_rns_galois_automorphism_with_prepared_ntt(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::RnsNttPlan,
+) -> RnsRlweCiphertext {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match prepared RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "RNS NTT plan basis must match prepared RNS Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match prepared RNS Galois ciphertext degree"
+    );
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    crate::grafting::rns_key_switch_with_prepared_ntt(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+    )
+}
+
+/// Profiling Galois path using the prepared dynamic NTT execution plan.
+///
+/// The automorphism is unchanged. The ciphertext-dependent key-switch
+/// transforms use `PreparedRnsNttPlan`.
+pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::PreparedRnsNttPlan,
+) -> (
+    RnsRlweCiphertext,
+    f64,
+    crate::grafting::RnsPreparedKeySwitchProfile,
+) {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match prepared RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "prepared RNS NTT plan basis must match prepared RNS Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "prepared RNS NTT plan degree must match prepared RNS Galois ciphertext degree"
+    );
+
+    let start = std::time::Instant::now();
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    let automorphism_seconds = start.elapsed().as_secs_f64();
+
+    let (output, key_switch_profile) =
+        crate::grafting::rns_key_switch_with_prepared_dynamic_ntt_profiled(
+            &transformed,
+            galois_key.key_switch_key(),
+            plan,
+        );
+
+    (output, automorphism_seconds, key_switch_profile)
+}
+
+/// Profiling variant of the prepared RNS Galois path.
+///
+/// Returns `(ciphertext, automorphism_seconds, key_switch_seconds)`.
+pub fn apply_rns_galois_automorphism_with_prepared_ntt_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::RnsNttPlan,
+) -> (
+    RnsRlweCiphertext,
+    f64,
+    crate::grafting::RnsPreparedKeySwitchProfile,
+) {
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "RNS ciphertext basis must match prepared RNS Galois key"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "RNS NTT plan basis must match prepared RNS Galois ciphertext basis"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "RNS NTT plan degree must match prepared RNS Galois ciphertext degree"
+    );
+
+    let start = std::time::Instant::now();
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    let automorphism_seconds = start.elapsed().as_secs_f64();
+
+    let (output, key_switch_profile) = crate::grafting::rns_key_switch_with_prepared_ntt_profiled(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+    );
+
+    (output, automorphism_seconds, key_switch_profile)
 }
 
 /// Applies an RNS CKKS Galois automorphism and switches the transformed

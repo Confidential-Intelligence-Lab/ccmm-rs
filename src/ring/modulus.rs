@@ -5,6 +5,88 @@
 ///
 /// Multiplication uses `u128` intermediates so products of two `u64`
 /// operands cannot overflow before modular reduction.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedModulus {
+    modulus: Modulus,
+    reciprocal: u128,
+}
+
+impl PreparedModulus {
+    /// Prepares a fixed modulus for Barrett-style reduction.
+    ///
+    /// The reciprocal is floor(2^128 / q). It is computed once and reused
+    /// across hot modular multiplications.
+    pub fn new(modulus: Modulus) -> Self {
+        let q = u128::from(modulus.value());
+
+        // floor(2^128 / q) without constructing 2^128 directly:
+        //
+        // floor((2^128 - 1) / q) is either floor(2^128 / q) or one less.
+        // Correct it using the remainder.
+        let max = u128::MAX;
+        let mut reciprocal = max / q;
+        let remainder = max % q;
+
+        if remainder == q - 1 {
+            reciprocal += 1;
+        }
+
+        Self {
+            modulus,
+            reciprocal,
+        }
+    }
+
+    pub fn modulus(self) -> Modulus {
+        self.modulus
+    }
+
+    pub fn reciprocal(self) -> u128 {
+        self.reciprocal
+    }
+
+    /// Exact portable multiplication of canonical residues.
+    ///
+    /// This first implementation keeps the product in u128 and uses the
+    /// prepared reciprocal to estimate the quotient. Correction restores the
+    /// exact canonical residue.
+    pub fn mul_canonical(self, a: u64, b: u64) -> u64 {
+        debug_assert!(a < self.modulus.value());
+        debug_assert!(b < self.modulus.value());
+
+        let q = u128::from(self.modulus.value());
+        let x = u128::from(a) * u128::from(b);
+
+        // For the SD3b large modulus x is at most 72 bits.
+        //
+        // Compute floor(x * reciprocal / 2^128). Since x is small enough,
+        // split the reciprocal product into high and low halves manually.
+        let x_hi = x >> 64;
+        let x_lo = x as u64 as u128;
+
+        let r_hi = self.reciprocal >> 64;
+        let r_lo = self.reciprocal as u64 as u128;
+
+        let p0 = x_lo * r_lo;
+        let p1 = x_lo * r_hi;
+        let p2 = x_hi * r_lo;
+        let p3 = x_hi * r_hi;
+
+        let carry = ((p0 >> 64) + (p1 & ((1_u128 << 64) - 1)) + (p2 & ((1_u128 << 64) - 1))) >> 64;
+
+        let quotient = p3 + (p1 >> 64) + (p2 >> 64) + carry;
+
+        let mut reduced = x - quotient * q;
+
+        while reduced >= q {
+            reduced -= q;
+        }
+
+        reduced as u64
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modulus {
     value: u64,
@@ -46,6 +128,40 @@ impl Modulus {
         ((a + q - b) % q) as u64
     }
 
+    /// Adds two already-canonical residues modulo q.
+    ///
+    /// Both operands must lie in `[0, q)`. This avoids the general-purpose
+    /// reductions performed by `add`.
+    pub fn add_canonical(self, a: u64, b: u64) -> u64 {
+        debug_assert!(a < self.value, "lhs residue must be canonical");
+        debug_assert!(b < self.value, "rhs residue must be canonical");
+
+        let (sum, overflow) = a.overflowing_add(b);
+
+        if overflow {
+            sum.wrapping_sub(self.value)
+        } else if sum >= self.value {
+            sum - self.value
+        } else {
+            sum
+        }
+    }
+
+    /// Subtracts two already-canonical residues modulo q.
+    ///
+    /// Both operands must lie in `[0, q)`. This avoids the general-purpose
+    /// reductions performed by `sub`.
+    pub fn sub_canonical(self, a: u64, b: u64) -> u64 {
+        debug_assert!(a < self.value, "lhs residue must be canonical");
+        debug_assert!(b < self.value, "rhs residue must be canonical");
+
+        if a >= b {
+            a - b
+        } else {
+            self.value - (b - a)
+        }
+    }
+
     /// Computes `(-a) mod q`.
     pub fn neg(self, a: u64) -> u64 {
         let reduced = self.reduce(a);
@@ -62,6 +178,23 @@ impl Modulus {
         let q = u128::from(self.value);
 
         ((u128::from(a) * u128::from(b)) % q) as u64
+    }
+
+    /// Multiplies two already-canonical residues modulo q.
+    ///
+    /// When the square of the modulus fits in `u64`, the product of two
+    /// canonical residues also fits in `u64`, avoiding the general `u128`
+    /// multiplication/reduction path. Larger moduli retain the exact
+    /// portable `u128` implementation.
+    pub fn mul_canonical(self, a: u64, b: u64) -> u64 {
+        debug_assert!(a < self.value, "lhs residue must be canonical");
+        debug_assert!(b < self.value, "rhs residue must be canonical");
+
+        if u128::from(self.value) * u128::from(self.value) <= u128::from(u64::MAX) {
+            (a * b) % self.value
+        } else {
+            ((u128::from(a) * u128::from(b)) % u128::from(self.value)) as u64
+        }
     }
 
     /// Computes `base^exponent mod q` by repeated squaring.
@@ -106,6 +239,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_multiplication_matches_general_multiplication() {
+        let moduli = [Modulus::new(268_238_849), Modulus::new(68_712_923_137)];
+
+        for modulus in moduli {
+            let q = modulus.value();
+
+            let values = [0, 1, 2, q / 2, q - 2, q - 1];
+
+            for &lhs in &values {
+                for &rhs in &values {
+                    assert_eq!(
+                        modulus.mul_canonical(lhs, rhs),
+                        modulus.mul(lhs, rhs),
+                        "canonical multiplication mismatch for q={q}, lhs={lhs}, rhs={rhs}"
+                    );
+                }
+            }
+        }
+
+        println!("MODULUS_CANONICAL_MUL_EQUIVALENCE=PASS");
+    }
+
+    #[test]
+    fn prepared_modulus_multiplication_matches_general_multiplication() {
+        let moduli = [Modulus::new(268_238_849), Modulus::new(68_712_923_137)];
+
+        for modulus in moduli {
+            let prepared = PreparedModulus::new(modulus);
+            let q = modulus.value();
+
+            let edge_values = [0, 1, 2, 3, q / 3, q / 2, q - 3, q - 2, q - 1];
+
+            for &lhs in &edge_values {
+                for &rhs in &edge_values {
+                    assert_eq!(
+                        prepared.mul_canonical(lhs, rhs),
+                        modulus.mul(lhs, rhs),
+                        "prepared multiplication mismatch for q={q}, lhs={lhs}, rhs={rhs}"
+                    );
+                }
+            }
+
+            let mut state = 0x1234_5678_9abc_def0_u64;
+
+            for _ in 0..10_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+
+                let lhs = state % q;
+
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+
+                let rhs = state % q;
+
+                assert_eq!(
+                    prepared.mul_canonical(lhs, rhs),
+                    modulus.mul(lhs, rhs),
+                    "prepared multiplication mismatch for q={q}, lhs={lhs}, rhs={rhs}"
+                );
+            }
+        }
+
+        println!("PREPARED_MODULUS_MUL_EQUIVALENCE=PASS");
+    }
+
+    #[test]
     fn construction_preserves_modulus() {
         let modulus = Modulus::new(17);
 
@@ -141,6 +343,47 @@ mod tests {
         assert_eq!(modulus.add(5, 7), 12);
         assert_eq!(modulus.add(16, 16), 15);
         assert_eq!(modulus.add(17, 18), 1);
+    }
+
+    #[test]
+    fn canonical_add_sub_match_general_arithmetic() {
+        let moduli = [
+            2_u64,
+            3,
+            17,
+            97,
+            12_289,
+            268_238_849,
+            68_712_923_137,
+            u64::MAX - 58,
+        ];
+
+        for &q in &moduli {
+            let modulus = Modulus::new(q);
+
+            let values = [0, 1 % q, 2 % q, q / 2, q.saturating_sub(2), q - 1];
+
+            for &a in &values {
+                for &b in &values {
+                    assert!(a < q);
+                    assert!(b < q);
+
+                    assert_eq!(
+                        modulus.add_canonical(a, b),
+                        modulus.add(a, b),
+                        "canonical add mismatch for q={q}, a={a}, b={b}"
+                    );
+
+                    assert_eq!(
+                        modulus.sub_canonical(a, b),
+                        modulus.sub(a, b),
+                        "canonical sub mismatch for q={q}, a={a}, b={b}"
+                    );
+                }
+            }
+        }
+
+        println!("MODULUS_CANONICAL_ADD_SUB_EQUIVALENCE=PASS");
     }
 
     #[test]

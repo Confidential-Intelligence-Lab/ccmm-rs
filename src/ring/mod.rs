@@ -9,6 +9,8 @@ pub mod ntt_params;
 pub mod ntt_polynomial;
 pub mod ntt_radix2;
 pub mod polynomial;
+pub mod prepared_ntt;
+pub mod prepared_rns_ntt;
 
 pub use modulus::Modulus;
 pub use ntt::NttPlan;
@@ -17,6 +19,8 @@ pub use polynomial::Polynomial;
 pub use ntt_params::{find_negacyclic_root, make_ntt_plan};
 
 pub use ntt_polynomial::NttPolynomial;
+pub use prepared_ntt::PreparedNttPlan;
+pub use prepared_rns_ntt::PreparedRnsNttPlan;
 
 pub mod rns;
 pub use rns::RnsPolynomial;

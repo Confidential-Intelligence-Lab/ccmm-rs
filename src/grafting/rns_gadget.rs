@@ -107,15 +107,34 @@ impl RnsGadgetLayout {
             "polynomial basis must match RNS gadget layout"
         );
 
-        let canonical = polynomial.reconstruct_coefficients();
+        let needs_reconstruction = self
+            .blocks
+            .iter()
+            .any(|block| block.end() - block.start() != 1);
+
+        let canonical = needs_reconstruction.then(|| polynomial.reconstruct_coefficients());
 
         let digits = self
             .blocks
             .iter()
             .map(|block| {
-                let qi = block.composite_modulus();
+                if block.end() - block.start() == 1 {
+                    polynomial
+                        .residue(block.start())
+                        .coefficients()
+                        .iter()
+                        .map(|&value| u128::from(value))
+                        .collect::<Vec<_>>()
+                } else {
+                    let qi = block.composite_modulus();
 
-                canonical.iter().map(|value| value % qi).collect::<Vec<_>>()
+                    canonical
+                        .as_ref()
+                        .expect("multi-limb gadget block requires CRT reconstruction")
+                        .iter()
+                        .map(|value| value % qi)
+                        .collect::<Vec<_>>()
+                }
             })
             .collect();
 

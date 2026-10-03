@@ -83,22 +83,20 @@ impl NttPlan {
         );
 
         let modulus = self.modulus();
-        let psi = self.psi();
+        let psi_inverse = self.psi_inverse();
 
-        let omega = modulus.mul(psi, psi);
-        let omega_inverse = modulus.inverse_prime(omega);
+        let omega_inverse = modulus.mul(psi_inverse, psi_inverse);
 
         let mut coefficients = values.to_vec();
 
         cyclic_ntt_radix2(&mut coefficients, modulus, omega_inverse);
 
-        let degree_inverse = modulus.inverse_prime(self.degree() as u64);
+        let degree_inverse = self.degree_inverse();
 
         for coefficient in &mut coefficients {
             *coefficient = modulus.mul(*coefficient, degree_inverse);
         }
 
-        let psi_inverse = modulus.inverse_prime(psi);
         let mut untwist = 1_u64;
 
         for coefficient in &mut coefficients {
@@ -128,12 +126,20 @@ fn cyclic_ntt_radix2(values: &mut [u64], modulus: Modulus, root: u64) {
 
     while len <= n {
         let root_step = modulus.pow(root, (n / len) as u64);
+        let half = len / 2;
+
+        // Twiddles depend only on the offset within a stage, not on the
+        // butterfly block. Build the stage schedule once and reuse it.
+        let mut twiddles = Vec::with_capacity(half);
+        let mut twiddle = 1_u64;
+
+        for _ in 0..half {
+            twiddles.push(twiddle);
+            twiddle = modulus.mul(twiddle, root_step);
+        }
 
         for start in (0..n).step_by(len) {
-            let mut twiddle = 1_u64;
-            let half = len / 2;
-
-            for offset in 0..half {
+            for (offset, &twiddle) in twiddles.iter().enumerate() {
                 let even = values[start + offset];
 
                 let odd = modulus.mul(values[start + offset + half], twiddle);
@@ -141,8 +147,6 @@ fn cyclic_ntt_radix2(values: &mut [u64], modulus: Modulus, root: u64) {
                 values[start + offset] = modulus.add(even, odd);
 
                 values[start + offset + half] = modulus.sub(even, odd);
-
-                twiddle = modulus.mul(twiddle, root_step);
             }
         }
 

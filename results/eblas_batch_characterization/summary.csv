@@ -1,0 +1,5 @@
+mechanism,privacy,dimension,scalar_degree,large_degree,batch_count,execution_ms,relative_l2_error,status
+CPMM,CP,64,256,8192,128,204.409,3.558767985371e-7,PASS
+CPMM,CP,128,128,8192,64,485.299,1.610681474010e-7,PASS
+CCMM,CC,64,128,8192,64,1065.353,4.101992550405e-7,PASS
+CCMM,CC,128,64,8192,32,2442.777,1.942477178548e-7,PASS

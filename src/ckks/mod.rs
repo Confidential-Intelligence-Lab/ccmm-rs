@@ -57,8 +57,13 @@ pub use rns_automorphism::apply_rns_automorphism;
 pub use rns_ciphertext::RnsCkksCiphertext;
 pub use rns_galois_key::{
     apply_rns_ckks_galois_automorphism, apply_rns_galois_automorphism,
-    apply_rns_galois_automorphism_with_ntt, conjugate_rns_ckks, rotate_left_rns_ckks,
-    rotate_right_rns_ckks, RnsGaloisKey,
+    apply_rns_galois_automorphism_with_ntt,
+    apply_rns_galois_automorphism_with_prepared_dynamic_ntt_profiled,
+    apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident,
+    apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_profiled,
+    apply_rns_galois_automorphism_with_prepared_ntt,
+    apply_rns_galois_automorphism_with_prepared_ntt_profiled, conjugate_rns_ckks,
+    rotate_left_rns_ckks, rotate_right_rns_ckks, PreparedRnsGaloisKey, RnsGaloisKey,
 };
 pub use rns_multiply::{
     evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks,

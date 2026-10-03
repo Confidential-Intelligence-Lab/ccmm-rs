@@ -110,6 +110,31 @@ pub struct RnsNttPolynomial {
 }
 
 impl RnsNttPolynomial {
+    /// Constructs an RNS NTT polynomial from already-separated NTT limbs.
+    pub fn from_residues(residues: Vec<NttPolynomial>) -> Self {
+        assert!(
+            !residues.is_empty(),
+            "RNS NTT polynomial must contain at least one residue limb"
+        );
+
+        let degree = residues[0].degree();
+        let moduli: Vec<_> = residues.iter().map(NttPolynomial::modulus).collect();
+
+        for residue in &residues {
+            assert_eq!(
+                residue.degree(),
+                degree,
+                "all RNS NTT residue polynomials must have the same degree"
+            );
+        }
+
+        Self {
+            degree,
+            moduli,
+            residues,
+        }
+    }
+
     pub fn degree(&self) -> usize {
         self.degree
     }
@@ -149,6 +174,101 @@ impl RnsNttPolynomial {
             degree: self.degree,
             moduli: self.moduli.clone(),
             residues,
+        }
+    }
+
+    /// Subtraction in the NTT domain across the full RNS basis.
+    pub fn sub(&self, rhs: &Self) -> Self {
+        assert_eq!(
+            self.degree, rhs.degree,
+            "RNS NTT polynomial degrees must match"
+        );
+
+        assert_eq!(
+            self.moduli, rhs.moduli,
+            "RNS NTT polynomial bases must match"
+        );
+
+        let residues = self
+            .residues
+            .iter()
+            .zip(&rhs.residues)
+            .map(|(lhs, rhs)| {
+                let values = lhs
+                    .values()
+                    .iter()
+                    .zip(rhs.values())
+                    .map(|(&a, &b)| lhs.modulus().sub_canonical(a, b))
+                    .collect();
+
+                NttPolynomial::from_canonical_values(
+                    &make_ntt_plan(lhs.modulus(), lhs.degree()),
+                    values,
+                )
+            })
+            .collect();
+
+        Self::from_residues(residues)
+    }
+
+    /// Multiplies by `X^exponent` directly in every RNS NTT limb.
+    pub fn mul_monomial_signed(&self, plan: &RnsNttPlan, exponent: i64) -> Self {
+        assert_eq!(
+            self.degree,
+            plan.degree(),
+            "RNS NTT polynomial degree must match plan"
+        );
+
+        assert_eq!(
+            self.moduli,
+            plan.moduli(),
+            "RNS NTT polynomial basis must match plan"
+        );
+
+        let residues = self
+            .residues
+            .iter()
+            .enumerate()
+            .map(|(index, residue)| residue.mul_monomial_signed(plan.plan(index), exponent))
+            .collect();
+
+        Self::from_residues(residues)
+    }
+
+    /// Accumulates a pointwise RNS NTT-domain product into this polynomial.
+    ///
+    /// This is exactly equivalent to:
+    ///
+    /// `*self = self.add(&lhs.pointwise_mul(rhs));`
+    ///
+    /// but delegates to the in-place fused limb operation and avoids
+    /// materializing temporary RNS products and sums.
+    pub fn pointwise_mul_add_assign(&mut self, lhs: &Self, rhs: &Self) {
+        assert_eq!(
+            self.degree, lhs.degree,
+            "RNS NTT polynomial degrees must match"
+        );
+        assert_eq!(
+            self.degree, rhs.degree,
+            "RNS NTT polynomial degrees must match"
+        );
+
+        assert_eq!(
+            self.moduli, lhs.moduli,
+            "RNS NTT polynomial bases must match"
+        );
+        assert_eq!(
+            self.moduli, rhs.moduli,
+            "RNS NTT polynomial bases must match"
+        );
+
+        for ((acc, lhs_residue), rhs_residue) in self
+            .residues
+            .iter_mut()
+            .zip(&lhs.residues)
+            .zip(&rhs.residues)
+        {
+            acc.pointwise_mul_add_assign_prevalidated(lhs_residue, rhs_residue);
         }
     }
 
@@ -223,6 +343,92 @@ mod tests {
         }
 
         out
+    }
+
+    #[test]
+    fn rns_ntt_sub_matches_coefficient_domain_exactly() {
+        let degree = 64;
+        let plan = RnsNttPlan::new(basis(), degree);
+
+        let lhs = RnsPolynomial::from_coefficients(
+            basis(),
+            &(0..degree)
+                .map(|i| 17_u128 + 31 * i as u128)
+                .collect::<Vec<_>>(),
+        );
+
+        let rhs = RnsPolynomial::from_coefficients(
+            basis(),
+            &(0..degree)
+                .map(|i| 7_u128 + 13 * i as u128)
+                .collect::<Vec<_>>(),
+        );
+
+        let lhs_ntt = plan.forward(&lhs);
+        let rhs_ntt = plan.forward(&rhs);
+
+        let actual = plan.inverse(&lhs_ntt.sub(&rhs_ntt));
+
+        let expected = RnsPolynomial::from_residues(
+            lhs.residues()
+                .iter()
+                .zip(rhs.residues())
+                .map(|(a, b)| a.sub(b))
+                .collect(),
+        );
+
+        assert_eq!(actual, expected);
+
+        println!("RNS_NTT_SUB_EQUIVALENCE=PASS");
+    }
+
+    #[test]
+    fn rns_ntt_monomial_matches_coefficient_domain_exactly() {
+        let degree = 64;
+        let plan = RnsNttPlan::new(basis(), degree);
+
+        let polynomial = RnsPolynomial::from_coefficients(
+            basis(),
+            &(0..degree)
+                .map(|i| {
+                    let x = i as u128;
+                    5 + 17 * x + 3 * x * x
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let transformed = plan.forward(&polynomial);
+
+        for exponent in [
+            -257_i64, -129, -128, -65, -64, -1, 0, 1, 63, 64, 65, 127, 128, 129, 257,
+        ] {
+            let actual = plan.inverse(&transformed.mul_monomial_signed(&plan, exponent));
+
+            let expected = RnsPolynomial::from_residues(
+                polynomial
+                    .residues()
+                    .iter()
+                    .map(|residue| {
+                        let period = 2_i128 * degree as i128;
+
+                        let normalized = i128::from(exponent).rem_euclid(period) as usize;
+
+                        let shift = normalized % degree;
+
+                        let sign = if normalized >= degree { -1_i8 } else { 1_i8 };
+
+                        residue.mul_monomial_signed(shift, sign)
+                    })
+                    .collect(),
+            );
+
+            assert_eq!(
+                actual, expected,
+                "RNS NTT monomial mismatch for exponent={exponent}"
+            );
+        }
+
+        println!("RNS_NTT_SIGNED_MONOMIAL_EQUIVALENCE=PASS");
     }
 
     #[test]
