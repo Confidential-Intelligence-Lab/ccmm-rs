@@ -5591,6 +5591,235 @@ mod sinc_tests {
         (squared_error / squared_reference).sqrt()
     }
 
+    fn cpmm_batch_gemv_capability(dimension: usize, scalar_degree: usize) -> (f64, f64) {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        const LARGE_DEGREE: usize = 8192;
+
+        let batch_count = scalar_degree / 2;
+        let half_rows = dimension / 2;
+        let scale = sd3b_scale();
+
+        assert_eq!(half_rows * scalar_degree, LARGE_DEGREE);
+
+        let lhs_clear = deterministic_cpmm_input(batch_count, dimension, 1);
+
+        // Reuse the deterministic CPMM family, but retain only one logical
+        // public vector per packed batch.
+        let vector_source = deterministic_cpmm_input(batch_count, dimension, 3);
+
+        let vectors: Vec<Vec<f64>> = vector_source
+            .iter()
+            .map(|matrix| (0..dimension).map(|row| matrix[row][0]).collect())
+            .collect();
+
+        let expected: Vec<Vec<f64>> = lhs_clear
+            .iter()
+            .zip(&vectors)
+            .map(|(matrix, vector)| {
+                (0..dimension)
+                    .map(|row| {
+                        (0..dimension)
+                            .map(|inner| matrix[row][inner] * vector[inner])
+                            .sum()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Embed each logical d x 1 public vector as the first column of a
+        // d x d plaintext matrix. All remaining columns are exactly zero.
+        let rhs_clear: Vec<Vec<Vec<f64>>> = vectors
+            .iter()
+            .map(|vector| {
+                (0..dimension)
+                    .map(|row| {
+                        let mut embedded_row = vec![0.0_f64; dimension];
+                        embedded_row[0] = vector[row];
+                        embedded_row
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let lhs_half: Vec<Vec<Vec<num_complex::Complex64>>> = lhs_clear
+            .iter()
+            .map(|matrix| super::as_half_row(matrix))
+            .collect();
+
+        let lhs_sinc = super::sinc_encode_batch(&lhs_half, scalar_degree);
+
+        assert_eq!(lhs_sinc.large_degree(), LARGE_DEGREE);
+        assert_eq!(lhs_sinc.num_columns(), dimension);
+
+        let basis = crate::ring::ModulusBasis::new(sd3b_moduli());
+
+        let chain = crate::ring::ModulusChain::from_top_basis(basis.clone());
+
+        let large_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), LARGE_DEGREE);
+
+        let scalar_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), scalar_degree);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x4241_5443_485F_4756 ^ dimension as u64);
+
+        let mut secret: Vec<i8> = (0..LARGE_DEGREE)
+            .map(|_| secret_rng.gen_range(-1_i8..=1_i8))
+            .collect();
+
+        if secret.iter().all(|&x| x == 0) {
+            secret[0] = 1;
+        }
+
+        let lhs_ciphertexts: Vec<crate::ckks::RnsCkksCiphertext> = lhs_sinc
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(column, coefficients)| {
+                let plaintext = quantize_coefficients(coefficients, &basis, scale);
+
+                let mut rng = ChaCha20Rng::seed_from_u64(0x4756_4D4D_0000_0000 ^ column as u64);
+
+                let rlwe = crate::grafting::encrypt_rns_raw_with_distribution_ntt_rng(
+                    &plaintext,
+                    2,
+                    crate::rlwe::ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    &secret,
+                    &large_plan,
+                    &mut rng,
+                );
+
+                crate::ckks::RnsCkksCiphertext::new(
+                    rlwe,
+                    crate::ckks::CkksChainState::top(&chain, scale),
+                    &chain,
+                )
+            })
+            .collect();
+
+        let rhs_plain = encode_packed_real_matrix(&rhs_clear, scalar_degree, &basis, scale);
+
+        let geometry = crate::eblas::BatchGemmGeometry::new(
+            crate::eblas::BatchGemmMechanism::Cpmm,
+            dimension,
+            scalar_degree,
+            LARGE_DEGREE,
+        );
+
+        let gemv_start = std::time::Instant::now();
+
+        let output = crate::eblas::batch_gemv_cpmm(
+            geometry,
+            &lhs_ciphertexts,
+            &rhs_plain,
+            &scalar_plan,
+            &chain,
+            scale,
+        );
+
+        let gemv_elapsed = gemv_start.elapsed();
+
+        assert_eq!(
+            output.rlwe().degree(),
+            LARGE_DEGREE,
+            "Batch CPMM GEMV must preserve the large-ring degree"
+        );
+
+        assert_eq!(
+            output.basis().moduli().len() + 1,
+            basis.moduli().len(),
+            "Batch CPMM GEMV must consume exactly one modulus level"
+        );
+
+        assert!(
+            output.scale().is_finite() && output.scale() > 0.0,
+            "Batch CPMM GEMV output scale must be finite and positive"
+        );
+
+        let decoded = decode_large_columns(
+            std::slice::from_ref(&output),
+            &secret,
+            scalar_degree,
+            half_rows,
+        );
+
+        let half_result = super::sinc_decode_batch(&decoded);
+
+        assert_eq!(half_result.len(), batch_count);
+
+        let actual: Vec<Vec<f64>> = half_result
+            .iter()
+            .map(|matrix| {
+                assert_eq!(matrix.len(), half_rows);
+                assert!(
+                    matrix.iter().all(|row| row.len() == 1),
+                    "Batch CPMM GEMV must decode exactly one logical column"
+                );
+
+                let mut vector = Vec::with_capacity(dimension);
+
+                vector.extend(matrix.iter().map(|row| row[0].re));
+                vector.extend(matrix.iter().map(|row| row[0].im));
+
+                vector
+            })
+            .collect();
+
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs_error = 0.0_f64;
+
+        for batch in 0..batch_count {
+            for row in 0..dimension {
+                let error = actual[batch][row] - expected[batch][row];
+
+                assert!(
+                    actual[batch][row].is_finite(),
+                    "Batch CPMM GEMV decoded a non-finite value"
+                );
+
+                squared_error += error * error;
+                squared_reference += expected[batch][row] * expected[batch][row];
+
+                max_abs_error = max_abs_error.max(error.abs());
+            }
+        }
+
+        assert!(
+            squared_reference > 0.0,
+            "Batch CPMM GEMV reference norm must be nonzero"
+        );
+
+        let relative_l2 = (squared_error / squared_reference).sqrt();
+
+        println!("BATCH_CPMM_GEMV_DIMENSION={dimension}");
+        println!("BATCH_CPMM_GEMV_SCALAR_DEGREE={scalar_degree}");
+        println!("BATCH_CPMM_GEMV_BATCH_COUNT={batch_count}");
+        println!("BATCH_CPMM_GEMV_OUTPUT_VALUES={}", batch_count * dimension);
+        println!(
+            "BATCH_CPMM_GEMV_MATRIX_MULT_MS={:.3}",
+            gemv_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!("BATCH_CPMM_GEMV_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CPMM_GEMV_MAX_ABS_ERROR={max_abs_error:.12e}");
+
+        (relative_l2, max_abs_error)
+    }
+
+    #[test]
+    fn batch_cpmm_gemv_d64_matches_clear_reference() {
+        let (relative_l2, max_abs_error) = cpmm_batch_gemv_capability(64, 256);
+
+        println!("BATCH_CPMM_GEMV_D64_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CPMM_GEMV_D64_MAX_ABS_ERROR={max_abs_error:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CPMM GEMV relative L2 error \
+             {relative_l2:e}"
+        );
+    }
+
     #[test]
     fn batch_galois_ntt_matches_reference_exactly() {
         use rand::SeedableRng;

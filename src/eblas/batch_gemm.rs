@@ -62,6 +62,50 @@ pub fn batch_gemm_cpmm(
     )
 }
 
+/// Executes packed ciphertext/plaintext GEMV through the Batch CPMM mechanism.
+///
+/// `lhs` is the encrypted packed representation of a batch of square matrices.
+/// `rhs` is an already encoded `d x d` plaintext embedding whose first column
+/// contains the logical public vectors and whose remaining columns are zero.
+///
+/// The CPMM execution therefore computes `[A * x, 0, ..., 0]`. This adapter
+/// returns only the first packed ciphertext column, which is the logical GEMV
+/// result. Packing, plaintext encoding, encryption, and decoding remain outside
+/// the eBLAS execution boundary.
+///
+/// This is a semantic GEMV adapter over the existing square CPMM mechanism,
+/// not a specialized lower-complexity GEMV kernel.
+pub fn batch_gemv_cpmm(
+    geometry: BatchGemmGeometry,
+    lhs: &[RnsCkksCiphertext],
+    rhs: &[Vec<RnsPolynomial>],
+    scalar_plan: &RnsNttPlan,
+    chain: &ModulusChain,
+    scale: f64,
+) -> RnsCkksCiphertext {
+    let dimension = geometry.dimension();
+
+    assert_eq!(
+        rhs.len(),
+        dimension,
+        "eBLAS Batch CPMM GEMV plaintext embedding must have one row per matrix row"
+    );
+    assert!(
+        rhs.iter().all(|row| row.len() == dimension),
+        "eBLAS Batch CPMM GEMV plaintext embedding must be square"
+    );
+
+    let mut output = batch_gemm_cpmm(geometry, lhs, rhs, scalar_plan, chain, scale);
+
+    assert_eq!(
+        output.len(),
+        dimension,
+        "eBLAS Batch CPMM GEMV square embedding returned unexpected output width"
+    );
+
+    output.remove(0)
+}
+
 /// Executes packed ciphertext/ciphertext GEMM through the Batch CCMM mechanism.
 ///
 /// Encoding, encryption, evaluation-key generation/preparation, decryption,
