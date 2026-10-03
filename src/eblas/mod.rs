@@ -16,6 +16,7 @@ pub mod batched_gemm;
 
 pub mod batch_gemm;
 pub mod batch_mapping;
+pub mod batch_representation;
 pub mod batch_schedule;
 
 pub mod decomposed_gemm;
@@ -39,6 +40,7 @@ pub use batch_gemm::{
     batch_gemv_cpmm,
 };
 pub use batch_mapping::BatchGemmTileBinding;
+pub use batch_representation::{represent_batch_gemm_work_group, BatchGemmRepresentation};
 
 pub use gemm::{gemm_cc, gemm_cc_auto, gemm_cc_structured_observed, gemm_cp, gemm_pc, gemm_pp};
 pub use native_representation::{
