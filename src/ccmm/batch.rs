@@ -2427,37 +2427,38 @@ pub fn encode_cpmm_real_batch(
         .collect()
 }
 
-/// Decrypts Batch CPMM large-ring output columns back into structural SinC
+/// Decrypts large-ring ciphertext columns back into structural SinC
 /// coefficient form.
 ///
-/// This is the inverse cryptographic representation boundary used after Batch
-/// CPMM execution. SinC slot decoding remains a separate structural step.
-pub fn decode_cpmm_large_columns(
+/// `dimension` is the number of scalar-ring rows combined into each large-ring
+/// column. For full-row CCMM this is the logical matrix dimension `d`; for
+/// half-row CPMM it is `d / 2`.
+///
+/// This is the inverse cryptographic representation boundary after Batch
+/// execution. SinC slot decoding remains a separate structural step.
+pub fn decode_sinc_large_columns(
     ciphertexts: &[crate::ckks::RnsCkksCiphertext],
     secret: &[i8],
     scalar_degree: usize,
-    half_rows: usize,
+    dimension: usize,
 ) -> SinCBatchPlaintext {
     use num_traits::ToPrimitive;
 
-    assert!(
-        scalar_degree > 0,
-        "Batch CPMM scalar degree must be positive"
-    );
-    assert!(half_rows > 0, "Batch CPMM half-row count must be positive");
+    assert!(scalar_degree > 0, "SinC scalar degree must be positive");
+    assert!(dimension > 0, "SinC row dimension must be positive");
     assert!(
         !ciphertexts.is_empty(),
-        "Batch CPMM output must contain at least one ciphertext column"
+        "SinC output must contain at least one ciphertext column"
     );
 
     let large_degree = scalar_degree
-        .checked_mul(half_rows)
-        .expect("Batch CPMM decoded large-ring degree overflow");
+        .checked_mul(dimension)
+        .expect("SinC decoded large-ring degree overflow");
 
     assert_eq!(
         secret.len(),
         large_degree,
-        "Batch CPMM decoding secret degree must match the large ring"
+        "SinC decoding secret degree must match the large ring"
     );
 
     let mut columns = Vec::with_capacity(ciphertexts.len());
@@ -2466,7 +2467,7 @@ pub fn decode_cpmm_large_columns(
         assert_eq!(
             ciphertext.rlwe().degree(),
             large_degree,
-            "Batch CPMM output ciphertext degree must match the SinC geometry"
+            "output ciphertext degree must match the SinC geometry"
         );
 
         let plan = crate::ring::RnsNttPlan::new(
@@ -2493,9 +2494,24 @@ pub fn decode_cpmm_large_columns(
 
     SinCBatchPlaintext {
         scalar_degree,
-        dimension: half_rows,
+        dimension,
         columns,
     }
+}
+
+/// Decrypts Batch CPMM output columns back into the half-row SinC
+/// representation used by CPMM.
+///
+/// This compatibility wrapper preserves the CPMM API while delegating the
+/// common cryptographic representation boundary to
+/// [`decode_sinc_large_columns`].
+pub fn decode_cpmm_large_columns(
+    ciphertexts: &[crate::ckks::RnsCkksCiphertext],
+    secret: &[i8],
+    scalar_degree: usize,
+    half_rows: usize,
+) -> SinCBatchPlaintext {
+    decode_sinc_large_columns(ciphertexts, secret, scalar_degree, half_rows)
 }
 
 #[cfg(test)]
