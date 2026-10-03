@@ -16,12 +16,14 @@ pub mod batched_gemm;
 
 pub mod batch_gemm;
 pub mod batch_mapping;
+pub mod batch_schedule;
 
 pub mod decomposed_gemm;
 pub mod decomposition;
 pub mod gemm;
 pub mod native_representation;
 pub use backend_policy::select_cc_backend;
+pub use batch_schedule::{batch_gemm_work_groups, BatchGemmScheduledProduct, BatchGemmWorkGroup};
 pub use decomposed_gemm::gemm_pp_decomposed;
 pub use decomposition::{
     GemmDecompositionCount, GemmDecompositionPlan, GemmTileProduct, NativeGemmTileMapping,
