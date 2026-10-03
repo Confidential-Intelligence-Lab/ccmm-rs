@@ -6051,6 +6051,20 @@ mod sinc_tests {
     }
 
     #[test]
+    fn batch_cpmm_gemv_d128_matches_clear_reference() {
+        let (relative_l2, max_abs_error) = cpmm_batch_gemv_capability(128, 128);
+
+        println!("BATCH_CPMM_GEMV_D128_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CPMM_GEMV_D128_MAX_ABS_ERROR={max_abs_error:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CPMM GEMV d=128 relative L2 error \
+             {relative_l2:e}"
+        );
+    }
+
+    #[test]
     fn batch_cpmm_dot_d64_matches_clear_reference() {
         let (relative_l2, max_abs_error, max_structural_zero) = cpmm_batch_dot_capability(64, 256);
 
@@ -6067,6 +6081,27 @@ mod sinc_tests {
         assert!(
             max_structural_zero < 1.0e-3,
             "authors-scale Batch CPMM DOT structural-zero error \
+             {max_structural_zero:e}"
+        );
+    }
+
+    #[test]
+    fn batch_cpmm_dot_d128_matches_clear_reference() {
+        let (relative_l2, max_abs_error, max_structural_zero) = cpmm_batch_dot_capability(128, 128);
+
+        println!("BATCH_CPMM_DOT_D128_REL_L2={relative_l2:.12e}");
+        println!("BATCH_CPMM_DOT_D128_MAX_ABS_ERROR={max_abs_error:.12e}");
+        println!("BATCH_CPMM_DOT_D128_MAX_STRUCTURAL_ZERO={max_structural_zero:.12e}");
+
+        assert!(
+            relative_l2 < 1.0e-3,
+            "authors-scale Batch CPMM DOT d=128 relative L2 error \
+             {relative_l2:e}"
+        );
+
+        assert!(
+            max_structural_zero < 1.0e-3,
+            "authors-scale Batch CPMM DOT d=128 structural-zero error \
              {max_structural_zero:e}"
         );
     }
