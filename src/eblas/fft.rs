@@ -10,11 +10,13 @@
 use num_complex::Complex64;
 use std::f64::consts::PI;
 
-use crate::ckks::{mod_switch_rns_ckks_to_next, CkksCanonicalEmbedding, RnsCkksEvaluator};
+use crate::ckks::{
+    mod_switch_rns_ckks_to_next, CkksCanonicalEmbedding, RnsCkksCiphertext, RnsCkksEvaluator,
+};
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, RnsNttPlan};
 
-use super::level1::scale_complex_cp;
+use super::level1::{multiply_complex_slots_cp, scale_complex_cp};
 
 /// Direction of a complex Fourier transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +355,82 @@ pub fn execute_packed_fft1_stage_pp(
                 + diagonals.rotate_right[index] * right
         })
         .collect()
+}
+
+/// Executes one packed radix-2 FFT1 stage on encrypted CKKS slots.
+///
+/// Logical FFT values occupy the first `diagonals.direct().len()` canonical
+/// CKKS slots. Remaining physical slots are inactive and are masked to zero.
+///
+/// The stage realizes
+///
+/// ```text
+/// y = D0 .* x + D1 .* rotl(x, h) + D2 .* rotr(x, h)
+/// ```
+///
+/// using two Galois rotations and three independent ciphertext-plaintext
+/// products. All three products begin at the same CKKS level and therefore
+/// consume one level in parallel. The final additions consume no further
+/// level.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn execute_packed_fft1_stage_cp(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedFft1StageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    let logical_length = diagonals.direct().len();
+    let slot_count = embedding.slot_count();
+
+    assert!(
+        logical_length <= slot_count,
+        "packed FFT1 logical length must not exceed CKKS slot count"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed FFT1 embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "packed FFT1 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "packed FFT1 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    assert!(
+        rotation < logical_length,
+        "packed FFT1 stage rotation must be smaller than logical length"
+    );
+
+    let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut left = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut right = vec![Complex64::new(0.0, 0.0); slot_count];
+
+    direct[..logical_length].copy_from_slice(diagonals.direct());
+    left[..logical_length].copy_from_slice(diagonals.rotate_left());
+    right[..logical_length].copy_from_slice(diagonals.rotate_right());
+
+    let rotated_left = evaluator.rotate_left(input, rotation);
+    let rotated_right = evaluator.rotate_right(input, rotation);
+
+    let direct_term = multiply_complex_slots_cp(input, &direct, embedding, chain, plan);
+    let left_term = multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan);
+    let right_term = multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan);
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
 }
 
 /// Executes an explicit FFT1 plan.
