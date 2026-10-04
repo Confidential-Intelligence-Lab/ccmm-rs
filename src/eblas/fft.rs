@@ -1623,6 +1623,80 @@ pub fn execute_packed_fft2_dif_stage_pp(
         .collect()
 }
 
+/// Executes one packed two-dimensional DIF FFT stage on encrypted CKKS slots.
+///
+/// The logical matrix occupies the first `shape.elements()` canonical slots in
+/// row-major order. Row stages use contiguous rotations by `half`; column
+/// stages use strided rotations by `half * cols`.
+///
+/// The stage computes
+///
+/// ```text
+/// y = D0 .* x + D1 .* rotl(x, r) + D2 .* rotr(x, r)
+/// ```
+///
+/// using three independent public slot-vector multiplications from the same
+/// input level. Therefore the complete stage consumes exactly one CKKS level,
+/// while the two rotations preserve level and scale.
+pub fn execute_packed_fft2_dif_stage_cp(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    let logical_length = diagonals.shape().elements();
+    let slot_count = embedding.slot_count();
+
+    assert!(
+        logical_length <= slot_count,
+        "packed FFT2 logical size must not exceed CKKS slot count"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed FFT2 embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "packed FFT2 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "packed FFT2 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    assert!(
+        rotation < logical_length,
+        "packed FFT2 stage rotation must be smaller than logical size"
+    );
+
+    let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut left = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut right = vec![Complex64::new(0.0, 0.0); slot_count];
+
+    direct[..logical_length].copy_from_slice(diagonals.direct());
+    left[..logical_length].copy_from_slice(diagonals.rotate_left());
+    right[..logical_length].copy_from_slice(diagonals.rotate_right());
+
+    let rotated_left = evaluator.rotate_left(input, rotation);
+    let rotated_right = evaluator.rotate_right(input, rotation);
+
+    let direct_term = multiply_complex_slots_cp(input, &direct, embedding, chain, plan);
+    let left_term = multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan);
+    let right_term = multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan);
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 /// Executes a complete packed cleartext two-dimensional DIF FFT.
 ///
 /// Input uses natural row-major order. The physical output has independently
