@@ -210,6 +210,151 @@ impl Fft1Plan {
     }
 }
 
+/// Public diagonal representation of one packed radix-2 FFT1 stage.
+///
+/// For a stage of span `m = 2h`, the packed stage is represented as
+///
+/// ```text
+/// y = D0 .* x + D1 .* rotl(x, h) + D2 .* rotr(x, h)
+/// ```
+///
+/// where all three diagonals are public. This representation preserves the
+/// canonical contiguous logical-slot order while masks prevent cyclic
+/// rotations from mixing adjacent butterfly blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedFft1StageDiagonals {
+    span: usize,
+    half: usize,
+    direct: Vec<Complex64>,
+    rotate_left: Vec<Complex64>,
+    rotate_right: Vec<Complex64>,
+}
+
+impl PackedFft1StageDiagonals {
+    /// Builds the three public diagonals for one radix-2 stage.
+    pub fn new(length: usize, span: usize, direction: FftDirection) -> Self {
+        assert!(length > 0, "packed FFT1 stage length must be positive");
+        assert!(
+            length.is_power_of_two(),
+            "packed FFT1 stage length must be a power of two"
+        );
+        assert!(
+            span >= 2 && span.is_power_of_two(),
+            "packed FFT1 stage span must be a power of two of at least two"
+        );
+        assert!(
+            span <= length,
+            "packed FFT1 stage span must not exceed transform length"
+        );
+        assert_eq!(
+            length % span,
+            0,
+            "packed FFT1 stage span must divide transform length"
+        );
+
+        let half = span / 2;
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        let mut direct = Vec::with_capacity(length);
+        let mut rotate_left = Vec::with_capacity(length);
+        let mut rotate_right = Vec::with_capacity(length);
+
+        for index in 0..length {
+            let offset = index % span;
+
+            if offset < half {
+                let angle = sign * 2.0 * PI * offset as f64 / span as f64;
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                direct.push(Complex64::new(1.0, 0.0));
+                rotate_left.push(twiddle);
+                rotate_right.push(Complex64::new(0.0, 0.0));
+            } else {
+                let exponent = offset - half;
+                let angle = sign * 2.0 * PI * exponent as f64 / span as f64;
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                direct.push(-twiddle);
+                rotate_left.push(Complex64::new(0.0, 0.0));
+                rotate_right.push(Complex64::new(1.0, 0.0));
+            }
+        }
+
+        Self {
+            span,
+            half,
+            direct,
+            rotate_left,
+            rotate_right,
+        }
+    }
+
+    pub const fn span(&self) -> usize {
+        self.span
+    }
+
+    pub const fn rotation(&self) -> usize {
+        self.half
+    }
+
+    pub fn direct(&self) -> &[Complex64] {
+        &self.direct
+    }
+
+    pub fn rotate_left(&self) -> &[Complex64] {
+        &self.rotate_left
+    }
+
+    pub fn rotate_right(&self) -> &[Complex64] {
+        &self.rotate_right
+    }
+}
+
+/// Executes one packed radix-2 stage in cleartext using its diagonal/rotation
+/// representation.
+///
+/// Rotations are cyclic over the complete logical vector. The public
+/// diagonals mask cross-block wrap-around so the result is exactly the same
+/// stage as the canonical radix-2 butterfly formulation.
+pub fn execute_packed_fft1_stage_pp(
+    input: &[Complex64],
+    diagonals: &PackedFft1StageDiagonals,
+) -> Vec<Complex64> {
+    let n = input.len();
+
+    assert_eq!(
+        diagonals.direct.len(),
+        n,
+        "packed FFT1 direct diagonal length must match input"
+    );
+    assert_eq!(
+        diagonals.rotate_left.len(),
+        n,
+        "packed FFT1 left diagonal length must match input"
+    );
+    assert_eq!(
+        diagonals.rotate_right.len(),
+        n,
+        "packed FFT1 right diagonal length must match input"
+    );
+
+    let rotation = diagonals.rotation();
+
+    (0..n)
+        .map(|index| {
+            let left = input[(index + rotation) % n];
+            let right = input[(index + n - rotation) % n];
+
+            diagonals.direct[index] * input[index]
+                + diagonals.rotate_left[index] * left
+                + diagonals.rotate_right[index] * right
+        })
+        .collect()
+}
+
 /// Executes an explicit FFT1 plan.
 ///
 /// This is numerically equivalent to [`fft1_pp`] but consumes the validated
@@ -729,6 +874,123 @@ fn bit_reverse_permute(values: &mut [Complex64]) {
 
 #[cfg(test)]
 mod tests {
+    fn execute_direct_fft1_stage(
+        input: &[Complex64],
+        stage: &Fft1Stage,
+        direction: FftDirection,
+    ) -> Vec<Complex64> {
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        let mut output = input.to_vec();
+
+        for butterfly in stage.butterflies() {
+            let angle =
+                sign * 2.0 * PI * butterfly.twiddle_exponent() as f64 / butterfly.span() as f64;
+            let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+            let even = input[butterfly.even_index()];
+            let odd = twiddle * input[butterfly.odd_index()];
+
+            output[butterfly.even_index()] = even + odd;
+            output[butterfly.odd_index()] = even - odd;
+        }
+
+        output
+    }
+
+    #[test]
+    fn packed_stage_diagonals_match_direct_butterflies_through_256() {
+        for &direction in &[FftDirection::Forward, FftDirection::Inverse] {
+            for exponent in 1..=8 {
+                let n = 1usize << exponent;
+                let plan = Fft1Plan::new(Fft1Shape::new(n));
+
+                let input: Vec<Complex64> = (0..n)
+                    .map(|index| {
+                        let re = ((index * 7 + 3) % 31) as f64 - 15.0;
+                        let im = ((index * 13 + 5) % 29) as f64 - 14.0;
+                        Complex64::new(re / 17.0, im / 19.0)
+                    })
+                    .collect();
+
+                for stage in plan.stages() {
+                    let diagonals = PackedFft1StageDiagonals::new(n, stage.span(), direction);
+
+                    assert_eq!(diagonals.span(), stage.span());
+                    assert_eq!(diagonals.rotation(), stage.span() / 2);
+
+                    let packed = execute_packed_fft1_stage_pp(&input, &diagonals);
+                    let direct = execute_direct_fft1_stage(&input, stage, direction);
+
+                    let max_abs = packed
+                        .iter()
+                        .zip(&direct)
+                        .map(|(lhs, rhs)| (*lhs - *rhs).norm())
+                        .fold(0.0_f64, f64::max);
+
+                    println!(
+                        "PACKED_FFT1_STAGE_CASE=N{n} DIRECTION={direction:?} SPAN={} ROTATION={} MAX_ABS={max_abs:.12e}",
+                        stage.span(),
+                        diagonals.rotation()
+                    );
+
+                    assert!(
+                        max_abs <= 1.0e-12,
+                        "packed FFT1 stage mismatch for N={n}, direction={direction:?}, span={}: {max_abs:e}",
+                        stage.span()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_stage_masks_expose_expected_n8_span4_structure() {
+        let diagonals = PackedFft1StageDiagonals::new(8, 4, FftDirection::Forward);
+
+        let one = Complex64::new(1.0, 0.0);
+        let zero = Complex64::new(0.0, 0.0);
+        let minus_one = Complex64::new(-1.0, 0.0);
+        let minus_i = Complex64::new(0.0, -1.0);
+        let plus_i = Complex64::new(0.0, 1.0);
+
+        let expected_direct = [one, one, minus_one, plus_i, one, one, minus_one, plus_i];
+        let expected_rotate_left = [one, minus_i, zero, zero, one, minus_i, zero, zero];
+        let expected_rotate_right = [zero, zero, one, one, zero, zero, one, one];
+
+        let max_direct_error = diagonals
+            .direct()
+            .iter()
+            .zip(expected_direct)
+            .map(|(actual, expected)| (*actual - expected).norm())
+            .fold(0.0_f64, f64::max);
+
+        let max_left_error = diagonals
+            .rotate_left()
+            .iter()
+            .zip(expected_rotate_left)
+            .map(|(actual, expected)| (*actual - expected).norm())
+            .fold(0.0_f64, f64::max);
+
+        let max_right_error = diagonals
+            .rotate_right()
+            .iter()
+            .zip(expected_rotate_right)
+            .map(|(actual, expected)| (*actual - expected).norm())
+            .fold(0.0_f64, f64::max);
+
+        println!(
+            "PACKED_FFT1_STAGE_MASK_CASE=N8 SPAN4 DIRECT_MAX_ABS={max_direct_error:.12e} LEFT_MAX_ABS={max_left_error:.12e} RIGHT_MAX_ABS={max_right_error:.12e}"
+        );
+
+        assert!(max_direct_error <= 1.0e-12);
+        assert!(max_left_error <= 1.0e-12);
+        assert!(max_right_error <= 1.0e-12);
+    }
+
     use super::*;
 
     fn deterministic_complex(length: usize, salt: usize) -> Vec<Complex64> {
