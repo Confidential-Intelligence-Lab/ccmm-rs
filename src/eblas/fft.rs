@@ -1426,6 +1426,252 @@ pub fn fft2_pp(shape: Fft2Shape, direction: FftDirection, input: &[Complex64]) -
     values
 }
 
+/// Axis transformed by a packed two-dimensional FFT stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedFft2Axis {
+    /// Transform independently across each row.
+    Rows,
+    /// Transform independently down each column.
+    Columns,
+}
+
+/// Public diagonal representation of one packed radix-2 DIF FFT2 stage.
+///
+/// The logical matrix occupies contiguous row-major slots. Row stages use
+/// rotations by `half`; column stages use rotations by `half * cols`.
+///
+/// The three public diagonals realize
+///
+/// ```text
+/// upper: y = x + partner
+/// lower: y = (partner - x) * w
+/// ```
+///
+/// where `partner` is selected by the axis-specific cyclic rotation. Public
+/// masks prevent cyclic rotations from coupling independent rows, columns, or
+/// butterfly blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedFft2DifStageDiagonals {
+    shape: Fft2Shape,
+    axis: PackedFft2Axis,
+    span: usize,
+    half: usize,
+    rotation: usize,
+    direct: Vec<Complex64>,
+    rotate_left: Vec<Complex64>,
+    rotate_right: Vec<Complex64>,
+}
+
+impl PackedFft2DifStageDiagonals {
+    /// Constructs one packed FFT2 DIF stage.
+    pub fn new(
+        shape: Fft2Shape,
+        axis: PackedFft2Axis,
+        span: usize,
+        direction: FftDirection,
+    ) -> Self {
+        let axis_length = match axis {
+            PackedFft2Axis::Rows => shape.cols(),
+            PackedFft2Axis::Columns => shape.rows(),
+        };
+
+        assert!(
+            span >= 2 && span.is_power_of_two(),
+            "packed FFT2 DIF span must be a power of two of at least two"
+        );
+        assert!(
+            span <= axis_length,
+            "packed FFT2 DIF span must not exceed the transformed axis"
+        );
+        assert_eq!(
+            axis_length % span,
+            0,
+            "packed FFT2 DIF span must divide the transformed axis"
+        );
+
+        let half = span / 2;
+        let rotation = match axis {
+            PackedFft2Axis::Rows => half,
+            PackedFft2Axis::Columns => half
+                .checked_mul(shape.cols())
+                .expect("packed FFT2 column rotation overflow"),
+        };
+
+        let mut direct = vec![Complex64::new(0.0, 0.0); shape.elements()];
+        let mut rotate_left = vec![Complex64::new(0.0, 0.0); shape.elements()];
+        let mut rotate_right = vec![Complex64::new(0.0, 0.0); shape.elements()];
+
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        for row in 0..shape.rows() {
+            for col in 0..shape.cols() {
+                let index = row * shape.cols() + col;
+                let axis_index = match axis {
+                    PackedFft2Axis::Rows => col,
+                    PackedFft2Axis::Columns => row,
+                };
+                let offset = axis_index % span;
+                let twiddle_index = offset % half;
+                let angle = sign * 2.0 * PI * twiddle_index as f64 / span as f64;
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                if offset < half {
+                    direct[index] = Complex64::new(1.0, 0.0);
+                    rotate_left[index] = Complex64::new(1.0, 0.0);
+                } else {
+                    direct[index] = -twiddle;
+                    rotate_right[index] = twiddle;
+                }
+            }
+        }
+
+        Self {
+            shape,
+            axis,
+            span,
+            half,
+            rotation,
+            direct,
+            rotate_left,
+            rotate_right,
+        }
+    }
+
+    pub const fn shape(&self) -> Fft2Shape {
+        self.shape
+    }
+
+    pub const fn axis(&self) -> PackedFft2Axis {
+        self.axis
+    }
+
+    pub const fn span(&self) -> usize {
+        self.span
+    }
+
+    pub const fn half(&self) -> usize {
+        self.half
+    }
+
+    pub const fn rotation(&self) -> usize {
+        self.rotation
+    }
+
+    pub fn direct(&self) -> &[Complex64] {
+        &self.direct
+    }
+
+    pub fn rotate_left(&self) -> &[Complex64] {
+        &self.rotate_left
+    }
+
+    pub fn rotate_right(&self) -> &[Complex64] {
+        &self.rotate_right
+    }
+}
+
+fn rotate_left_complex(values: &[Complex64], amount: usize) -> Vec<Complex64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    let amount = amount % values.len();
+    (0..values.len())
+        .map(|index| values[(index + amount) % values.len()])
+        .collect()
+}
+
+fn rotate_right_complex(values: &[Complex64], amount: usize) -> Vec<Complex64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    let amount = amount % values.len();
+    (0..values.len())
+        .map(|index| values[(index + values.len() - amount) % values.len()])
+        .collect()
+}
+
+/// Executes one packed cleartext FFT2 DIF stage using the same
+/// diagonal-times-rotation algebra required by the encrypted realization.
+pub fn execute_packed_fft2_dif_stage_pp(
+    input: &[Complex64],
+    diagonals: &PackedFft2DifStageDiagonals,
+) -> Vec<Complex64> {
+    assert_eq!(
+        input.len(),
+        diagonals.shape().elements(),
+        "packed FFT2 DIF input length must match shape"
+    );
+
+    let left = rotate_left_complex(input, diagonals.rotation());
+    let right = rotate_right_complex(input, diagonals.rotation());
+
+    input
+        .iter()
+        .zip(left.iter())
+        .zip(right.iter())
+        .enumerate()
+        .map(|(index, ((current, left), right))| {
+            diagonals.direct()[index] * *current
+                + diagonals.rotate_left()[index] * *left
+                + diagonals.rotate_right()[index] * *right
+        })
+        .collect()
+}
+
+/// Executes a complete packed cleartext two-dimensional DIF FFT.
+///
+/// Input uses natural row-major order. The physical output has independently
+/// bit-reversed row and column coordinates:
+///
+/// ```text
+/// physical(bit_reverse(row), bit_reverse(col)) = logical(row, col)
+/// ```
+///
+/// No transpose or global permutation is executed between dimensions.
+pub fn execute_packed_fft2_dif_pp(
+    shape: Fft2Shape,
+    direction: FftDirection,
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    assert_eq!(
+        input.len(),
+        shape.elements(),
+        "packed FFT2 DIF input length must match shape"
+    );
+
+    let mut values = input.to_vec();
+
+    let mut span = shape.cols();
+    while span >= 2 {
+        let diagonals =
+            PackedFft2DifStageDiagonals::new(shape, PackedFft2Axis::Rows, span, direction);
+        values = execute_packed_fft2_dif_stage_pp(&values, &diagonals);
+        span /= 2;
+    }
+
+    span = shape.rows();
+    while span >= 2 {
+        let diagonals =
+            PackedFft2DifStageDiagonals::new(shape, PackedFft2Axis::Columns, span, direction);
+        values = execute_packed_fft2_dif_stage_pp(&values, &diagonals);
+        span /= 2;
+    }
+
+    if direction == FftDirection::Inverse {
+        let normalization = 1.0 / shape.elements() as f64;
+        for value in &mut values {
+            *value *= normalization;
+        }
+    }
+
+    values
+}
+
 fn bit_reverse_permute(values: &mut [Complex64]) {
     let n = values.len();
 
@@ -1706,6 +1952,198 @@ mod tests {
             .zip(expected)
             .map(|(actual, expected)| (*actual - *expected).norm())
             .fold(0.0_f64, f64::max)
+    }
+
+    fn bit_reverse_index_for_test(index: usize, length: usize) -> usize {
+        if length <= 1 {
+            return 0;
+        }
+
+        let bits = length.trailing_zeros();
+        index.reverse_bits() >> (usize::BITS - bits)
+    }
+
+    fn direct_fft2_dif_stage_for_test(
+        shape: Fft2Shape,
+        axis: PackedFft2Axis,
+        span: usize,
+        direction: FftDirection,
+        input: &[Complex64],
+    ) -> Vec<Complex64> {
+        let mut output = input.to_vec();
+        let half = span / 2;
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        match axis {
+            PackedFft2Axis::Rows => {
+                for row in 0..shape.rows() {
+                    for base_col in (0..shape.cols()).step_by(span) {
+                        for offset in 0..half {
+                            let upper = row * shape.cols() + base_col + offset;
+                            let lower = upper + half;
+                            let angle = sign * 2.0 * PI * offset as f64 / span as f64;
+                            let twiddle = Complex64::new(angle.cos(), angle.sin());
+                            let a = input[upper];
+                            let b = input[lower];
+
+                            output[upper] = a + b;
+                            output[lower] = (a - b) * twiddle;
+                        }
+                    }
+                }
+            }
+            PackedFft2Axis::Columns => {
+                for col in 0..shape.cols() {
+                    for base_row in (0..shape.rows()).step_by(span) {
+                        for offset in 0..half {
+                            let upper = (base_row + offset) * shape.cols() + col;
+                            let lower = (base_row + offset + half) * shape.cols() + col;
+                            let angle = sign * 2.0 * PI * offset as f64 / span as f64;
+                            let twiddle = Complex64::new(angle.cos(), angle.sin());
+                            let a = input[upper];
+                            let b = input[lower];
+
+                            output[upper] = a + b;
+                            output[lower] = (a - b) * twiddle;
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn packed_fft2_dif_stages_match_direct_butterflies() {
+        let cases = [(2, 2), (2, 4), (4, 2), (4, 4), (4, 8), (8, 4), (8, 8)];
+        let mut case_count = 0usize;
+
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            for (rows, cols) in cases {
+                let shape = Fft2Shape::new(rows, cols);
+                let input: Vec<Complex64> = (0..shape.elements())
+                    .map(|index| {
+                        Complex64::new(
+                            (((index * 7 + 3) % 23) as f64 - 11.0) / 16.0,
+                            (((index * 11 + 5) % 29) as f64 - 14.0) / 16.0,
+                        )
+                    })
+                    .collect();
+
+                for axis in [PackedFft2Axis::Rows, PackedFft2Axis::Columns] {
+                    let axis_length = match axis {
+                        PackedFft2Axis::Rows => cols,
+                        PackedFft2Axis::Columns => rows,
+                    };
+
+                    let mut span = axis_length;
+                    while span >= 2 {
+                        let diagonals =
+                            PackedFft2DifStageDiagonals::new(shape, axis, span, direction);
+                        let actual = execute_packed_fft2_dif_stage_pp(&input, &diagonals);
+                        let expected =
+                            direct_fft2_dif_stage_for_test(shape, axis, span, direction, &input);
+
+                        let max_abs = actual
+                            .iter()
+                            .zip(&expected)
+                            .map(|(a, b)| (*a - *b).norm())
+                            .fold(0.0_f64, f64::max);
+
+                        println!(
+                            "PACKED_FFT2_DIF_STAGE_CASE=ROWS{rows} COLS{cols} \
+                             AXIS={axis:?} SPAN={span} ROTATION={} \
+                             DIRECTION={direction:?} MAX_ABS={max_abs:.12e}",
+                            diagonals.rotation()
+                        );
+
+                        assert!(
+                            max_abs < 1.0e-12,
+                            "packed FFT2 DIF stage mismatch for \
+                             {rows}x{cols} {axis:?} span {span} {direction:?}: {max_abs}"
+                        );
+
+                        case_count += 1;
+                        span /= 2;
+                    }
+                }
+            }
+        }
+
+        println!("PACKED_FFT2_DIF_STAGE_CASE_COUNT={case_count}");
+        assert_eq!(case_count, 56);
+    }
+
+    #[test]
+    fn packed_fft2_dif_matches_canonical_fft2_without_transpose() {
+        let cases = [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (2, 4),
+            (4, 2),
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+        ];
+        let mut case_count = 0usize;
+
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            for (rows, cols) in cases {
+                let shape = Fft2Shape::new(rows, cols);
+                let input: Vec<Complex64> = (0..shape.elements())
+                    .map(|index| {
+                        Complex64::new(
+                            (((index * 13 + 1) % 31) as f64 - 15.0) / 32.0,
+                            (((index * 17 + 9) % 37) as f64 - 18.0) / 32.0,
+                        )
+                    })
+                    .collect();
+
+                let packed = execute_packed_fft2_dif_pp(shape, direction, &input);
+                let canonical = fft2_pp(shape, direction, &input);
+
+                let mut max_abs = 0.0_f64;
+
+                for logical_row in 0..rows {
+                    for logical_col in 0..cols {
+                        let physical_row = bit_reverse_index_for_test(logical_row, rows);
+                        let physical_col = bit_reverse_index_for_test(logical_col, cols);
+
+                        let physical_index = physical_row * cols + physical_col;
+                        let logical_index = logical_row * cols + logical_col;
+
+                        max_abs =
+                            max_abs.max((packed[physical_index] - canonical[logical_index]).norm());
+                    }
+                }
+
+                println!(
+                    "PACKED_FFT2_DIF_CASE=ROWS{rows} COLS{cols} \
+                     DIRECTION={direction:?} ROW_STAGES={} COLUMN_STAGES={} \
+                     TRANSPOSES=0 MAX_ABS={max_abs:.12e}",
+                    shape.row_stages(),
+                    shape.column_stages()
+                );
+
+                assert!(
+                    max_abs < 1.0e-11,
+                    "packed FFT2 DIF mismatch for \
+                     {rows}x{cols} {direction:?}: {max_abs}"
+                );
+
+                case_count += 1;
+            }
+        }
+
+        println!("PACKED_FFT2_DIF_CASE_COUNT={case_count}");
+        assert_eq!(case_count, 20);
     }
 
     #[test]
