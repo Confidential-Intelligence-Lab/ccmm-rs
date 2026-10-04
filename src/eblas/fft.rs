@@ -889,6 +889,230 @@ pub fn execute_fft1_plan(
     values
 }
 
+/// Executes one packed radix-2 butterfly across two encrypted CKKS
+/// ciphertexts using a public complex twiddle vector.
+///
+/// For encrypted packed operands `a` and `b`, this computes
+///
+/// ```text
+/// t = twiddles .* b
+/// u = a + t
+/// v = a - t
+/// ```
+///
+/// `multiply_complex_slots_cp` performs the public slot-vector
+/// multiplication and consumes one CKKS level. `a` is modulus-switched
+/// to the same next level without changing its scale, after which
+/// ciphertext addition and subtraction preserve the aligned CKKS state.
+///
+/// This primitive is intended for factored/distributed FFT execution in
+/// which one logical FFT butterfly spans two ciphertexts. Both operands
+/// remain encrypted throughout; only the FFT twiddle vector is public.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn packed_fft_butterfly_cp(
+    evaluator: &RnsCkksEvaluator<'_>,
+    a: &RnsCkksCiphertext,
+    b: &RnsCkksCiphertext,
+    twiddles: &[Complex64],
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> (RnsCkksCiphertext, RnsCkksCiphertext) {
+    a.assert_matches_chain(chain);
+    b.assert_matches_chain(chain);
+
+    assert_eq!(
+        a.rlwe().degree(),
+        b.rlwe().degree(),
+        "packed FFT butterfly operands must have matching ring degrees"
+    );
+    assert_eq!(
+        a.level(),
+        b.level(),
+        "packed FFT butterfly operands must have matching levels"
+    );
+    assert_eq!(
+        a.scale(),
+        b.scale(),
+        "packed FFT butterfly operands must have matching scales"
+    );
+    assert_eq!(
+        a.basis(),
+        b.basis(),
+        "packed FFT butterfly operands must have matching RNS bases"
+    );
+    assert_eq!(
+        embedding.degree(),
+        a.rlwe().degree(),
+        "packed FFT butterfly embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        twiddles.len(),
+        embedding.slot_count(),
+        "packed FFT butterfly twiddle vector must match CKKS slot count"
+    );
+    assert_eq!(
+        plan.degree(),
+        a.rlwe().degree(),
+        "packed FFT butterfly NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        a.basis().moduli(),
+        "packed FFT butterfly NTT plan basis must match ciphertext basis"
+    );
+    assert!(
+        chain.has_next_level(a.level()),
+        "packed FFT butterfly requires another CKKS chain level"
+    );
+
+    twiddles.iter().for_each(|twiddle| {
+        assert!(
+            twiddle.re.is_finite() && twiddle.im.is_finite(),
+            "packed FFT butterfly twiddles must be finite"
+        );
+    });
+
+    let weighted_b = multiply_complex_slots_cp(b, twiddles, embedding, chain, plan);
+
+    let aligned_a = mod_switch_rns_ckks_to_next(a, chain);
+
+    assert_eq!(
+        aligned_a.level(),
+        weighted_b.level(),
+        "packed FFT butterfly aligned operands must have matching levels"
+    );
+    assert_eq!(
+        aligned_a.scale(),
+        weighted_b.scale(),
+        "packed FFT butterfly aligned operands must have matching scales"
+    );
+    assert_eq!(
+        aligned_a.basis(),
+        weighted_b.basis(),
+        "packed FFT butterfly aligned operands must have matching bases"
+    );
+
+    let upper = evaluator.add(&aligned_a, &weighted_b);
+    let lower = evaluator.sub(&aligned_a, &weighted_b);
+
+    (upper, lower)
+}
+
+/// Executes one packed decimation-in-frequency radix-2 butterfly across
+/// two encrypted CKKS ciphertexts using a public complex twiddle vector.
+///
+/// For encrypted packed operands `a` and `b`, this computes
+///
+/// ```text
+/// sum  = a + b
+/// diff = a - b
+/// u    = sum
+/// v    = twiddles .* diff
+/// ```
+///
+/// This matches the packed FFT2 DIF convention used by
+/// `PackedFft2DifStageDiagonals`. For an upper/lower pair
+/// `(a, b)`, the lower branch is `(a - b) * twiddle`.
+///
+/// The public twiddle multiplication consumes one CKKS level. The sum is
+/// modulus-switched to the same next level without changing its scale.
+///
+/// Both data operands remain encrypted throughout. Only the FFT twiddle
+/// vector is public.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn packed_fft_dif_butterfly_cp(
+    evaluator: &RnsCkksEvaluator<'_>,
+    a: &RnsCkksCiphertext,
+    b: &RnsCkksCiphertext,
+    twiddles: &[Complex64],
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> (RnsCkksCiphertext, RnsCkksCiphertext) {
+    a.assert_matches_chain(chain);
+    b.assert_matches_chain(chain);
+
+    assert_eq!(
+        a.rlwe().degree(),
+        b.rlwe().degree(),
+        "packed DIF butterfly operands must have matching ring degrees"
+    );
+    assert_eq!(
+        a.level(),
+        b.level(),
+        "packed DIF butterfly operands must have matching levels"
+    );
+    assert_eq!(
+        a.scale(),
+        b.scale(),
+        "packed DIF butterfly operands must have matching scales"
+    );
+    assert_eq!(
+        a.basis(),
+        b.basis(),
+        "packed DIF butterfly operands must have matching RNS bases"
+    );
+    assert_eq!(
+        embedding.degree(),
+        a.rlwe().degree(),
+        "packed DIF butterfly embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        twiddles.len(),
+        embedding.slot_count(),
+        "packed DIF butterfly twiddle vector must match CKKS slot count"
+    );
+    assert_eq!(
+        plan.degree(),
+        a.rlwe().degree(),
+        "packed DIF butterfly NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        a.basis().moduli(),
+        "packed DIF butterfly NTT plan basis must match ciphertext basis"
+    );
+    assert!(
+        chain.has_next_level(a.level()),
+        "packed DIF butterfly requires another CKKS chain level"
+    );
+
+    twiddles.iter().for_each(|twiddle| {
+        assert!(
+            twiddle.re.is_finite() && twiddle.im.is_finite(),
+            "packed DIF butterfly twiddles must be finite"
+        );
+    });
+
+    let sum = evaluator.add(a, b);
+    let diff = evaluator.sub(a, b);
+
+    let weighted_diff = multiply_complex_slots_cp(&diff, twiddles, embedding, chain, plan);
+
+    let aligned_sum = mod_switch_rns_ckks_to_next(&sum, chain);
+
+    assert_eq!(
+        aligned_sum.level(),
+        weighted_diff.level(),
+        "packed DIF butterfly aligned outputs must have matching levels"
+    );
+    assert_eq!(
+        aligned_sum.scale(),
+        weighted_diff.scale(),
+        "packed DIF butterfly aligned outputs must have matching scales"
+    );
+    assert_eq!(
+        aligned_sum.basis(),
+        weighted_diff.basis(),
+        "packed DIF butterfly aligned outputs must have matching bases"
+    );
+
+    (aligned_sum, weighted_diff)
+}
+
 /// Executes one radix-2 FFT butterfly over encrypted operands and a public
 /// complex twiddle.
 ///
@@ -1686,12 +1910,64 @@ pub fn execute_packed_fft2_dif_stage_cp(
     left[..logical_length].copy_from_slice(diagonals.rotate_left());
     right[..logical_length].copy_from_slice(diagonals.rotate_right());
 
-    let rotated_left = evaluator.rotate_left(input, rotation);
-    let rotated_right = evaluator.rotate_right(input, rotation);
+    let left_exponent = crate::ckks::rotation_exponent_left(input.rlwe().degree(), rotation);
+    let right_exponent = crate::ckks::rotation_exponent_right(input.rlwe().degree(), rotation);
 
-    let direct_term = multiply_complex_slots_cp(input, &direct, embedding, chain, plan);
-    let left_term = multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan);
-    let right_term = multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan);
+    let left_key = evaluator.keys().galois_for(input.state(), left_exponent);
+    let right_key = evaluator.keys().galois_for(input.state(), right_exponent);
+
+    /*
+     * The two Galois rotations are independent computations over the same
+     * stage input. Execute them concurrently while preserving the exact
+     * rotation semantics and level state.
+     */
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_handle = scope.spawn(|| {
+            crate::ckks::rotate_left_rns_ckks_with_ntt(input, rotation, left_key, chain, plan)
+        });
+
+        let right_handle = scope.spawn(|| {
+            crate::ckks::rotate_right_rns_ckks_with_ntt(input, rotation, right_key, chain, plan)
+        });
+
+        (
+            left_handle
+                .join()
+                .expect("packed FFT2 left rotation worker panicked"),
+            right_handle
+                .join()
+                .expect("packed FFT2 right rotation worker panicked"),
+        )
+    });
+
+    /*
+     * Once the rotations are available, the direct, left, and right public
+     * diagonal products are mutually independent. Execute all three
+     * concurrently. Each product performs exactly the same CP multiply and
+     * rescale as the serial implementation.
+     */
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_handle =
+            scope.spawn(|| multiply_complex_slots_cp(input, &direct, embedding, chain, plan));
+
+        let left_handle =
+            scope.spawn(|| multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan));
+
+        let right_handle = scope
+            .spawn(|| multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan));
+
+        (
+            direct_handle
+                .join()
+                .expect("packed FFT2 direct CP worker panicked"),
+            left_handle
+                .join()
+                .expect("packed FFT2 left CP worker panicked"),
+            right_handle
+                .join()
+                .expect("packed FFT2 right CP worker panicked"),
+        )
+    });
 
     let partial = evaluator.add(&direct_term, &left_term);
     evaluator.add(&partial, &right_term)

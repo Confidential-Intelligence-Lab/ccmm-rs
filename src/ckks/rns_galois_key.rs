@@ -622,6 +622,110 @@ pub fn rotate_right_rns_ckks(
     apply_rns_ckks_galois_automorphism(ciphertext, galois_key, chain)
 }
 
+/// Rotates logical CKKS slots left using the canonical Galois key and
+/// NTT-backed key switching.
+///
+/// The active CKKS level, basis, and scale are preserved.
+pub fn rotate_left_rns_ckks_with_ntt(
+    ciphertext: &crate::ckks::RnsCkksCiphertext,
+    steps: usize,
+    galois_key: &RnsGaloisKey,
+    chain: &crate::ring::ModulusChain,
+    plan: &crate::ring::RnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    ciphertext.assert_matches_chain(chain);
+
+    let expected = crate::ckks::rotation_exponent_left(ciphertext.rlwe().degree(), steps);
+
+    assert_eq!(
+        galois_key.exponent(),
+        expected,
+        "RNS Galois key exponent does not match requested left rotation"
+    );
+
+    let transformed = apply_rns_galois_automorphism_with_ntt(ciphertext.rlwe(), galois_key, plan);
+
+    crate::ckks::RnsCkksCiphertext::new(transformed, ciphertext.state().clone(), chain)
+}
+
+/// Rotates logical CKKS slots right using the canonical Galois key and
+/// NTT-backed key switching.
+///
+/// The active CKKS level, basis, and scale are preserved.
+pub fn rotate_right_rns_ckks_with_ntt(
+    ciphertext: &crate::ckks::RnsCkksCiphertext,
+    steps: usize,
+    galois_key: &RnsGaloisKey,
+    chain: &crate::ring::ModulusChain,
+    plan: &crate::ring::RnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    ciphertext.assert_matches_chain(chain);
+
+    let expected = crate::ckks::rotation_exponent_right(ciphertext.rlwe().degree(), steps);
+
+    assert_eq!(
+        galois_key.exponent(),
+        expected,
+        "RNS Galois key exponent does not match requested right rotation"
+    );
+
+    let transformed = apply_rns_galois_automorphism_with_ntt(ciphertext.rlwe(), galois_key, plan);
+
+    crate::ckks::RnsCkksCiphertext::new(transformed, ciphertext.state().clone(), chain)
+}
+
+/// Rotates logical CKKS slots left using a prepared NTT-domain Galois key.
+///
+/// The active CKKS level, basis, and scale are preserved.
+pub fn rotate_left_rns_ckks_with_prepared_ntt(
+    ciphertext: &crate::ckks::RnsCkksCiphertext,
+    steps: usize,
+    galois_key: &PreparedRnsGaloisKey,
+    chain: &crate::ring::ModulusChain,
+    plan: &crate::ring::RnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    ciphertext.assert_matches_chain(chain);
+
+    let expected = crate::ckks::rotation_exponent_left(ciphertext.rlwe().degree(), steps);
+
+    assert_eq!(
+        galois_key.exponent(),
+        expected,
+        "prepared RNS Galois key exponent does not match requested left rotation"
+    );
+
+    let transformed =
+        apply_rns_galois_automorphism_with_prepared_ntt(ciphertext.rlwe(), galois_key, plan);
+
+    crate::ckks::RnsCkksCiphertext::new(transformed, ciphertext.state().clone(), chain)
+}
+
+/// Rotates logical CKKS slots right using a prepared NTT-domain Galois key.
+///
+/// The active CKKS level, basis, and scale are preserved.
+pub fn rotate_right_rns_ckks_with_prepared_ntt(
+    ciphertext: &crate::ckks::RnsCkksCiphertext,
+    steps: usize,
+    galois_key: &PreparedRnsGaloisKey,
+    chain: &crate::ring::ModulusChain,
+    plan: &crate::ring::RnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    ciphertext.assert_matches_chain(chain);
+
+    let expected = crate::ckks::rotation_exponent_right(ciphertext.rlwe().degree(), steps);
+
+    assert_eq!(
+        galois_key.exponent(),
+        expected,
+        "prepared RNS Galois key exponent does not match requested right rotation"
+    );
+
+    let transformed =
+        apply_rns_galois_automorphism_with_prepared_ntt(ciphertext.rlwe(), galois_key, plan);
+
+    crate::ckks::RnsCkksCiphertext::new(transformed, ciphertext.state().clone(), chain)
+}
+
 /// Applies logical CKKS complex conjugation at the current RNS level.
 ///
 /// The supplied Galois key must correspond to exponent `-1 mod 2N`.

@@ -43,6 +43,77 @@ pub struct CkksCanonicalEmbedding {
     slot_root_indices: Vec<usize>,
 }
 
+/// In-place radix-2 complex DFT.
+///
+/// `sign = -1.0` computes
+///
+/// ```text
+/// X[k] = sum_j x[j] exp(-2*pi*i*j*k/N)
+/// ```
+///
+/// while `sign = +1.0` computes the corresponding positive-sign transform.
+///
+/// No normalization is applied.
+fn radix2_dft_in_place(values: &mut [Complex64], sign: f64) {
+    let n = values.len();
+
+    assert!(
+        n > 0 && n.is_power_of_two(),
+        "radix-2 DFT length must be a positive power of two"
+    );
+    assert!(
+        sign == -1.0 || sign == 1.0,
+        "radix-2 DFT sign must be -1 or +1"
+    );
+
+    /*
+     * Bit-reversal permutation.
+     */
+    let mut j = 0_usize;
+
+    for i in 1..n {
+        let mut bit = n >> 1;
+
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+
+        j ^= bit;
+
+        if i < j {
+            values.swap(i, j);
+        }
+    }
+
+    /*
+     * Iterative radix-2 Cooley-Tukey butterflies.
+     */
+    let mut length = 2_usize;
+
+    while length <= n {
+        let angle = sign * 2.0 * PI / length as f64;
+        let root = Complex64::from_polar(1.0, angle);
+        let half = length / 2;
+
+        for start in (0..n).step_by(length) {
+            let mut twiddle = Complex64::new(1.0, 0.0);
+
+            for offset in 0..half {
+                let even = values[start + offset];
+                let odd = values[start + offset + half] * twiddle;
+
+                values[start + offset] = even + odd;
+                values[start + offset + half] = even - odd;
+
+                twiddle *= root;
+            }
+        }
+
+        length *= 2;
+    }
+}
+
 impl CkksCanonicalEmbedding {
     /// Constructs the canonical embedding for `R[X]/(X^N + 1)`.
     pub fn new(degree: usize) -> Self {
@@ -114,7 +185,50 @@ impl CkksCanonicalEmbedding {
     /// ```text
     /// values[N - 1 - j] = conjugate(values[j]).
     /// ```
+    ///
+    /// The production implementation uses the identity
+    ///
+    /// ```text
+    /// xi_j = zeta * omega^j,
+    /// zeta = exp(pi*i/N),
+    /// omega = exp(2*pi*i/N),
+    /// ```
+    ///
+    /// so canonical evaluation is one coefficient-wise phase twist followed
+    /// by a radix-2 positive-sign DFT.
     pub fn evaluate_all(&self, coefficients: &[f64]) -> Vec<Complex64> {
+        assert_eq!(
+            coefficients.len(),
+            self.degree,
+            "CKKS coefficient count must equal ring degree"
+        );
+
+        coefficients.iter().for_each(|value| {
+            assert!(
+                value.is_finite(),
+                "CKKS embedding coefficients must be finite"
+            );
+        });
+
+        let zeta = Complex64::from_polar(1.0, PI / self.degree as f64);
+        let mut twist = Complex64::new(1.0, 0.0);
+
+        let mut evaluations = Vec::with_capacity(self.degree);
+
+        for &coefficient in coefficients {
+            evaluations.push(Complex64::new(coefficient, 0.0) * twist);
+            twist *= zeta;
+        }
+
+        radix2_dft_in_place(&mut evaluations, 1.0);
+
+        evaluations
+    }
+
+    /// Direct O(N^2) canonical evaluation retained as a mathematical oracle
+    /// for regression testing of the optimized embedding.
+    #[cfg(test)]
+    fn evaluate_all_reference(&self, coefficients: &[f64]) -> Vec<Complex64> {
         assert_eq!(
             coefficients.len(),
             self.degree,
@@ -132,10 +246,6 @@ impl CkksCanonicalEmbedding {
             .iter()
             .copied()
             .map(|root| {
-                /*
-                 * Horner evaluation is both simpler and numerically
-                 * preferable to repeatedly computing root powers.
-                 */
                 coefficients
                     .iter()
                     .rev()
@@ -197,11 +307,49 @@ impl CkksCanonicalEmbedding {
     /// then
     ///
     /// ```text
-    /// p_k = (1/N) * sum_j v_j * xi_j^(-k).
+    /// p_k = zeta^(-k) * (1/N) * sum_j v_j * omega^(-j*k).
     /// ```
+    ///
+    /// The production path therefore uses one radix-2 negative-sign DFT,
+    /// followed by normalization and a coefficient-wise inverse phase twist.
     ///
     /// Conjugate symmetry guarantees real coefficients in exact arithmetic.
     pub fn slots_to_coefficients(&self, slots: &[Complex64]) -> Vec<f64> {
+        let mut evaluations = self.expand_slots(slots);
+
+        radix2_dft_in_place(&mut evaluations, -1.0);
+
+        let normalization = 1.0 / self.degree as f64;
+        let inverse_zeta = Complex64::from_polar(1.0, -PI / self.degree as f64);
+        let mut twist = Complex64::new(1.0, 0.0);
+
+        evaluations
+            .into_iter()
+            .enumerate()
+            .map(|(coefficient_index, transformed)| {
+                let coefficient = transformed * normalization * twist;
+                twist *= inverse_zeta;
+
+                /*
+                 * The imaginary part is numerical residue only: the
+                 * conjugate-symmetric embedding corresponds to a real
+                 * polynomial.
+                 */
+                assert!(
+                    coefficient.im.abs() <= 1.0e-10 * (1.0 + coefficient.re.abs()),
+                    "canonical inverse embedding produced non-real coefficient: \
+                     index={coefficient_index}, coefficient={coefficient}"
+                );
+
+                coefficient.re
+            })
+            .collect()
+    }
+
+    /// Direct O(N^2) canonical interpolation retained as a mathematical oracle
+    /// for regression testing of the optimized embedding.
+    #[cfg(test)]
+    fn slots_to_coefficients_reference(&self, slots: &[Complex64]) -> Vec<f64> {
         let evaluations = self.expand_slots(slots);
 
         let normalization = 1.0 / self.degree as f64;
@@ -217,14 +365,9 @@ impl CkksCanonicalEmbedding {
                     .sum::<Complex64>()
                     * normalization;
 
-                /*
-                 * The imaginary part is numerical residue only: the
-                 * conjugate-symmetric embedding corresponds to a real
-                 * polynomial.
-                 */
                 assert!(
                     coefficient.im.abs() <= 1.0e-10 * (1.0 + coefficient.re.abs()),
-                    "canonical inverse embedding produced non-real coefficient: \
+                    "reference canonical inverse embedding produced non-real coefficient: \
                      index={coefficient_index}, coefficient={coefficient}"
                 );
 
@@ -252,6 +395,50 @@ mod tests {
             "actual={actual}, expected={expected}, error={}",
             (actual - expected).abs()
         );
+    }
+
+    #[test]
+    fn optimized_evaluation_matches_direct_reference() {
+        for degree in [2_usize, 4, 8, 16, 32, 64, 128] {
+            let embedding = CkksCanonicalEmbedding::new(degree);
+
+            let coefficients: Vec<f64> = (0..degree)
+                .map(|index| {
+                    let centered = ((index * 17 + 5) % 31) as f64 - 15.0;
+                    centered / 32.0
+                })
+                .collect();
+
+            let optimized = embedding.evaluate_all(&coefficients);
+            let reference = embedding.evaluate_all_reference(&coefficients);
+
+            for (actual, expected) in optimized.into_iter().zip(reference) {
+                assert_complex_close(actual, expected, 1.0e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_interpolation_matches_direct_reference() {
+        for degree in [2_usize, 4, 8, 16, 32, 64, 128] {
+            let embedding = CkksCanonicalEmbedding::new(degree);
+
+            let slots: Vec<Complex64> = (0..embedding.slot_count())
+                .map(|index| {
+                    let re = ((index * 11 + 3) % 23) as f64 - 11.0;
+                    let im = ((index * 7 + 1) % 19) as f64 - 9.0;
+
+                    Complex64::new(re / 16.0, im / 16.0)
+                })
+                .collect();
+
+            let optimized = embedding.slots_to_coefficients(&slots);
+            let reference = embedding.slots_to_coefficients_reference(&slots);
+
+            for (actual, expected) in optimized.into_iter().zip(reference) {
+                assert_real_close(actual, expected, 1.0e-10);
+            }
+        }
     }
 
     #[test]

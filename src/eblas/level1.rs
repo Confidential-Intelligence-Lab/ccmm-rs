@@ -234,9 +234,7 @@ pub fn multiply_complex_slots_cp(
     let plaintext_scale = dropped.value() as f64;
 
     let plaintext = encode_complex_slots(public_slots, embedding, input.basis(), plaintext_scale);
-
     let product = multiply_plain_rns_ckks_with_ntt(input, &plaintext, plaintext_scale, chain, plan);
-
     rescale_rns_ckks_to_next(&product, chain)
 }
 
