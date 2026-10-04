@@ -100,6 +100,7 @@ pub mod eblas;
 pub mod eval;
 pub mod execution;
 pub mod grafting;
+pub mod image_pipeline;
 pub mod matrix;
 pub mod ring;
 pub mod rlwe;
