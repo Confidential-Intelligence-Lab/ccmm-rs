@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Locked dependency graph
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Release check
+        run: cargo check --locked --release --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Release library tests
+        run: cargo test --locked --release --lib
+
+  crypto-smoke:
+    name: Crypto and eBLAS Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: NTT parameter validation
+        run: cargo run --locked --release --bin ntt_parameter_validation
+
+      - name: RNS modulus-switch validation
+        run: cargo run --locked --release --bin rns_mod_switch_validation
+
+      - name: eBLAS Level-1 validation
+        run: cargo run --locked --release --bin eblas_level1_validation
+
+      - name: Packed FFT1 validation
+        run: cargo run --locked --release --bin eblas_packed_fft1_cp_validation
+
+      - name: Packed FFT2 stage validation
+        run: cargo run --locked --release --bin eblas_packed_fft2_stage_validation
+
+      - name: Packed FFT2 validation
+        run: cargo run --locked --release --bin eblas_packed_fft2_cp_validation
+
+      - name: Security exposure validation
+        run: cargo run --locked --release --bin security_exposure
+
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: RustSec audit
+        run: cargo audit

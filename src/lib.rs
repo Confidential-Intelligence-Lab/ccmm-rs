@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! FHE-rs: homomorphic encryption and encrypted linear algebra in Rust.
 //!
 //! FHE-rs is a native Rust research library for building applications that
