@@ -6,23 +6,29 @@ use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
 use num_complex::Complex64;
 
-fn encode_replicated_complex_scalar(
-    value: Complex64,
+fn encode_complex_slots(
+    slots: &[Complex64],
     embedding: &CkksCanonicalEmbedding,
     basis: &ModulusBasis,
     scale: f64,
 ) -> RnsPolynomial {
+    assert_eq!(
+        slots.len(),
+        embedding.slot_count(),
+        "eBLAS packed plaintext slot count must match CKKS embedding slot count"
+    );
     assert!(
-        value.re.is_finite() && value.im.is_finite(),
-        "eBLAS complex SCALE scalar must be finite"
+        slots
+            .iter()
+            .all(|value| value.re.is_finite() && value.im.is_finite()),
+        "eBLAS packed plaintext slots must be finite"
     );
     assert!(
         scale.is_finite() && scale > 0.0,
-        "eBLAS SCALE plaintext scale must be finite and positive"
+        "eBLAS packed plaintext scale must be finite and positive"
     );
 
-    let slots = vec![value; embedding.slot_count()];
-    let coefficients = embedding.slots_to_coefficients(&slots);
+    let coefficients = embedding.slots_to_coefficients(slots);
 
     let residues = basis
         .moduli()
@@ -146,7 +152,8 @@ pub fn scale_complex_cp(
         .dropped_modulus(first.level())
         .expect("eBLAS SCALE cannot consume the final CKKS chain level");
     let plaintext_scale = dropped.value() as f64;
-    let scalar = encode_replicated_complex_scalar(alpha, embedding, first.basis(), plaintext_scale);
+    let slots = vec![alpha; embedding.slot_count()];
+    let scalar = encode_complex_slots(&slots, embedding, first.basis(), plaintext_scale);
 
     let mut data = Vec::with_capacity(input.rows() * input.cols());
     for col in 0..input.cols() {
@@ -176,6 +183,61 @@ pub fn scale_complex_cp(
     }
 
     RnsCkksCiphertextMatrix::from_vec_column_major(input.rows(), input.cols(), data)
+}
+
+/// Multiplies one encrypted CKKS value by an arbitrary public complex slot vector.
+///
+/// `public_slots[k]` multiplies logical CKKS slot `k`. The public vector must
+/// contain exactly `embedding.slot_count()` entries.
+///
+/// The public vector is encoded at the active level using that level's dropped
+/// modulus as its plaintext scale. Ciphertext-plaintext multiplication followed
+/// by one CKKS rescale consumes exactly one chain level and returns
+/// approximately to the incoming ciphertext scale.
+///
+/// This is the packed public-mask/twiddle primitive used by structured eBLAS
+/// transforms. It performs no ciphertext-ciphertext multiplication and requires
+/// no relinearization.
+pub fn multiply_complex_slots_cp(
+    input: &crate::ckks::RnsCkksCiphertext,
+    public_slots: &[Complex64],
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "eBLAS packed CP embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        public_slots.len(),
+        embedding.slot_count(),
+        "eBLAS packed CP public slot count must match CKKS embedding slot count"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "eBLAS packed CP NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "eBLAS packed CP NTT plan basis must match ciphertext basis"
+    );
+
+    let dropped = chain
+        .dropped_modulus(input.level())
+        .expect("eBLAS packed CP multiplication cannot consume the final CKKS chain level");
+    let plaintext_scale = dropped.value() as f64;
+
+    let plaintext = encode_complex_slots(public_slots, embedding, input.basis(), plaintext_scale);
+
+    let product = multiply_plain_rns_ckks_with_ntt(input, &plaintext, plaintext_scale, chain, plan);
+
+    rescale_rns_ckks_to_next(&product, chain)
 }
 
 /// Computes `alpha * x + y` for encrypted matrices and a public real scalar.
