@@ -1697,6 +1697,90 @@ pub fn execute_packed_fft2_dif_stage_cp(
     evaluator.add(&partial, &right_term)
 }
 
+/// Executes a complete packed radix-2 DIF FFT2 over encrypted CKKS slots.
+///
+/// The first `shape.elements()` canonical CKKS slots contain the logical input
+/// in natural row-major order. Row DIF stages execute first, followed directly
+/// by column DIF stages on the same ciphertext representation.
+///
+/// No encrypted transpose is performed.
+///
+/// The physical output has independently bit-reversed row and column
+/// coordinates:
+///
+/// ```text
+/// physical(bit_reverse(row), bit_reverse(col)) = logical(row, col)
+/// ```
+///
+/// Every DIF stage consumes one CKKS level. Therefore forward FFT2 consumes
+/// `log2(cols) + log2(rows)` levels. Inverse FFT2 additionally performs one
+/// public slot-vector multiplication by `1 / (rows * cols)`, consuming one
+/// further level.
+pub fn execute_packed_fft2_dif_cp(
+    shape: Fft2Shape,
+    direction: FftDirection,
+    input: &RnsCkksCiphertext,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert!(
+        shape.elements() <= embedding.slot_count(),
+        "packed encrypted FFT2 size must not exceed CKKS slot count"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed encrypted FFT2 embedding degree must match ciphertext ring degree"
+    );
+
+    let mut value = input.clone();
+
+    let mut span = shape.cols();
+    while span >= 2 {
+        let diagonals =
+            PackedFft2DifStageDiagonals::new(shape, PackedFft2Axis::Rows, span, direction);
+
+        let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+
+        value = execute_packed_fft2_dif_stage_cp(
+            &value, &diagonals, evaluator, embedding, chain, &plan,
+        );
+
+        span /= 2;
+    }
+
+    span = shape.rows();
+    while span >= 2 {
+        let diagonals =
+            PackedFft2DifStageDiagonals::new(shape, PackedFft2Axis::Columns, span, direction);
+
+        let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+
+        value = execute_packed_fft2_dif_stage_cp(
+            &value, &diagonals, evaluator, embedding, chain, &plan,
+        );
+
+        span /= 2;
+    }
+
+    if direction == FftDirection::Inverse && shape.elements() > 1 {
+        let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+
+        let mut normalization = vec![Complex64::new(0.0, 0.0); embedding.slot_count()];
+
+        let factor = 1.0 / shape.elements() as f64;
+
+        normalization[..shape.elements()].fill(Complex64::new(factor, 0.0));
+
+        value = multiply_complex_slots_cp(&value, &normalization, embedding, chain, &plan);
+    }
+
+    value
+}
+
 /// Executes a complete packed cleartext two-dimensional DIF FFT.
 ///
 /// Input uses natural row-major order. The physical output has independently
