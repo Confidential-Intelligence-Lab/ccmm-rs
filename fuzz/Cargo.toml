@@ -1,0 +1,35 @@
+[package]
+name = "ccmm-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ccmm-rs]
+path = ".."
+
+[[bin]]
+name = "fft1_shape"
+path = "fuzz_targets/fft1_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fft2_shape"
+path = "fuzz_targets/fft2_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packed_fft2_stage"
+path = "fuzz_targets/packed_fft2_stage.rs"
+test = false
+doc = false
+bench = false
