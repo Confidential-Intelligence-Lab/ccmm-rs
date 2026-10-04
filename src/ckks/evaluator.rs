@@ -168,6 +168,8 @@ impl<'a> RnsCkksEvaluator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -302,6 +304,116 @@ mod tests {
         assert_eq!(evaluator.chain(), &chain);
 
         assert_eq!(evaluator.keys(), &keys);
+    }
+
+    fn ckks_test_scale_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            Just(256.0),
+            Just(512.0),
+            Just(1024.0),
+            Just(4096.0),
+            Just(32_768.0),
+            Just(65_537.0),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 2048,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_add_sub_preserve_generated_state(
+            level in 0usize..3,
+            scale in ckks_test_scale_strategy(),
+        ) {
+            let chain = chain();
+            let keys = evaluation_keys(&chain);
+            let evaluator =
+                RnsCkksEvaluator::new(&chain, &keys);
+
+            let lhs =
+                zero_ciphertext(&chain, level, scale);
+            let rhs =
+                zero_ciphertext(&chain, level, scale);
+
+            let sum = evaluator.add(&lhs, &rhs);
+            let difference = evaluator.sub(&lhs, &rhs);
+
+            for result in [&sum, &difference] {
+                prop_assert_eq!(result.level(), level);
+                prop_assert_eq!(
+                    result.basis(),
+                    chain.level(level),
+                );
+                prop_assert_eq!(result.scale(), scale);
+            }
+        }
+
+        #[test]
+        fn property_rotations_preserve_generated_state(
+            level in 0usize..3,
+            scale in ckks_test_scale_strategy(),
+            rotate_left in any::<bool>(),
+        ) {
+            let chain = chain();
+            let keys = evaluation_keys(&chain);
+            let evaluator =
+                RnsCkksEvaluator::new(&chain, &keys);
+
+            let ciphertext =
+                zero_ciphertext(&chain, level, scale);
+
+            let output = if rotate_left {
+                evaluator.rotate_left(&ciphertext, 1)
+            } else {
+                evaluator.rotate_right(&ciphertext, 1)
+            };
+
+            prop_assert_eq!(
+                output.level(),
+                ciphertext.level(),
+            );
+            prop_assert_eq!(
+                output.basis(),
+                ciphertext.basis(),
+            );
+            prop_assert_eq!(
+                output.scale(),
+                ciphertext.scale(),
+            );
+        }
+
+        #[test]
+        fn property_conjugation_preserves_generated_state(
+            level in 0usize..3,
+            scale in ckks_test_scale_strategy(),
+        ) {
+            let chain = chain();
+            let keys = evaluation_keys(&chain);
+            let evaluator =
+                RnsCkksEvaluator::new(&chain, &keys);
+
+            let ciphertext =
+                zero_ciphertext(&chain, level, scale);
+
+            let output = evaluator.conjugate(&ciphertext);
+
+            prop_assert_eq!(
+                output.level(),
+                ciphertext.level(),
+            );
+            prop_assert_eq!(
+                output.basis(),
+                ciphertext.basis(),
+            );
+            prop_assert_eq!(
+                output.scale(),
+                ciphertext.scale(),
+            );
+        }
     }
 
     #[test]
