@@ -12,6 +12,7 @@
 
 pub mod backend_policy;
 pub mod correlation;
+pub mod fft;
 
 pub mod batched_gemm;
 
@@ -132,6 +133,8 @@ pub enum EblasOperation {
     Dot,
     /// Valid correlation.
     Correlation,
+    /// One-dimensional or multidimensional Fourier transform.
+    Fft,
     /// Element-wise addition.
     Add,
     /// Public-scalar scaling.
