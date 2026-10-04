@@ -10,6 +10,12 @@
 use num_complex::Complex64;
 use std::f64::consts::PI;
 
+use crate::ckks::{mod_switch_rns_ckks_to_next, CkksCanonicalEmbedding, RnsCkksEvaluator};
+use crate::matrix::RnsCkksCiphertextMatrix;
+use crate::ring::{ModulusChain, RnsNttPlan};
+
+use super::level1::scale_complex_cp;
+
 /// Direction of a complex Fourier transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FftDirection {
@@ -256,6 +262,110 @@ pub fn execute_fft1_plan(
     }
 
     values
+}
+
+/// Executes one radix-2 FFT butterfly over encrypted operands and a public
+/// complex twiddle.
+///
+/// For encrypted matrices `a` and `b`, this computes
+///
+/// ```text
+/// t = twiddle * b
+/// u = a + t
+/// v = a - t
+/// ```
+///
+/// `scale_complex_cp` performs the public complex multiplication and consumes
+/// one CKKS level. `a` is modulus-switched to the same next level without
+/// changing its scale, after which ciphertext addition and subtraction preserve
+/// the aligned state.
+///
+/// The transform coefficient is public: this primitive performs no
+/// ciphertext-ciphertext multiplication and requires no relinearization.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn fft1_butterfly_cp(
+    evaluator: &RnsCkksEvaluator<'_>,
+    a: &RnsCkksCiphertextMatrix,
+    b: &RnsCkksCiphertextMatrix,
+    twiddle: Complex64,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> (RnsCkksCiphertextMatrix, RnsCkksCiphertextMatrix) {
+    assert!(
+        twiddle.re.is_finite() && twiddle.im.is_finite(),
+        "eBLAS FFT1 butterfly twiddle must be finite"
+    );
+
+    assert_eq!(
+        a.rows(),
+        b.rows(),
+        "eBLAS FFT1 butterfly operand row counts must match"
+    );
+    assert_eq!(
+        a.cols(),
+        b.cols(),
+        "eBLAS FFT1 butterfly operand column counts must match"
+    );
+    assert_eq!(
+        a.level(),
+        b.level(),
+        "eBLAS FFT1 butterfly operands must have matching levels"
+    );
+    assert_eq!(
+        a.scale(),
+        b.scale(),
+        "eBLAS FFT1 butterfly operands must have matching scales"
+    );
+    assert_eq!(
+        a.get(0, 0).basis(),
+        b.get(0, 0).basis(),
+        "eBLAS FFT1 butterfly operands must have matching bases"
+    );
+
+    let weighted_b = scale_complex_cp(b, twiddle, embedding, chain, plan);
+
+    let mut aligned_a_data = Vec::with_capacity(a.len());
+    for col in 0..a.cols() {
+        for row in 0..a.rows() {
+            aligned_a_data.push(mod_switch_rns_ckks_to_next(a.get(row, col), chain));
+        }
+    }
+
+    let aligned_a =
+        RnsCkksCiphertextMatrix::from_vec_column_major(a.rows(), a.cols(), aligned_a_data);
+
+    assert_eq!(
+        aligned_a.level(),
+        weighted_b.level(),
+        "eBLAS FFT1 butterfly aligned operands must have matching levels"
+    );
+    assert_eq!(
+        aligned_a.scale(),
+        weighted_b.scale(),
+        "eBLAS FFT1 butterfly aligned operands must have matching scales"
+    );
+    assert_eq!(
+        aligned_a.get(0, 0).basis(),
+        weighted_b.get(0, 0).basis(),
+        "eBLAS FFT1 butterfly aligned operands must have matching bases"
+    );
+
+    let mut upper = Vec::with_capacity(a.len());
+    let mut lower = Vec::with_capacity(a.len());
+
+    for col in 0..a.cols() {
+        for row in 0..a.rows() {
+            upper.push(evaluator.add(aligned_a.get(row, col), weighted_b.get(row, col)));
+            lower.push(evaluator.sub(aligned_a.get(row, col), weighted_b.get(row, col)));
+        }
+    }
+
+    (
+        RnsCkksCiphertextMatrix::from_vec_column_major(a.rows(), a.cols(), upper),
+        RnsCkksCiphertextMatrix::from_vec_column_major(a.rows(), a.cols(), lower),
+    )
 }
 
 /// Dense complex DFT reference oracle.

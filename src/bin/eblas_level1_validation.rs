@@ -2,6 +2,7 @@ use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
     RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
+use ccmm_rs::eblas::fft::fft1_butterfly_cp;
 use ccmm_rs::eblas::{add_cc, axpy_cp, scale_complex_cp, scale_cp};
 use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::RnsCkksCiphertextMatrix;
@@ -310,4 +311,65 @@ fn main() {
     assert!(scale_pass, "eBLAS SCALE validation failed");
     assert!(complex_scale_pass, "eBLAS complex SCALE validation failed");
     assert!(axpy_pass, "eBLAS AXPY validation failed");
+
+    let fft_twiddles = [
+        ("ONE", Complex64::new(1.0, 0.0)),
+        ("NEG_ONE", Complex64::new(-1.0, 0.0)),
+        ("I", Complex64::new(0.0, 1.0)),
+        ("NEG_I", Complex64::new(0.0, -1.0)),
+        (
+            "EXP_NEG_I_PI_4",
+            Complex64::new(
+                std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+            ),
+        ),
+    ];
+
+    for (name, twiddle) in fft_twiddles {
+        let (upper, lower) =
+            fft1_butterfly_cp(&evaluator, &x_ct, &y_ct, twiddle, &embedding, &chain, &plan);
+
+        assert_eq!(upper.level(), x_ct.level() + 1);
+        assert_eq!(lower.level(), x_ct.level() + 1);
+        assert_eq!(upper.scale(), x_ct.scale());
+        assert_eq!(lower.scale(), x_ct.scale());
+        assert_eq!(upper.get(0, 0).basis(), chain.level(x_ct.level() + 1));
+        assert_eq!(lower.get(0, 0).basis(), chain.level(x_ct.level() + 1));
+
+        let mut max_upper_error = 0.0_f64;
+        let mut max_lower_error = 0.0_f64;
+
+        for row in 0..x.len() {
+            let expected_product = twiddle * Complex64::new(y[row], 0.0);
+            let expected_upper = Complex64::new(x[row], 0.0) + expected_product;
+            let expected_lower = Complex64::new(x[row], 0.0) - expected_product;
+
+            let actual_upper = decode_complex_scalar(upper.get(row, 0), &secret, &embedding);
+            let actual_lower = decode_complex_scalar(lower.get(row, 0), &secret, &embedding);
+
+            max_upper_error = max_upper_error.max((actual_upper - expected_upper).norm());
+            max_lower_error = max_lower_error.max((actual_lower - expected_lower).norm());
+        }
+
+        println!(
+            "FFT1_BUTTERFLY_CP_CASE={} TWIDDLE=({:.12e},{:.12e}) LEVEL={} SCALE={:.12e} U_MAX_ABS={:.12e} V_MAX_ABS={:.12e}",
+            name,
+            twiddle.re,
+            twiddle.im,
+            upper.level(),
+            upper.scale(),
+            max_upper_error,
+            max_lower_error,
+        );
+
+        assert!(
+            max_upper_error < TOLERANCE,
+            "FFT1 CP butterfly upper-output error {max_upper_error:e}"
+        );
+        assert!(
+            max_lower_error < TOLERANCE,
+            "FFT1 CP butterfly lower-output error {max_lower_error:e}"
+        );
+    }
 }
