@@ -99,3 +99,23 @@ jobs:
 
       - name: RustSec audit
         run: cargo audit
+
+  supply-chain:
+    name: Supply Chain Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Dependency policy
+        run: cargo deny check
