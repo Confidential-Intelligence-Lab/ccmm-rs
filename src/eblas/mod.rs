@@ -60,7 +60,7 @@ pub use gemv::{
 
 pub mod level1;
 
-pub use level1::{add_cc, axpy_cp, scale_cp};
+pub use level1::{add_cc, axpy_cp, scale_complex_cp, scale_cp};
 
 pub mod transpose;
 

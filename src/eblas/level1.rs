@@ -6,19 +6,22 @@ use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
 use num_complex::Complex64;
 
-fn encode_replicated_scalar(
-    value: f64,
+fn encode_replicated_complex_scalar(
+    value: Complex64,
     embedding: &CkksCanonicalEmbedding,
     basis: &ModulusBasis,
     scale: f64,
 ) -> RnsPolynomial {
-    assert!(value.is_finite(), "eBLAS SCALE scalar must be finite");
+    assert!(
+        value.re.is_finite() && value.im.is_finite(),
+        "eBLAS complex SCALE scalar must be finite"
+    );
     assert!(
         scale.is_finite() && scale > 0.0,
         "eBLAS SCALE plaintext scale must be finite and positive"
     );
 
-    let slots = vec![Complex64::new(value, 0.0); embedding.slot_count()];
+    let slots = vec![value; embedding.slot_count()];
     let coefficients = embedding.slots_to_coefficients(&slots);
 
     let residues = basis
@@ -95,6 +98,31 @@ pub fn scale_cp(
 ) -> RnsCkksCiphertextMatrix {
     assert!(alpha.is_finite(), "eBLAS SCALE scalar must be finite");
 
+    scale_complex_cp(input, Complex64::new(alpha, 0.0), embedding, chain, plan)
+}
+
+/// Scales an encrypted matrix by a public complex scalar.
+///
+/// The scalar is replicated across CKKS slots and encoded at the active
+/// level using that level's dropped modulus as its plaintext scale.
+/// Ciphertext-plaintext multiplication followed by one CKKS rescale consumes
+/// exactly one chain level while returning approximately to the incoming
+/// ciphertext scale.
+///
+/// This primitive is the public-twiddle multiplication required by structured
+/// encrypted FFT execution.
+pub fn scale_complex_cp(
+    input: &RnsCkksCiphertextMatrix,
+    alpha: Complex64,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertextMatrix {
+    assert!(
+        alpha.re.is_finite() && alpha.im.is_finite(),
+        "eBLAS complex SCALE scalar must be finite"
+    );
+
     let first = input.get(0, 0);
     first.assert_matches_chain(chain);
 
@@ -118,7 +146,7 @@ pub fn scale_cp(
         .dropped_modulus(first.level())
         .expect("eBLAS SCALE cannot consume the final CKKS chain level");
     let plaintext_scale = dropped.value() as f64;
-    let scalar = encode_replicated_scalar(alpha, embedding, first.basis(), plaintext_scale);
+    let scalar = encode_replicated_complex_scalar(alpha, embedding, first.basis(), plaintext_scale);
 
     let mut data = Vec::with_capacity(input.rows() * input.cols());
     for col in 0..input.cols() {

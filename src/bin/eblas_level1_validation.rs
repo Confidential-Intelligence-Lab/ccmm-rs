@@ -2,7 +2,7 @@ use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
     RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
-use ccmm_rs::eblas::{add_cc, axpy_cp, scale_cp};
+use ccmm_rs::eblas::{add_cc, axpy_cp, scale_complex_cp, scale_cp};
 use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::RnsCkksCiphertextMatrix;
 use ccmm_rs::ring::{ModulusBasis, Polynomial, RnsNttPlan, RnsPolynomial};
@@ -105,11 +105,11 @@ fn encrypt_vector(
     RnsCkksCiphertextMatrix::from_vec_column_major(values.len(), 1, data)
 }
 
-fn decode_scalar(
+fn decode_complex_scalar(
     ciphertext: &RnsCkksCiphertext,
     secret: &[i8],
     embedding: &CkksCanonicalEmbedding,
-) -> f64 {
+) -> Complex64 {
     let plan = RnsNttPlan::new(
         ciphertext.basis().moduli().to_vec(),
         ciphertext.rlwe().degree(),
@@ -121,8 +121,18 @@ fn decode_scalar(
         .into_iter()
         .map(|x| centered(x, modulus) as f64 / ciphertext.scale())
         .collect();
+
     let slots = embedding.coefficients_to_slots(&coefficients);
-    slots.iter().map(|slot| slot.re).sum::<f64>() / slots.len() as f64
+
+    slots.iter().copied().sum::<Complex64>() / slots.len() as f64
+}
+
+fn decode_scalar(
+    ciphertext: &RnsCkksCiphertext,
+    secret: &[i8],
+    embedding: &CkksCanonicalEmbedding,
+) -> f64 {
+    decode_complex_scalar(ciphertext, secret, embedding).re
 }
 
 fn decode_vector(
@@ -164,6 +174,7 @@ fn main() {
     let x = [1.25, -2.0, 0.375, 4.5];
     let y = [-0.5, 1.25, 2.0, -3.0];
     let alpha = -0.625_f64;
+    let complex_alpha = Complex64::new(0.6, -0.8);
 
     let x_ct = encrypt_vector(
         &x,
@@ -193,6 +204,7 @@ fn main() {
 
     let added = add_cc(&evaluator, &x_ct, &y_ct);
     let scaled = scale_cp(&x_ct, alpha, &embedding, &chain, &plan);
+    let complex_scaled = scale_complex_cp(&x_ct, complex_alpha, &embedding, &chain, &plan);
     let axpy = axpy_cp(&evaluator, alpha, &x_ct, &y_ct, &embedding, &chain, &plan);
 
     let add_expected: Vec<f64> = x.iter().zip(y).map(|(&a, b)| a + b).collect();
@@ -205,20 +217,30 @@ fn main() {
 
     let add_actual = decode_vector(&added, &secret, &embedding);
     let scale_actual = decode_vector(&scaled, &secret, &embedding);
+    let complex_scale_actual: Vec<Complex64> = (0..complex_scaled.rows())
+        .map(|row| decode_complex_scalar(complex_scaled.get(row, 0), &secret, &embedding))
+        .collect();
     let axpy_actual = decode_vector(&axpy, &secret, &embedding);
 
     let add_error = max_error(&add_actual, &add_expected);
     let scale_error = max_error(&scale_actual, &scale_expected);
+    let complex_scale_error = complex_scale_actual
+        .iter()
+        .zip(x.iter())
+        .map(|(actual, &value)| (*actual - complex_alpha * value).norm())
+        .fold(0.0_f64, f64::max);
     let axpy_error = max_error(&axpy_actual, &axpy_expected);
 
     let input_level = x_ct.get(0, 0).level();
     let add_level = added.get(0, 0).level();
     let scale_level = scaled.get(0, 0).level();
+    let complex_scale_level = complex_scaled.get(0, 0).level();
     let axpy_level = axpy.get(0, 0).level();
 
     let input_scale = x_ct.get(0, 0).scale();
     let add_scale = added.get(0, 0).scale();
     let scale_scale = scaled.get(0, 0).scale();
+    let complex_scale_scale = complex_scaled.get(0, 0).scale();
     let axpy_scale = axpy.get(0, 0).scale();
 
     let dropped = chain
@@ -228,12 +250,17 @@ fn main() {
     let expected_scale_after_scale = input_scale * dropped / dropped;
     let scale_relative_error =
         ((scale_scale - expected_scale_after_scale) / expected_scale_after_scale).abs();
+    let complex_scale_relative_error =
+        ((complex_scale_scale - expected_scale_after_scale) / expected_scale_after_scale).abs();
     let axpy_scale_relative_error = ((axpy_scale - input_scale) / input_scale).abs();
 
     let add_pass = add_error <= TOLERANCE && add_level == input_level && add_scale == input_scale;
     let scale_pass = scale_error <= TOLERANCE
         && scale_level == input_level + 1
         && scale_relative_error <= 1.0e-12;
+    let complex_scale_pass = complex_scale_error <= TOLERANCE
+        && complex_scale_level == input_level + 1
+        && complex_scale_relative_error <= 1.0e-12;
     let axpy_pass = axpy_error <= TOLERANCE
         && axpy_level == input_level + 1
         && axpy_scale_relative_error <= 1.0e-12;
@@ -253,6 +280,18 @@ fn main() {
     println!("SCALE_RELATIVE_SCALE_ERROR={scale_relative_error:.12e}");
     println!("SCALE_MAX_ERROR={scale_error:.12e}");
     println!("SCALE_STATUS={}", if scale_pass { "PASS" } else { "FAIL" });
+    println!(
+        "COMPLEX_ALPHA={:.12}{:+.12}i",
+        complex_alpha.re, complex_alpha.im,
+    );
+    println!("COMPLEX_SCALE_LEVEL={complex_scale_level}");
+    println!("COMPLEX_SCALE_SCALE={complex_scale_scale:.12e}");
+    println!("COMPLEX_SCALE_RELATIVE_SCALE_ERROR={complex_scale_relative_error:.12e}");
+    println!("COMPLEX_SCALE_MAX_ERROR={complex_scale_error:.12e}");
+    println!(
+        "COMPLEX_SCALE_STATUS={}",
+        if complex_scale_pass { "PASS" } else { "FAIL" }
+    );
     println!("AXPY_LEVEL={axpy_level}");
     println!("AXPY_SCALE={axpy_scale:.12e}");
     println!("AXPY_RELATIVE_SCALE_ERROR={axpy_scale_relative_error:.12e}");
@@ -260,7 +299,7 @@ fn main() {
     println!("AXPY_STATUS={}", if axpy_pass { "PASS" } else { "FAIL" });
     println!(
         "R3_5D_EBLAS_LEVEL1_STATUS={}",
-        if add_pass && scale_pass && axpy_pass {
+        if add_pass && scale_pass && complex_scale_pass && axpy_pass {
             "PASS"
         } else {
             "FAIL"
@@ -269,5 +308,6 @@ fn main() {
 
     assert!(add_pass, "eBLAS ADD validation failed");
     assert!(scale_pass, "eBLAS SCALE validation failed");
+    assert!(complex_scale_pass, "eBLAS complex SCALE validation failed");
     assert!(axpy_pass, "eBLAS AXPY validation failed");
 }
