@@ -692,6 +692,70 @@ pub fn execute_packed_fft1_dif_stage_cp(
     evaluator.add(&partial, &right_term)
 }
 
+/// Executes a complete packed radix-2 DIF FFT1 over encrypted CKKS slots.
+///
+/// The first `shape.length()` canonical CKKS slots contain the logical input
+/// in natural order. DIF stages execute with spans `N, N/2, ..., 2`, so the
+/// returned ciphertext intentionally stores Fourier coefficients in
+/// bit-reversed physical slot order. No encrypted bit-reversal permutation is
+/// performed.
+///
+/// Each generic DIF stage consumes one CKKS level. Forward execution therefore
+/// consumes `log2(N)` levels. Inverse execution additionally multiplies all
+/// active slots by public `1/N`, consuming one further level for normalization.
+///
+/// The NTT plan is rebuilt at every stage from the ciphertext's active RNS
+/// basis. The evaluator selects level-specific Galois keys automatically from
+/// the ciphertext state.
+pub fn execute_packed_fft1_dif_cp(
+    shape: Fft1Shape,
+    direction: FftDirection,
+    input: &RnsCkksCiphertext,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    let logical_length = shape.length();
+
+    assert!(
+        logical_length <= embedding.slot_count(),
+        "packed encrypted FFT1 length must not exceed CKKS slot count"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed encrypted FFT1 embedding degree must match ciphertext ring degree"
+    );
+
+    let mut value = input.clone();
+    let mut span = logical_length;
+
+    while span >= 2 {
+        let diagonals = PackedFft1DifStageDiagonals::new(logical_length, span, direction);
+        let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+
+        value = execute_packed_fft1_dif_stage_cp(
+            &value, &diagonals, evaluator, embedding, chain, &plan,
+        );
+
+        span /= 2;
+    }
+
+    if direction == FftDirection::Inverse && logical_length > 1 {
+        let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+        let mut normalization = vec![Complex64::new(0.0, 0.0); embedding.slot_count()];
+        let factor = 1.0 / logical_length as f64;
+
+        normalization[..logical_length].fill(Complex64::new(factor, 0.0));
+
+        value = multiply_complex_slots_cp(&value, &normalization, embedding, chain, &plan);
+    }
+
+    value
+}
+
 /// Executes an explicit FFT1 plan.
 ///
 /// This is numerically equivalent to [`fft1_pp`] but consumes the validated
