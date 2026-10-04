@@ -60,6 +60,204 @@ impl Fft1Shape {
     }
 }
 
+/// One radix-2 butterfly in an FFT execution plan.
+///
+/// Indices refer to the working vector after the initial bit-reversal
+/// permutation. `twiddle_exponent` selects
+///
+/// `exp(sign * 2*pi*i*twiddle_exponent/span)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fft1Butterfly {
+    stage: usize,
+    span: usize,
+    even_index: usize,
+    odd_index: usize,
+    twiddle_exponent: usize,
+}
+
+impl Fft1Butterfly {
+    pub const fn stage(self) -> usize {
+        self.stage
+    }
+
+    pub const fn span(self) -> usize {
+        self.span
+    }
+
+    pub const fn even_index(self) -> usize {
+        self.even_index
+    }
+
+    pub const fn odd_index(self) -> usize {
+        self.odd_index
+    }
+
+    pub const fn twiddle_exponent(self) -> usize {
+        self.twiddle_exponent
+    }
+}
+
+/// One radix-2 FFT stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fft1Stage {
+    index: usize,
+    span: usize,
+    butterflies: Vec<Fft1Butterfly>,
+}
+
+impl Fft1Stage {
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    pub const fn span(&self) -> usize {
+        self.span
+    }
+
+    pub fn butterflies(&self) -> &[Fft1Butterfly] {
+        &self.butterflies
+    }
+}
+
+/// Explicit application-facing execution plan for FFT1.
+///
+/// The plan separates transform structure from backend execution:
+///
+/// 1. bit-reversal permutation;
+/// 2. staged radix-2 butterflies;
+/// 3. inverse normalization, when requested by the executor.
+///
+/// Twiddle values themselves are not stored because they are public constants
+/// determined by `(direction, span, twiddle_exponent)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fft1Plan {
+    shape: Fft1Shape,
+    stages: Vec<Fft1Stage>,
+}
+
+impl Fft1Plan {
+    /// Builds the canonical iterative radix-2 Cooley-Tukey plan.
+    pub fn new(shape: Fft1Shape) -> Self {
+        let n = shape.length();
+        let mut stages = Vec::with_capacity(shape.stages() as usize);
+
+        let mut span = 2usize;
+        let mut stage_index = 0usize;
+
+        while span <= n {
+            let half = span / 2;
+            let mut butterflies = Vec::with_capacity(n / 2);
+
+            for base in (0..n).step_by(span) {
+                for offset in 0..half {
+                    butterflies.push(Fft1Butterfly {
+                        stage: stage_index,
+                        span,
+                        even_index: base + offset,
+                        odd_index: base + offset + half,
+                        twiddle_exponent: offset,
+                    });
+                }
+            }
+
+            stages.push(Fft1Stage {
+                index: stage_index,
+                span,
+                butterflies,
+            });
+
+            stage_index += 1;
+
+            span = span
+                .checked_mul(2)
+                .expect("eBLAS FFT plan stage span overflow");
+        }
+
+        let plan = Self { shape, stages };
+
+        assert_eq!(
+            plan.butterfly_count(),
+            shape.butterflies(),
+            "eBLAS FFT plan butterfly count must match shape contract"
+        );
+
+        plan
+    }
+
+    pub const fn shape(&self) -> Fft1Shape {
+        self.shape
+    }
+
+    pub fn stages(&self) -> &[Fft1Stage] {
+        &self.stages
+    }
+
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
+    }
+
+    pub fn butterfly_count(&self) -> usize {
+        self.stages
+            .iter()
+            .map(|stage| stage.butterflies.len())
+            .sum()
+    }
+}
+
+/// Executes an explicit FFT1 plan.
+///
+/// This is numerically equivalent to [`fft1_pp`] but consumes the validated
+/// structural plan rather than reconstructing butterfly topology internally.
+pub fn execute_fft1_plan(
+    plan: &Fft1Plan,
+    direction: FftDirection,
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    let shape = plan.shape();
+
+    assert_eq!(
+        input.len(),
+        shape.length(),
+        "eBLAS FFT plan input length must match transform shape"
+    );
+
+    let mut values = input.to_vec();
+    bit_reverse_permute(&mut values);
+
+    let sign = match direction {
+        FftDirection::Forward => -1.0,
+        FftDirection::Inverse => 1.0,
+    };
+
+    for stage in plan.stages() {
+        for butterfly in stage.butterflies() {
+            debug_assert_eq!(butterfly.stage(), stage.index());
+            debug_assert_eq!(butterfly.span(), stage.span());
+
+            let angle =
+                sign * 2.0 * PI * butterfly.twiddle_exponent() as f64 / butterfly.span() as f64;
+
+            let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+            let even = values[butterfly.even_index()];
+            let odd = twiddle * values[butterfly.odd_index()];
+
+            values[butterfly.even_index()] = even + odd;
+            values[butterfly.odd_index()] = even - odd;
+        }
+    }
+
+    if direction == FftDirection::Inverse {
+        let scale = shape.length() as f64;
+
+        for value in &mut values {
+            *value /= scale;
+        }
+    }
+
+    values
+}
+
 /// Dense complex DFT reference oracle.
 ///
 /// This intentionally uses O(N^2) work and exists for semantic validation.
@@ -358,6 +556,180 @@ mod tests {
                 error < 1.0e-10,
                 "FFT roundtrip maximum absolute error {error:e}"
             );
+        }
+    }
+
+    #[test]
+    fn plan_exposes_expected_n8_provenance() {
+        let shape = Fft1Shape::new(8);
+        let plan = Fft1Plan::new(shape);
+
+        assert_eq!(plan.stage_count(), 3);
+        assert_eq!(plan.butterfly_count(), 12);
+
+        let stages = plan.stages();
+
+        assert_eq!(stages[0].index(), 0);
+        assert_eq!(stages[0].span(), 2);
+
+        assert_eq!(
+            stages[0].butterflies(),
+            &[
+                Fft1Butterfly {
+                    stage: 0,
+                    span: 2,
+                    even_index: 0,
+                    odd_index: 1,
+                    twiddle_exponent: 0,
+                },
+                Fft1Butterfly {
+                    stage: 0,
+                    span: 2,
+                    even_index: 2,
+                    odd_index: 3,
+                    twiddle_exponent: 0,
+                },
+                Fft1Butterfly {
+                    stage: 0,
+                    span: 2,
+                    even_index: 4,
+                    odd_index: 5,
+                    twiddle_exponent: 0,
+                },
+                Fft1Butterfly {
+                    stage: 0,
+                    span: 2,
+                    even_index: 6,
+                    odd_index: 7,
+                    twiddle_exponent: 0,
+                },
+            ]
+        );
+
+        assert_eq!(stages[1].span(), 4);
+
+        assert_eq!(
+            stages[1]
+                .butterflies()
+                .iter()
+                .map(|b| { (b.even_index(), b.odd_index(), b.twiddle_exponent(),) })
+                .collect::<Vec<_>>(),
+            vec![(0, 2, 0), (1, 3, 1), (4, 6, 0), (5, 7, 1),]
+        );
+
+        assert_eq!(stages[2].span(), 8);
+
+        assert_eq!(
+            stages[2]
+                .butterflies()
+                .iter()
+                .map(|b| { (b.even_index(), b.odd_index(), b.twiddle_exponent(),) })
+                .collect::<Vec<_>>(),
+            vec![(0, 4, 0), (1, 5, 1), (2, 6, 2), (3, 7, 3),]
+        );
+    }
+
+    #[test]
+    fn plan_counts_match_shape_contract_through_256() {
+        for length in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let shape = Fft1Shape::new(length);
+            let plan = Fft1Plan::new(shape);
+
+            assert_eq!(plan.stage_count(), shape.stages() as usize);
+
+            assert_eq!(plan.butterfly_count(), shape.butterflies());
+
+            println!(
+                "FFT1_PLAN_CASE=N{} STAGES{} BUTTERFLIES{}",
+                length,
+                plan.stage_count(),
+                plan.butterfly_count(),
+            );
+        }
+    }
+
+    #[test]
+    fn planned_forward_execution_matches_fft_and_dft() {
+        for &(length, salt) in &[
+            (1usize, 31usize),
+            (2, 32),
+            (4, 33),
+            (8, 34),
+            (16, 35),
+            (32, 36),
+            (64, 37),
+            (128, 38),
+            (256, 39),
+        ] {
+            let shape = Fft1Shape::new(length);
+            let plan = Fft1Plan::new(shape);
+            let input = deterministic_complex(length, salt);
+
+            let expected_dft = dft1_reference(shape, FftDirection::Forward, &input);
+
+            let expected_fft = fft1_pp(shape, FftDirection::Forward, &input);
+
+            let actual = execute_fft1_plan(&plan, FftDirection::Forward, &input);
+
+            let vs_fft = max_abs_error(&actual, &expected_fft);
+
+            let vs_dft = max_abs_error(&actual, &expected_dft);
+
+            println!(
+                "FFT1_PLAN_FORWARD_CASE=N{} \
+                 MAX_ABS_VS_FFT={:.12e} \
+                 MAX_ABS_VS_DFT={:.12e}",
+                length, vs_fft, vs_dft,
+            );
+
+            assert!(
+                vs_fft < 1.0e-12,
+                "planned FFT differs from fft1_pp by {vs_fft:e}"
+            );
+
+            assert!(
+                vs_dft < 1.0e-10,
+                "planned FFT differs from DFT oracle by {vs_dft:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn planned_inverse_execution_matches_fft_and_roundtrip() {
+        for &(length, salt) in &[
+            (1usize, 41usize),
+            (2, 42),
+            (4, 43),
+            (8, 44),
+            (16, 45),
+            (32, 46),
+            (64, 47),
+            (128, 48),
+            (256, 49),
+        ] {
+            let shape = Fft1Shape::new(length);
+            let plan = Fft1Plan::new(shape);
+            let input = deterministic_complex(length, salt);
+
+            let spectrum = execute_fft1_plan(&plan, FftDirection::Forward, &input);
+
+            let planned_inverse = execute_fft1_plan(&plan, FftDirection::Inverse, &spectrum);
+
+            let direct_inverse = fft1_pp(shape, FftDirection::Inverse, &spectrum);
+
+            let vs_fft = max_abs_error(&planned_inverse, &direct_inverse);
+
+            let roundtrip = max_abs_error(&planned_inverse, &input);
+
+            println!(
+                "FFT1_PLAN_INVERSE_CASE=N{} \
+                 MAX_ABS_VS_FFT={:.12e} \
+                 ROUNDTRIP_MAX_ABS={:.12e}",
+                length, vs_fft, roundtrip,
+            );
+
+            assert!(vs_fft < 1.0e-12);
+            assert!(roundtrip < 1.0e-10);
         }
     }
 }
