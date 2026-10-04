@@ -16,3 +16,4 @@ rayon = "1.10"
 
 [dev-dependencies]
 approx = "0.5"
+proptest = "1.5"

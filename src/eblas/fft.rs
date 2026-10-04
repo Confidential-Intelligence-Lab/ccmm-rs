@@ -1850,6 +1850,8 @@ fn bit_reverse_permute(values: &mut [Complex64]) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     fn execute_direct_fft1_stage(
         input: &[Complex64],
         stage: &Fft1Stage,
@@ -2110,6 +2112,152 @@ mod tests {
             .zip(expected)
             .map(|(actual, expected)| (*actual - *expected).norm())
             .fold(0.0_f64, f64::max)
+    }
+
+    fn bounded_complex_strategy() -> impl Strategy<Value = Complex64> {
+        (-1024_i32..=1024_i32, -1024_i32..=1024_i32)
+            .prop_map(|(re, im)| Complex64::new(re as f64 / 1024.0, im as f64 / 1024.0))
+    }
+
+    fn fft1_property_case() -> impl Strategy<Value = (usize, Vec<Complex64>)> {
+        prop_oneof![
+            Just(1usize),
+            Just(2usize),
+            Just(4usize),
+            Just(8usize),
+            Just(16usize),
+            Just(32usize),
+        ]
+        .prop_flat_map(|n| {
+            prop::collection::vec(bounded_complex_strategy(), n).prop_map(move |input| (n, input))
+        })
+    }
+
+    fn fft2_property_case() -> impl Strategy<Value = (usize, usize, Vec<Complex64>)> {
+        (
+            prop_oneof![Just(1usize), Just(2usize), Just(4usize), Just(8usize),],
+            prop_oneof![Just(1usize), Just(2usize), Just(4usize), Just(8usize),],
+        )
+            .prop_flat_map(|(rows, cols)| {
+                prop::collection::vec(bounded_complex_strategy(), rows * cols)
+                    .prop_map(move |input| (rows, cols, input))
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 4096,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_fft1_roundtrip_recovers_generated_input(
+            (n, input) in fft1_property_case(),
+        ) {
+            let shape = Fft1Shape::new(n);
+
+            let spectrum =
+                fft1_pp(shape, FftDirection::Forward, &input);
+            let recovered =
+                fft1_pp(shape, FftDirection::Inverse, &spectrum);
+
+            let max_abs = recovered
+                .iter()
+                .zip(&input)
+                .map(|(actual, expected)| {
+                    (*actual - *expected).norm()
+                })
+                .fold(0.0_f64, f64::max);
+
+            prop_assert!(
+                max_abs < 1.0e-10,
+                "FFT1 roundtrip mismatch N={n}: {max_abs:e}"
+            );
+        }
+
+        #[test]
+        fn property_fft2_roundtrip_recovers_generated_input(
+            (rows, cols, input) in fft2_property_case(),
+        ) {
+            let shape = Fft2Shape::new(rows, cols);
+
+            let spectrum =
+                fft2_pp(shape, FftDirection::Forward, &input);
+            let recovered =
+                fft2_pp(shape, FftDirection::Inverse, &spectrum);
+
+            let max_abs = recovered
+                .iter()
+                .zip(&input)
+                .map(|(actual, expected)| {
+                    (*actual - *expected).norm()
+                })
+                .fold(0.0_f64, f64::max);
+
+            prop_assert!(
+                max_abs < 1.0e-10,
+                "FFT2 roundtrip mismatch \
+                 {rows}x{cols}: {max_abs:e}"
+            );
+        }
+
+        #[test]
+        fn property_packed_fft2_dif_matches_canonical_layout(
+            (rows, cols, input) in fft2_property_case(),
+            inverse in any::<bool>(),
+        ) {
+            let shape = Fft2Shape::new(rows, cols);
+
+            let direction = if inverse {
+                FftDirection::Inverse
+            } else {
+                FftDirection::Forward
+            };
+
+            let packed =
+                execute_packed_fft2_dif_pp(
+                    shape,
+                    direction,
+                    &input,
+                );
+
+            let canonical =
+                fft2_pp(shape, direction, &input);
+
+            let mut max_abs = 0.0_f64;
+
+            for logical_row in 0..rows {
+                for logical_col in 0..cols {
+                    let physical_row =
+                        bit_reverse_index_for_test(
+                            logical_row,
+                            rows,
+                        );
+                    let physical_col =
+                        bit_reverse_index_for_test(
+                            logical_col,
+                            cols,
+                        );
+
+                    let physical =
+                        physical_row * cols + physical_col;
+                    let logical =
+                        logical_row * cols + logical_col;
+
+                    max_abs = max_abs.max(
+                        (packed[physical] - canonical[logical])
+                            .norm(),
+                    );
+                }
+            }
+
+            prop_assert!(
+                max_abs < 1.0e-10,
+                "packed FFT2 DIF mismatch \
+                 {rows}x{cols} {direction:?}: {max_abs:e}"
+            );
+        }
     }
 
     fn bit_reverse_index_for_test(index: usize, length: usize) -> usize {
