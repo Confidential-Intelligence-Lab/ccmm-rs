@@ -2,7 +2,9 @@ use ccmm_rs::ckks::{
     research_profile_4096, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
     RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
-use ccmm_rs::eblas::fft::fft1_butterfly_cp;
+use ccmm_rs::eblas::fft::{
+    execute_fft1_plan, execute_fft1_plan_cp, fft1_butterfly_cp, Fft1Plan, Fft1Shape, FftDirection,
+};
 use ccmm_rs::eblas::{add_cc, axpy_cp, scale_complex_cp, scale_cp};
 use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::matrix::RnsCkksCiphertextMatrix;
@@ -370,6 +372,104 @@ fn main() {
         assert!(
             max_lower_error < TOLERANCE,
             "FFT1 CP butterfly lower-output error {max_lower_error:e}"
+        );
+    }
+
+    for &(fft_length, salt) in &[(2usize, 0x1200_u64), (4usize, 0x1400_u64)] {
+        let fft_shape = Fft1Shape::new(fft_length);
+        let fft_plan = Fft1Plan::new(fft_shape);
+
+        let input_values: Vec<f64> = (0..fft_length)
+            .map(|index| {
+                let raw = ((index * 7 + fft_length * 5) % 19) as f64;
+                (raw - 9.0) / 5.0
+            })
+            .collect();
+
+        let encrypted_values: Vec<RnsCkksCiphertextMatrix> = input_values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                encrypt_vector(
+                    &[value],
+                    salt ^ index as u64,
+                    &embedding,
+                    &basis,
+                    initial_scale,
+                    &secret,
+                    &plan,
+                    &chain,
+                    distribution,
+                )
+            })
+            .collect();
+
+        let expected_input: Vec<Complex64> = input_values
+            .iter()
+            .map(|&value| Complex64::new(value, 0.0))
+            .collect();
+
+        let expected_plan = execute_fft1_plan(&fft_plan, FftDirection::Forward, &expected_input);
+
+        let actual_encrypted = execute_fft1_plan_cp(
+            &fft_plan,
+            FftDirection::Forward,
+            &encrypted_values,
+            &evaluator,
+            &embedding,
+            &chain,
+        );
+
+        let actual: Vec<Complex64> = actual_encrypted
+            .iter()
+            .map(|value| decode_complex_scalar(value.get(0, 0), &secret, &embedding))
+            .collect();
+
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+
+        for (actual_value, expected_value) in actual.iter().zip(&expected_plan) {
+            let error = *actual_value - *expected_value;
+
+            squared_error += error.norm_sqr();
+            squared_reference += expected_value.norm_sqr();
+            max_abs = max_abs.max(error.norm());
+        }
+
+        let rel_l2 = if squared_reference > 0.0 {
+            (squared_error / squared_reference).sqrt()
+        } else {
+            squared_error.sqrt()
+        };
+
+        let output_level = actual_encrypted[0].level();
+        let expected_output_level =
+            encrypted_values[0].level() + fft_plan.stage_count().saturating_sub(1);
+
+        println!(
+            "FFT1_CP_FULL_CASE=N{} STAGES={} BUTTERFLIES={} INPUT_LEVEL={} OUTPUT_LEVEL={} LEVELS_CONSUMED={} REL_L2={:.12e} MAX_ABS={:.12e}",
+            fft_length,
+            fft_plan.stage_count(),
+            fft_plan.butterfly_count(),
+            encrypted_values[0].level(),
+            output_level,
+            output_level - encrypted_values[0].level(),
+            rel_l2,
+            max_abs,
+        );
+
+        assert_eq!(
+            output_level, expected_output_level,
+            "encrypted FFT1 output level must match stage depth"
+        );
+        assert!(
+            rel_l2 < TOLERANCE,
+            "encrypted FFT1 relative L2 error {rel_l2:e}"
+        );
+        assert!(
+            max_abs < TOLERANCE,
+            "encrypted FFT1 maximum absolute error {max_abs:e}"
         );
     }
 }

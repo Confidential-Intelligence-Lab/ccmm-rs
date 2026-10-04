@@ -368,6 +368,238 @@ pub fn fft1_butterfly_cp(
     )
 }
 
+/// Executes an explicit FFT1 plan over encrypted data and a public transform.
+///
+/// The input is one ciphertext matrix per logical FFT value. All operands must
+/// begin at the same CKKS level, basis, scale, shape, and ring degree.
+///
+/// Execution follows the same structural plan as [`execute_fft1_plan`]:
+///
+/// 1. bit-reversal permutation;
+/// 2. staged radix-2 butterflies;
+/// 3. optional inverse normalization.
+///
+/// The first radix-2 stage contains only unit twiddles and therefore executes
+/// with ciphertext addition/subtraction only, consuming no CKKS level.
+/// Subsequent stages consume one level each because their public twiddle
+/// multiplications use ciphertext-plaintext multiplication followed by one
+/// rescale. Forward execution therefore consumes `max(stage_count - 1, 0)`
+/// levels.
+///
+/// Twiddle coefficients and FFT topology are public. This executor performs no
+/// ciphertext-ciphertext multiplication and requires no relinearization.
+pub fn execute_fft1_plan_cp(
+    plan: &Fft1Plan,
+    direction: FftDirection,
+    input: &[RnsCkksCiphertextMatrix],
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+) -> Vec<RnsCkksCiphertextMatrix> {
+    let shape = plan.shape();
+
+    assert_eq!(
+        input.len(),
+        shape.length(),
+        "eBLAS encrypted FFT1 input length must match transform shape"
+    );
+
+    assert!(
+        !input.is_empty(),
+        "eBLAS encrypted FFT1 requires at least one ciphertext operand"
+    );
+
+    let first = &input[0];
+
+    let butterfly_levels = plan.stage_count().saturating_sub(1);
+    let normalization_levels =
+        usize::from(direction == FftDirection::Inverse && shape.length() > 1);
+    let required_levels = butterfly_levels + normalization_levels;
+
+    assert!(
+        first.level() + required_levels <= chain.max_level(),
+        "eBLAS encrypted FFT1 modulus chain is too shallow for the planned execution"
+    );
+
+    for value in &input[1..] {
+        assert_eq!(
+            value.rows(),
+            first.rows(),
+            "eBLAS encrypted FFT1 operand row counts must match"
+        );
+        assert_eq!(
+            value.cols(),
+            first.cols(),
+            "eBLAS encrypted FFT1 operand column counts must match"
+        );
+        assert_eq!(
+            value.level(),
+            first.level(),
+            "eBLAS encrypted FFT1 operand levels must match"
+        );
+        assert_eq!(
+            value.scale(),
+            first.scale(),
+            "eBLAS encrypted FFT1 operand scales must match"
+        );
+        assert_eq!(
+            value.get(0, 0).basis(),
+            first.get(0, 0).basis(),
+            "eBLAS encrypted FFT1 operand bases must match"
+        );
+        assert_eq!(
+            value.ring_degree(),
+            first.ring_degree(),
+            "eBLAS encrypted FFT1 operand ring degrees must match"
+        );
+    }
+
+    let mut values = input.to_vec();
+
+    let n = values.len();
+    if n > 2 {
+        let bits = n.trailing_zeros();
+
+        for index in 0..n {
+            let reversed = index.reverse_bits() >> (usize::BITS - bits);
+
+            if reversed > index {
+                values.swap(index, reversed);
+            }
+        }
+    }
+
+    let sign = match direction {
+        FftDirection::Forward => -1.0,
+        FftDirection::Inverse => 1.0,
+    };
+
+    for stage in plan.stages() {
+        let stage_input = values.clone();
+        let mut stage_output = values.clone();
+
+        let level_free_unit_stage = stage.span() == 2
+            && stage
+                .butterflies()
+                .iter()
+                .all(|butterfly| butterfly.twiddle_exponent() == 0);
+
+        if level_free_unit_stage {
+            for butterfly in stage.butterflies() {
+                debug_assert_eq!(butterfly.stage(), stage.index());
+                debug_assert_eq!(butterfly.span(), stage.span());
+
+                let a = &stage_input[butterfly.even_index()];
+                let b = &stage_input[butterfly.odd_index()];
+
+                assert_eq!(
+                    a.rows(),
+                    b.rows(),
+                    "eBLAS FFT1 unit butterfly operand row counts must match"
+                );
+                assert_eq!(
+                    a.cols(),
+                    b.cols(),
+                    "eBLAS FFT1 unit butterfly operand column counts must match"
+                );
+                assert_eq!(
+                    a.level(),
+                    b.level(),
+                    "eBLAS FFT1 unit butterfly operand levels must match"
+                );
+                assert_eq!(
+                    a.scale(),
+                    b.scale(),
+                    "eBLAS FFT1 unit butterfly operand scales must match"
+                );
+                assert_eq!(
+                    a.get(0, 0).basis(),
+                    b.get(0, 0).basis(),
+                    "eBLAS FFT1 unit butterfly operand bases must match"
+                );
+
+                let mut upper = Vec::with_capacity(a.len());
+                let mut lower = Vec::with_capacity(a.len());
+
+                for col in 0..a.cols() {
+                    for row in 0..a.rows() {
+                        upper.push(evaluator.add(a.get(row, col), b.get(row, col)));
+                        lower.push(evaluator.sub(a.get(row, col), b.get(row, col)));
+                    }
+                }
+
+                stage_output[butterfly.even_index()] =
+                    RnsCkksCiphertextMatrix::from_vec_column_major(a.rows(), a.cols(), upper);
+
+                stage_output[butterfly.odd_index()] =
+                    RnsCkksCiphertextMatrix::from_vec_column_major(a.rows(), a.cols(), lower);
+            }
+        } else {
+            let level = stage_input[0].level();
+
+            assert!(
+                chain.has_next_level(level),
+                "eBLAS encrypted FFT1 stage requires another CKKS chain level"
+            );
+
+            let stage_ntt_plan = RnsNttPlan::new(
+                chain.level(level).moduli().to_vec(),
+                stage_input[0].ring_degree(),
+            );
+
+            for butterfly in stage.butterflies() {
+                debug_assert_eq!(butterfly.stage(), stage.index());
+                debug_assert_eq!(butterfly.span(), stage.span());
+
+                let angle =
+                    sign * 2.0 * PI * butterfly.twiddle_exponent() as f64 / butterfly.span() as f64;
+
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                let (upper, lower) = fft1_butterfly_cp(
+                    evaluator,
+                    &stage_input[butterfly.even_index()],
+                    &stage_input[butterfly.odd_index()],
+                    twiddle,
+                    embedding,
+                    chain,
+                    &stage_ntt_plan,
+                );
+
+                stage_output[butterfly.even_index()] = upper;
+                stage_output[butterfly.odd_index()] = lower;
+            }
+        }
+
+        values = stage_output;
+    }
+
+    if direction == FftDirection::Inverse && shape.length() > 1 {
+        let level = values[0].level();
+
+        assert!(
+            chain.has_next_level(level),
+            "eBLAS encrypted inverse FFT1 normalization requires another CKKS chain level"
+        );
+
+        let normalization_plan = RnsNttPlan::new(
+            chain.level(level).moduli().to_vec(),
+            values[0].ring_degree(),
+        );
+
+        let normalization = Complex64::new(1.0 / shape.length() as f64, 0.0);
+
+        values = values
+            .iter()
+            .map(|value| {
+                scale_complex_cp(value, normalization, embedding, chain, &normalization_plan)
+            })
+            .collect();
+    }
+
+    values
+}
+
 /// Dense complex DFT reference oracle.
 ///
 /// This intentionally uses O(N^2) work and exists for semantic validation.
