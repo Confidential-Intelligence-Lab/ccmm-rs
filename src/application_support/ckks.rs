@@ -14,9 +14,13 @@ use crate::grafting::{
     BoundedRnsMultiplicationKey,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
-use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
+use crate::ring::{
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusBasis,
+    ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial,
+};
 use crate::rlwe::ErrorDistribution;
 use num_complex::Complex64;
+use num_traits::ToPrimitive;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -59,14 +63,6 @@ pub fn encode_rns(
         .collect();
 
     RnsPolynomial::from_residues(residues)
-}
-
-fn centered(value: u128, modulus: u128) -> i128 {
-    if value > modulus / 2 {
-        value as i128 - modulus as i128
-    } else {
-        value as i128
-    }
 }
 
 /// Encrypts one real scalar replicated across all CKKS slots.
@@ -117,11 +113,15 @@ pub fn decode_scalar(
         ciphertext.rlwe().degree(),
     );
     let plaintext = decrypt_rns_raw_with_ntt(ciphertext.rlwe(), secret, &plan);
-    let modulus = plaintext.composite_modulus();
-    let coefficients: Vec<f64> = plaintext
-        .reconstruct_coefficients()
+    let modulus = composite_modulus_big(plaintext.basis());
+    let coefficients: Vec<f64> = reconstruct_coefficients_big(&plaintext)
         .into_iter()
-        .map(|value| centered(value, modulus) as f64 / ciphertext.scale())
+        .map(|value| {
+            centered_representative_big(&value, &modulus)
+                .to_f64()
+                .expect("centered CKKS coefficient must be representable as f64")
+                / ciphertext.scale()
+        })
         .collect();
     let slots = embedding.coefficients_to_slots(&coefficients);
     let mean = slots.iter().map(|slot| slot.re).sum::<f64>() / slots.len() as f64;
