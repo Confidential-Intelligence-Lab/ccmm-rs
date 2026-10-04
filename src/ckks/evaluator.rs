@@ -72,6 +72,49 @@ impl<'a> RnsCkksEvaluator<'a> {
         )
     }
 
+    /// Subtracts two CKKS ciphertexts with identical active states.
+    ///
+    /// Subtraction is level-, basis-, and scale-preserving.
+    pub fn sub(&self, lhs: &RnsCkksCiphertext, rhs: &RnsCkksCiphertext) -> RnsCkksCiphertext {
+        lhs.assert_matches_chain(self.chain);
+        rhs.assert_matches_chain(self.chain);
+
+        assert_eq!(
+            lhs.level(),
+            rhs.level(),
+            "RNS CKKS subtraction requires matching levels"
+        );
+        assert_eq!(
+            lhs.basis(),
+            rhs.basis(),
+            "RNS CKKS subtraction requires matching bases"
+        );
+        assert_eq!(
+            lhs.scale(),
+            rhs.scale(),
+            "RNS CKKS subtraction requires matching scales"
+        );
+
+        let limbs = lhs
+            .rlwe()
+            .limbs()
+            .iter()
+            .zip(rhs.rlwe().limbs())
+            .map(|(lhs_limb, rhs_limb)| {
+                RlweCiphertext::new(
+                    lhs_limb.b().sub(rhs_limb.b()),
+                    lhs_limb.a().sub(rhs_limb.a()),
+                )
+            })
+            .collect();
+
+        RnsCkksCiphertext::new(
+            RnsRlweCiphertext::from_limbs(limbs),
+            lhs.state().clone(),
+            self.chain,
+        )
+    }
+
     pub fn multiply(&self, lhs: &RnsCkksCiphertext, rhs: &RnsCkksCiphertext) -> RnsCkksCiphertext {
         multiply_with_evaluation_keys(lhs, rhs, self.keys, self.chain)
     }
@@ -298,6 +341,47 @@ mod tests {
         let lhs = zero_ciphertext(&chain, 1, 65_537.0);
         let rhs = zero_ciphertext(&chain, 1, 32_768.0);
         let _ = evaluator.add(&lhs, &rhs);
+    }
+
+    #[test]
+    fn evaluator_sub_preserves_active_state() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let result = evaluator.sub(&lhs, &rhs);
+
+        assert_eq!(result.level(), lhs.level());
+        assert_eq!(result.basis(), lhs.basis());
+        assert_eq!(result.scale(), lhs.scale());
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS CKKS subtraction requires matching levels")]
+    fn evaluator_sub_rejects_mismatched_levels() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 0, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 65_537.0);
+
+        let _ = evaluator.sub(&lhs, &rhs);
+    }
+
+    #[test]
+    #[should_panic(expected = "RNS CKKS subtraction requires matching scales")]
+    fn evaluator_sub_rejects_mismatched_scales() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 1, 65_537.0);
+        let rhs = zero_ciphertext(&chain, 1, 32_768.0);
+
+        let _ = evaluator.sub(&lhs, &rhs);
     }
 
     #[test]
