@@ -1,0 +1,135 @@
+name: Deep Assurance
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-assurance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  deep-regression:
+    name: Deep Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Locked dependency graph
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Full release library tests
+        run: cargo test --locked --release --lib -- --nocapture
+
+      - name: FFT evidence
+        run: scripts/run_eblas_fft_evidence.sh
+
+      - name: Correlation evidence
+        run: scripts/run_eblas_correlation_evidence.sh
+
+      - name: Upload FFT evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: eblas-fft-evidence-${{ github.sha }}
+          path: results/eblas_fft_evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload correlation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: eblas-correlation-evidence-${{ github.sha }}
+          path: results/eblas_correlation_evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+  deep-fuzz:
+    name: Deep Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly
+        run: |
+          rustup toolchain install nightly \
+            --profile minimal \
+            --component rust-src
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+
+      - name: Build fuzz targets
+        run: |
+          cargo +nightly fuzz build fft1_shape
+          cargo +nightly fuzz build fft2_shape
+          cargo +nightly fuzz build packed_fft2_stage
+
+      - name: FFT1 shape fuzz
+        run: |
+          cargo +nightly fuzz run fft1_shape -- \
+            -max_total_time=120 \
+            -timeout=10
+
+      - name: FFT2 shape fuzz
+        run: |
+          cargo +nightly fuzz run fft2_shape -- \
+            -max_total_time=120 \
+            -timeout=10
+
+      - name: Packed FFT2 stage fuzz
+        run: |
+          cargo +nightly fuzz run packed_fft2_stage -- \
+            -max_total_time=180 \
+            -timeout=10
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  supply-chain:
+    name: Deep Supply Chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: RustSec
+        run: cargo audit
+
+      - name: Dependency policy
+        run: cargo deny check
