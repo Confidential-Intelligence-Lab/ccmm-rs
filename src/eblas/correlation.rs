@@ -450,6 +450,29 @@ pub fn correlate_2d_pp(shape: Correlation2dShape, input: &[f64], filters: &[f64]
     correlation_2d_output_nhwc(shape, &output)
 }
 
+/// Computes valid two-dimensional ciphertext/plaintext correlation through
+/// decomposed Batch CPMM.
+///
+/// The NHWC input and `[Kh,Kw,C,F]` filters use the same deterministic
+/// lowering as PP execution. The lowered input-window matrix is encrypted;
+/// the lowered filter matrix remains plaintext. Native decomposition, SinC
+/// packing, Batch CPMM execution, reduction accumulation, and logical output
+/// reconstruction remain owned by the decomposed GEMM substrate.
+pub fn correlate_2d_cp(
+    shape: Correlation2dShape,
+    geometry: BatchGemmGeometry,
+    input: &[f64],
+    filters: &[f64],
+    context: &DecomposedCpmmExecutionContext<'_>,
+) -> Vec<f64> {
+    let (gemm_shape, windows, lowered_filters) =
+        correlation_2d_gemm_operands(shape, input, filters);
+
+    let output = gemm_cp_decomposed(gemm_shape, geometry, &windows, &lowered_filters, context);
+
+    correlation_2d_output_nhwc(shape, &output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +925,189 @@ mod tests {
     #[should_panic(expected = "kernel width cannot exceed input width")]
     fn correlation_2d_shape_rejects_wide_kernel() {
         let _ = Correlation2dShape::new(NhwcShape::new(1, 3, 2, 1), 1, 3, 1);
+    }
+
+    fn deterministic_2d_values(length: usize, salt: usize) -> Vec<f64> {
+        (0..length)
+            .map(|index| {
+                let x = (index * 17 + salt * 19) % 41;
+                (x as f64 - 20.0) / 128.0
+            })
+            .collect()
+    }
+
+    fn assert_slice_close(actual: &[f64], expected: &[f64], tolerance: f64, metric_prefix: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "2D correlation output lengths must match"
+        );
+
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+
+        for (&observed, &reference) in actual.iter().zip(expected) {
+            let error = observed - reference;
+            squared_error += error * error;
+            squared_reference += reference * reference;
+            max_abs = max_abs.max(error.abs());
+        }
+
+        let rel_l2 = if squared_reference > 0.0 {
+            (squared_error / squared_reference).sqrt()
+        } else {
+            squared_error.sqrt()
+        };
+
+        println!(
+            "CORRELATION_2D_{metric_prefix}_REL_L2={rel_l2:.12e} \
+             CORRELATION_2D_{metric_prefix}_MAX_ABS={max_abs:.12e}"
+        );
+
+        assert!(
+            rel_l2 <= tolerance,
+            "encrypted 2D correlation relative L2 error {rel_l2:e} exceeds tolerance {tolerance:e}"
+        );
+        assert!(
+            max_abs <= tolerance,
+            "encrypted 2D correlation max abs error {max_abs:e} exceeds tolerance {tolerance:e}"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_cp_2d_case(
+        input_height: usize,
+        input_width: usize,
+        channels: usize,
+        kernel_height: usize,
+        kernel_width: usize,
+        filters: usize,
+        input_salt: usize,
+        filter_salt: usize,
+        seed: u64,
+    ) {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let shape = Correlation2dShape::new(
+            NhwcShape::new(1, input_height, input_width, channels),
+            kernel_height,
+            kernel_width,
+            filters,
+        );
+
+        let input = deterministic_2d_values(shape.input().elements(), input_salt);
+
+        let filter_values = deterministic_2d_values(
+            shape
+                .inner()
+                .checked_mul(shape.filters())
+                .expect("2D correlation filter element count overflow"),
+            filter_salt,
+        );
+
+        let expected = correlate_2d_pp(shape, &input, &filter_values);
+
+        let basis = crate::ring::ModulusBasis::new(cpmm_moduli());
+        let chain = crate::ring::ModulusChain::from_top_basis(basis.clone());
+
+        let large_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), CPMM_LARGE_DEGREE);
+
+        let scalar_plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), CPMM_SCALAR_DEGREE);
+
+        let mut secret_rng = ChaCha20Rng::seed_from_u64(0x4350_3244_434f_5200 ^ seed);
+
+        let mut secret: Vec<i8> = (0..CPMM_LARGE_DEGREE)
+            .map(|_| secret_rng.gen_range(-1_i8..=1_i8))
+            .collect();
+
+        if secret.iter().all(|&value| value == 0) {
+            secret[0] = 1;
+        }
+
+        let geometry = BatchGemmGeometry::new(
+            crate::eblas::BatchGemmMechanism::Cpmm,
+            CPMM_DIMENSION,
+            CPMM_SCALAR_DEGREE,
+            CPMM_LARGE_DEGREE,
+        );
+
+        let context = DecomposedCpmmExecutionContext {
+            basis: &basis,
+            chain: &chain,
+            large_plan: &large_plan,
+            scalar_plan: &scalar_plan,
+            secret: &secret,
+            scale: cpmm_scale(),
+            encryption_seed: seed ^ 0x3244_4350_454e_4352,
+        };
+
+        let actual = correlate_2d_cp(shape, geometry, &input, &filter_values, &context);
+
+        println!(
+            "CORRELATION_2D_CP_CASE=\
+             H{} W{} C{} KH{} KW{} F{} M{} K{} N{}",
+            input_height,
+            input_width,
+            channels,
+            kernel_height,
+            kernel_width,
+            filters,
+            shape.rows(),
+            shape.inner(),
+            shape.filters(),
+        );
+
+        assert_slice_close(&actual, &expected, 1.0e-3, "CP");
+    }
+
+    #[test]
+    fn cp_2d_semantic_channels_filters_matches_pp() {
+        // Logical GEMM:
+        //
+        //   M = 2*2 = 4
+        //   K = 1*1*2 = 2
+        //   N = 2
+        //
+        // Exercises channels and multiple filters without decomposition.
+        run_cp_2d_case(2, 2, 2, 1, 1, 2, 41, 51, 0x5238_3001);
+    }
+
+    #[test]
+    fn cp_2d_m_decomposition_matches_pp() {
+        // Valid 1x1 correlation:
+        //
+        //   input = 66 x 1 x 1
+        //   M = 66
+        //   K = 1
+        //   N = 1
+        //
+        // d=64 therefore forces two output-row tiles.
+        run_cp_2d_case(66, 1, 1, 1, 1, 1, 42, 52, 0x5238_3002);
+    }
+
+    #[test]
+    fn cp_2d_k_decomposition_matches_pp() {
+        // One valid spatial position with a 9x9 kernel:
+        //
+        //   M = 1
+        //   K = 9*9*1 = 81
+        //   N = 1
+        //
+        // d=64 therefore forces two reduction products.
+        run_cp_2d_case(9, 9, 1, 9, 9, 1, 43, 53, 0x5238_3003);
+    }
+
+    #[test]
+    fn cp_2d_n_decomposition_matches_pp() {
+        // One input value evaluated against 65 filters:
+        //
+        //   M = 1
+        //   K = 1
+        //   N = 65
+        //
+        // d=64 therefore forces two output-column tiles.
+        run_cp_2d_case(1, 1, 1, 1, 1, 65, 44, 54, 0x5238_3004);
     }
 }
