@@ -433,18 +433,27 @@ impl RnsKeySwitchKey {
         let mut entries = Vec::with_capacity(layout.block_count());
 
         for block_index in 0..layout.block_count() {
-            let idempotent = layout.crt_idempotent(block_index);
+            let singleton =
+                layout.blocks()[block_index].end() - layout.blocks()[block_index].start() == 1;
+
+            let legacy_idempotent = (!singleton).then(|| layout.crt_idempotent(block_index));
 
             let mut limbs = Vec::with_capacity(basis.len());
 
-            for &modulus in basis.moduli() {
+            for (limb_index, &modulus) in basis.moduli().iter().enumerate() {
                 let params = RlweParameters::new(degree, modulus, plaintext_modulus, noise_bound);
 
                 let source = project_secret(modulus, source_secret_coefficients);
 
                 let target = project_secret(modulus, target_secret_coefficients);
 
-                let factor = (idempotent % u128::from(modulus.value())) as u64;
+                let factor = if singleton {
+                    layout.crt_idempotent_residue(block_index, limb_index)
+                } else {
+                    (legacy_idempotent
+                        .expect("multi-limb gadget block requires legacy CRT idempotent")
+                        % u128::from(modulus.value())) as u64
+                };
 
                 let message = source.polynomial().scalar_mul(factor);
 
@@ -507,7 +516,12 @@ impl RnsKeySwitchKey {
         let mut entries = Vec::with_capacity(config.layout.block_count());
 
         for block_index in 0..config.layout.block_count() {
-            let idempotent = config.layout.crt_idempotent(block_index);
+            let singleton = config.layout.blocks()[block_index].end()
+                - config.layout.blocks()[block_index].start()
+                == 1;
+
+            let legacy_idempotent = (!singleton).then(|| config.layout.crt_idempotent(block_index));
+
             let mut limbs = Vec::with_capacity(basis.len());
 
             for (limb_index, &modulus) in basis.moduli().iter().enumerate() {
@@ -517,9 +531,20 @@ impl RnsKeySwitchKey {
                     config.plaintext_modulus,
                     config.noise_bound,
                 );
+
                 let source = project_secret(modulus, source_secret_coefficients);
                 let target = project_secret(modulus, target_secret_coefficients);
-                let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                let factor = if singleton {
+                    config
+                        .layout
+                        .crt_idempotent_residue(block_index, limb_index)
+                } else {
+                    (legacy_idempotent
+                        .expect("multi-limb gadget block requires legacy CRT idempotent")
+                        % u128::from(modulus.value())) as u64
+                };
+
                 let message = source.polynomial().scalar_mul(factor);
 
                 limbs.push(encrypt_raw_with_ntt_rng(
@@ -605,15 +630,29 @@ impl RnsKeySwitchKey {
         let mut entries = Vec::with_capacity(config.layout.block_count());
 
         for block_index in 0..config.layout.block_count() {
-            let idempotent = config.layout.crt_idempotent(block_index);
+            let singleton = config.layout.blocks()[block_index].end()
+                - config.layout.blocks()[block_index].start()
+                == 1;
+
+            let legacy_idempotent = (!singleton).then(|| config.layout.crt_idempotent(block_index));
 
             let message_residues = basis
                 .moduli()
                 .iter()
                 .copied()
-                .map(|modulus| {
+                .enumerate()
+                .map(|(limb_index, modulus)| {
                     let source = project_secret(modulus, source_secret_coefficients);
-                    let factor = (idempotent % u128::from(modulus.value())) as u64;
+
+                    let factor = if singleton {
+                        config
+                            .layout
+                            .crt_idempotent_residue(block_index, limb_index)
+                    } else {
+                        (legacy_idempotent
+                            .expect("multi-limb gadget block requires legacy CRT idempotent")
+                            % u128::from(modulus.value())) as u64
+                    };
 
                     source.polynomial().scalar_mul(factor)
                 })

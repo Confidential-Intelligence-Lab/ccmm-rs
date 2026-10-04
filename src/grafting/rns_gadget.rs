@@ -79,6 +79,41 @@ impl RnsGadgetLayout {
         self.blocks.len()
     }
 
+    /// Returns the CRT idempotent for one gadget block reduced modulo one
+    /// target RNS limb.
+    ///
+    /// For a singleton gadget block containing exactly one modulus q_i,
+    /// the CRT idempotent has the one-hot RNS representation
+    ///
+    /// E_i mod q_j = 1 when i == j, and 0 otherwise.
+    ///
+    /// This representation avoids materializing the full composite modulus Q
+    /// and is therefore suitable for wide RNS bases.
+    pub fn crt_idempotent_residue(&self, block_index: usize, limb_index: usize) -> u64 {
+        assert!(
+            block_index < self.blocks.len(),
+            "gadget block index out of range"
+        );
+        assert!(
+            limb_index < self.full_basis.len(),
+            "RNS limb index out of range"
+        );
+
+        let block = &self.blocks[block_index];
+
+        assert_eq!(
+            block.end() - block.start(),
+            1,
+            "RNS-native CRT idempotent residues currently require singleton gadget blocks"
+        );
+
+        if limb_index == block.start() {
+            1
+        } else {
+            0
+        }
+    }
+
     /// CRT idempotent for gadget block `i`.
     ///
     /// If block modulus is Qi and full modulus is Q:
@@ -231,6 +266,53 @@ fn inverse_mod_u128(value: u128, modulus: u128) -> u128 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn singleton_crt_idempotent_residues_are_one_hot() {
+        let basis = ModulusBasis::new(vec![
+            crate::ring::Modulus::new(12_289),
+            crate::ring::Modulus::new(40_961),
+            crate::ring::Modulus::new(65_537),
+        ]);
+
+        let layout = RnsGadgetLayout::new(basis, vec![1, 1, 1]);
+
+        for block_index in 0..3 {
+            for limb_index in 0..3 {
+                let expected = if block_index == limb_index { 1 } else { 0 };
+
+                assert_eq!(
+                    layout.crt_idempotent_residue(block_index, limb_index),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_crt_idempotent_residues_match_legacy_idempotents() {
+        let basis = ModulusBasis::new(vec![
+            crate::ring::Modulus::new(12_289),
+            crate::ring::Modulus::new(40_961),
+            crate::ring::Modulus::new(65_537),
+        ]);
+
+        let layout = RnsGadgetLayout::new(basis, vec![1, 1, 1]);
+
+        for block_index in 0..layout.block_count() {
+            let legacy = layout.crt_idempotent(block_index);
+
+            for limb_index in 0..layout.full_basis().len() {
+                let modulus = layout.full_basis().modulus(limb_index);
+
+                assert_eq!(
+                    layout.crt_idempotent_residue(block_index, limb_index),
+                    (legacy % u128::from(modulus.value())) as u64
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::ring::Modulus;
 
