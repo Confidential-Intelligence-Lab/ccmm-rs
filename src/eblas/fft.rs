@@ -433,6 +433,185 @@ pub fn execute_packed_fft1_stage_cp(
     evaluator.add(&partial, &right_term)
 }
 
+/// Public diagonal representation of one packed radix-2
+/// decimation-in-frequency FFT1 stage.
+///
+/// For a stage of span `m = 2h`, DIF computes
+///
+/// ```text
+/// upper = a + b
+/// lower = (a - b) * w
+/// ```
+///
+/// over every butterfly pair separated by `h`. Natural-order input followed
+/// by spans `N, N/2, ..., 2` produces the Fourier coefficients in bit-reversed
+/// slot order. This is useful for encrypted execution because the permutation
+/// can remain a representation mapping rather than an encrypted operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedFft1DifStageDiagonals {
+    span: usize,
+    half: usize,
+    direct: Vec<Complex64>,
+    rotate_left: Vec<Complex64>,
+    rotate_right: Vec<Complex64>,
+}
+
+impl PackedFft1DifStageDiagonals {
+    pub fn new(length: usize, span: usize, direction: FftDirection) -> Self {
+        assert!(length > 0, "packed DIF FFT1 stage length must be positive");
+        assert!(
+            length.is_power_of_two(),
+            "packed DIF FFT1 stage length must be a power of two"
+        );
+        assert!(
+            span >= 2 && span.is_power_of_two(),
+            "packed DIF FFT1 stage span must be a power of two of at least two"
+        );
+        assert!(
+            span <= length,
+            "packed DIF FFT1 stage span must not exceed transform length"
+        );
+        assert_eq!(
+            length % span,
+            0,
+            "packed DIF FFT1 stage span must divide transform length"
+        );
+
+        let half = span / 2;
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        let mut direct = Vec::with_capacity(length);
+        let mut rotate_left = Vec::with_capacity(length);
+        let mut rotate_right = Vec::with_capacity(length);
+
+        for index in 0..length {
+            let offset = index % span;
+
+            if offset < half {
+                direct.push(Complex64::new(1.0, 0.0));
+                rotate_left.push(Complex64::new(1.0, 0.0));
+                rotate_right.push(Complex64::new(0.0, 0.0));
+            } else {
+                let exponent = offset - half;
+                let angle = sign * 2.0 * PI * exponent as f64 / span as f64;
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                direct.push(-twiddle);
+                rotate_left.push(Complex64::new(0.0, 0.0));
+                rotate_right.push(twiddle);
+            }
+        }
+
+        Self {
+            span,
+            half,
+            direct,
+            rotate_left,
+            rotate_right,
+        }
+    }
+
+    pub const fn span(&self) -> usize {
+        self.span
+    }
+
+    pub const fn rotation(&self) -> usize {
+        self.half
+    }
+
+    pub fn direct(&self) -> &[Complex64] {
+        &self.direct
+    }
+
+    pub fn rotate_left(&self) -> &[Complex64] {
+        &self.rotate_left
+    }
+
+    pub fn rotate_right(&self) -> &[Complex64] {
+        &self.rotate_right
+    }
+}
+
+/// Executes one packed DIF FFT1 stage in cleartext.
+///
+/// The same cyclic-rotation convention used by the encrypted packed DIT stage
+/// is retained here; public diagonals mask all cross-block contamination.
+pub fn execute_packed_fft1_dif_stage_pp(
+    input: &[Complex64],
+    diagonals: &PackedFft1DifStageDiagonals,
+) -> Vec<Complex64> {
+    let n = input.len();
+
+    assert_eq!(
+        diagonals.direct.len(),
+        n,
+        "packed DIF FFT1 direct diagonal length must match input"
+    );
+    assert_eq!(
+        diagonals.rotate_left.len(),
+        n,
+        "packed DIF FFT1 left diagonal length must match input"
+    );
+    assert_eq!(
+        diagonals.rotate_right.len(),
+        n,
+        "packed DIF FFT1 right diagonal length must match input"
+    );
+
+    let rotation = diagonals.rotation();
+
+    (0..n)
+        .map(|index| {
+            let left = input[(index + rotation) % n];
+            let right = input[(index + n - rotation) % n];
+
+            diagonals.direct[index] * input[index]
+                + diagonals.rotate_left[index] * left
+                + diagonals.rotate_right[index] * right
+        })
+        .collect()
+}
+
+/// Executes a complete packed radix-2 DIF FFT1 in cleartext.
+///
+/// Input is in natural logical order. The returned vector intentionally remains
+/// in bit-reversed physical slot order. For inverse transforms, normalization
+/// is applied without changing that representation.
+pub fn execute_packed_fft1_dif_pp(
+    shape: Fft1Shape,
+    direction: FftDirection,
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    assert_eq!(
+        input.len(),
+        shape.length(),
+        "packed DIF FFT1 input length must match transform shape"
+    );
+
+    let n = shape.length();
+    let mut values = input.to_vec();
+    let mut span = n;
+
+    while span >= 2 {
+        let diagonals = PackedFft1DifStageDiagonals::new(n, span, direction);
+        values = execute_packed_fft1_dif_stage_pp(&values, &diagonals);
+        span /= 2;
+    }
+
+    if direction == FftDirection::Inverse {
+        let scale = n as f64;
+
+        for value in &mut values {
+            *value /= scale;
+        }
+    }
+
+    values
+}
+
 /// Executes an explicit FFT1 plan.
 ///
 /// This is numerically equivalent to [`fft1_pp`] but consumes the validated
@@ -977,6 +1156,125 @@ mod tests {
         }
 
         output
+    }
+
+    #[test]
+    fn packed_dif_fft_matches_canonical_fft_through_256() {
+        for &direction in &[FftDirection::Forward, FftDirection::Inverse] {
+            for exponent in 0..=8 {
+                let n = 1usize << exponent;
+                let shape = Fft1Shape::new(n);
+
+                let input: Vec<Complex64> = (0..n)
+                    .map(|index| {
+                        let re = ((index * 11 + 7) % 37) as f64 - 18.0;
+                        let im = ((index * 17 + 3) % 41) as f64 - 20.0;
+                        Complex64::new(re / 23.0, im / 29.0)
+                    })
+                    .collect();
+
+                let canonical = fft1_pp(shape, direction, &input);
+                let packed_physical = execute_packed_fft1_dif_pp(shape, direction, &input);
+
+                let bits = n.trailing_zeros();
+                let mut max_abs = 0.0_f64;
+
+                for (logical_index, &expected) in canonical.iter().enumerate() {
+                    let physical_index = if n <= 2 {
+                        logical_index
+                    } else {
+                        logical_index.reverse_bits() >> (usize::BITS - bits)
+                    };
+
+                    max_abs = max_abs.max((packed_physical[physical_index] - expected).norm());
+                }
+
+                println!(
+                    "PACKED_FFT1_DIF_CASE=N{} DIRECTION={:?} STAGES={} MAX_ABS={:.12e}",
+                    n,
+                    direction,
+                    shape.stages(),
+                    max_abs
+                );
+
+                assert!(
+                    max_abs < 1.0e-10,
+                    "packed DIF FFT1 must match canonical FFT under bit-reversed output mapping"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_dif_stage_matches_direct_dif_butterflies_through_256() {
+        for &direction in &[FftDirection::Forward, FftDirection::Inverse] {
+            let sign = match direction {
+                FftDirection::Forward => -1.0,
+                FftDirection::Inverse => 1.0,
+            };
+
+            for exponent in 1..=8 {
+                let n = 1usize << exponent;
+
+                let input: Vec<Complex64> = (0..n)
+                    .map(|index| {
+                        Complex64::new(
+                            (((index * 5 + 1) % 23) as f64 - 11.0) / 13.0,
+                            (((index * 9 + 4) % 19) as f64 - 9.0) / 17.0,
+                        )
+                    })
+                    .collect();
+
+                let mut span = n;
+
+                while span >= 2 {
+                    let half = span / 2;
+
+                    let diagonals = PackedFft1DifStageDiagonals::new(n, span, direction);
+
+                    let packed = execute_packed_fft1_dif_stage_pp(&input, &diagonals);
+
+                    let mut direct = input.clone();
+
+                    for base in (0..n).step_by(span) {
+                        for offset in 0..half {
+                            let upper = base + offset;
+                            let lower = upper + half;
+
+                            let angle = sign * 2.0 * PI * offset as f64 / span as f64;
+
+                            let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                            direct[upper] = input[upper] + input[lower];
+
+                            direct[lower] = (input[upper] - input[lower]) * twiddle;
+                        }
+                    }
+
+                    let max_abs = packed
+                        .iter()
+                        .zip(&direct)
+                        .map(|(actual, expected)| (*actual - *expected).norm())
+                        .fold(0.0_f64, f64::max);
+
+                    println!(
+                        "PACKED_FFT1_DIF_STAGE_CASE=N{} DIRECTION={:?} SPAN={} ROTATION={} MAX_ABS={:.12e}",
+                        n,
+                        direction,
+                        span,
+                        half,
+                        max_abs
+                    );
+
+                    assert!(
+                        max_abs < 1.0e-12,
+                        "packed DIF stage must match direct DIF butterflies"
+                    );
+
+                    span /= 2;
+                }
+            }
+        }
     }
 
     #[test]
