@@ -60,6 +60,8 @@ pub fn mod_switch_rns_ckks_to_next_observed(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use crate::ckks::CkksChainState;
     use crate::grafting::RnsRlweCiphertext;
     use crate::ring::{Modulus, ModulusBasis, ModulusChain, Polynomial};
@@ -109,6 +111,72 @@ mod tests {
             CkksChainState::top(chain, 65_537.0),
             chain,
         )
+    }
+
+    fn mod_switch_scale_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            Just(256.0),
+            Just(512.0),
+            Just(1024.0),
+            Just(4096.0),
+            Just(32_768.0),
+            Just(65_537.0),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 2048,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_mod_switch_advances_exactly_one_level(
+            start_level in 0usize..2,
+            scale in mod_switch_scale_strategy(),
+        ) {
+            let chain = chain();
+
+            let top = ciphertext(&chain);
+            let mut input = RnsCkksCiphertext::new(
+                top.rlwe().clone(),
+                CkksChainState::top(&chain, scale),
+                &chain,
+            );
+
+            while input.level() < start_level {
+                input =
+                    mod_switch_rns_ckks_to_next(&input, &chain);
+            }
+
+            let input_level = input.level();
+            let input_scale = input.scale();
+            let input_limbs = input.rlwe().limbs().to_vec();
+
+            let output =
+                mod_switch_rns_ckks_to_next(&input, &chain);
+
+            let expected_level = input_level + 1;
+            let expected_basis = chain.level(expected_level);
+
+            prop_assert_eq!(
+                output.level(),
+                expected_level,
+            );
+            prop_assert_eq!(
+                output.basis(),
+                expected_basis,
+            );
+            prop_assert_eq!(
+                output.scale(),
+                input_scale,
+            );
+            prop_assert_eq!(
+                output.rlwe().limbs(),
+                &input_limbs[..expected_basis.len()],
+            );
+        }
     }
 
     #[test]

@@ -168,6 +168,8 @@ fn rescale_polynomial_limb(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use crate::ckks::CkksChainState;
     use crate::ring::{ModulusBasis, RnsPolynomial};
 
@@ -267,6 +269,80 @@ mod tests {
         let inner = rns_rlwe_from_coefficients(chain.top(), coefficients_b, coefficients_a);
 
         RnsCkksCiphertext::new(inner, CkksChainState::top(chain, scale), chain)
+    }
+
+    fn rescale_scale_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            Just(65_537.0 * 65_537.0),
+            Just(65_537.0 * 40_961.0),
+            Just(2.0_f64.powi(32)),
+            Just(2.0_f64.powi(40)),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 2048,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_rescale_advances_level_and_updates_scale(
+            start_level in 0usize..2,
+            initial_scale in rescale_scale_strategy(),
+        ) {
+            let chain = chain();
+
+            let mut input = ciphertext_from_coefficients(
+                &chain,
+                &[1, 17, 42, 65_537],
+                &[9, 21, 77, 131],
+                initial_scale,
+            );
+
+            while input.level() < start_level {
+                input =
+                    rescale_rns_ckks_to_next(&input, &chain);
+            }
+
+            let input_level = input.level();
+            let input_scale = input.scale();
+
+            let dropped = chain
+                .dropped_modulus(input_level)
+                .expect("generated level must have successor")
+                .value() as f64;
+
+            let output =
+                rescale_rns_ckks_to_next(&input, &chain);
+
+            let expected_level = input_level + 1;
+            let expected_scale = input_scale / dropped;
+
+            prop_assert_eq!(
+                output.level(),
+                expected_level,
+            );
+            prop_assert_eq!(
+                output.basis(),
+                chain.level(expected_level),
+            );
+
+            let scale_error =
+                (output.scale() - expected_scale).abs();
+
+            prop_assert!(
+                scale_error <= f64::EPSILON
+                    * expected_scale.abs().max(1.0),
+                "rescale scale mismatch: \
+                 input_level={input_level} \
+                 input_scale={input_scale:e} \
+                 expected={expected_scale:e} \
+                 actual={:e}",
+                output.scale(),
+            );
+        }
     }
 
     #[test]
