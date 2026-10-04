@@ -68,6 +68,85 @@ impl Fft1Shape {
     }
 }
 
+/// Shape contract for a two-dimensional radix-2 FFT.
+///
+/// Logical values use row-major layout:
+///
+/// ```text
+/// physical_index = row * cols + col
+/// ```
+///
+/// Both dimensions are transformed independently and must be non-zero
+/// powers of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fft2Shape {
+    rows: usize,
+    cols: usize,
+}
+
+impl Fft2Shape {
+    /// Creates a two-dimensional radix-2 FFT shape.
+    pub fn new(rows: usize, cols: usize) -> Self {
+        assert!(rows > 0, "eBLAS FFT2 row count must be positive");
+        assert!(cols > 0, "eBLAS FFT2 column count must be positive");
+        assert!(
+            rows.is_power_of_two(),
+            "eBLAS radix-2 FFT2 row count must be a power of two"
+        );
+        assert!(
+            cols.is_power_of_two(),
+            "eBLAS radix-2 FFT2 column count must be a power of two"
+        );
+
+        rows.checked_mul(cols)
+            .expect("eBLAS FFT2 element count overflow");
+
+        Self { rows, cols }
+    }
+
+    /// Number of logical matrix rows.
+    pub const fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// Number of logical matrix columns.
+    pub const fn cols(self) -> usize {
+        self.cols
+    }
+
+    /// Number of logical complex values.
+    pub fn elements(self) -> usize {
+        self.rows
+            .checked_mul(self.cols)
+            .expect("eBLAS FFT2 element count overflow")
+    }
+
+    /// Number of radix-2 stages across rows.
+    pub fn row_stages(self) -> u32 {
+        self.cols.trailing_zeros()
+    }
+
+    /// Number of radix-2 stages down columns.
+    pub fn column_stages(self) -> u32 {
+        self.rows.trailing_zeros()
+    }
+
+    /// Total number of separable radix-2 stages.
+    pub fn stages(self) -> u32 {
+        self.row_stages()
+            .checked_add(self.column_stages())
+            .expect("eBLAS FFT2 stage count overflow")
+    }
+
+    /// Total number of radix-2 butterflies in the separable transform.
+    pub fn butterflies(self) -> usize {
+        self.elements()
+            .checked_mul(self.stages() as usize)
+            .expect("eBLAS FFT2 butterfly count overflow")
+            / 2
+    }
+}
+
 /// One radix-2 butterfly in an FFT execution plan.
 ///
 /// Indices refer to the working vector after the initial bit-reversal
@@ -1255,6 +1334,98 @@ pub fn fft1_pp(shape: Fft1Shape, direction: FftDirection, input: &[Complex64]) -
     values
 }
 
+/// Dense O(R^2 C^2) two-dimensional DFT reference oracle.
+///
+/// Input and output use row-major layout. The inverse transform is normalized
+/// by `1 / (rows * cols)`.
+pub fn dft2_reference(
+    shape: Fft2Shape,
+    direction: FftDirection,
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    assert_eq!(
+        input.len(),
+        shape.elements(),
+        "eBLAS FFT2 input length must match shape"
+    );
+
+    let rows = shape.rows();
+    let cols = shape.cols();
+    let sign = match direction {
+        FftDirection::Forward => -1.0,
+        FftDirection::Inverse => 1.0,
+    };
+    let normalization = match direction {
+        FftDirection::Forward => 1.0,
+        FftDirection::Inverse => 1.0 / shape.elements() as f64,
+    };
+
+    let mut output = vec![Complex64::new(0.0, 0.0); shape.elements()];
+
+    for kr in 0..rows {
+        for kc in 0..cols {
+            let mut sum = Complex64::new(0.0, 0.0);
+
+            for nr in 0..rows {
+                for nc in 0..cols {
+                    let phase = (kr * nr) as f64 / rows as f64 + (kc * nc) as f64 / cols as f64;
+                    let angle = sign * 2.0 * PI * phase;
+                    let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                    sum += input[nr * cols + nc] * twiddle;
+                }
+            }
+
+            output[kr * cols + kc] = sum * normalization;
+        }
+    }
+
+    output
+}
+
+/// Application-facing separable two-dimensional radix-2 FFT.
+///
+/// The logical matrix is row-major. The implementation first transforms every
+/// row and then every column. The result remains in canonical logical
+/// row-major order.
+pub fn fft2_pp(shape: Fft2Shape, direction: FftDirection, input: &[Complex64]) -> Vec<Complex64> {
+    assert_eq!(
+        input.len(),
+        shape.elements(),
+        "eBLAS FFT2 input length must match shape"
+    );
+
+    let rows = shape.rows();
+    let cols = shape.cols();
+    let row_shape = Fft1Shape::new(cols);
+    let column_shape = Fft1Shape::new(rows);
+
+    let mut values = input.to_vec();
+
+    for row in 0..rows {
+        let start = row * cols;
+        let end = start + cols;
+        let transformed = fft1_pp(row_shape, direction, &values[start..end]);
+        values[start..end].copy_from_slice(&transformed);
+    }
+
+    let mut column = vec![Complex64::new(0.0, 0.0); rows];
+
+    for col in 0..cols {
+        for row in 0..rows {
+            column[row] = values[row * cols + col];
+        }
+
+        let transformed = fft1_pp(column_shape, direction, &column);
+
+        for row in 0..rows {
+            values[row * cols + col] = transformed[row];
+        }
+    }
+
+    values
+}
+
 fn bit_reverse_permute(values: &mut [Complex64]) {
     let n = values.len();
 
@@ -1535,6 +1706,141 @@ mod tests {
             .zip(expected)
             .map(|(actual, expected)| (*actual - *expected).norm())
             .fold(0.0_f64, f64::max)
+    }
+
+    #[test]
+    fn fft2_shape_exposes_separable_radix2_structure() {
+        let shape = Fft2Shape::new(8, 4);
+
+        assert_eq!(shape.rows(), 8);
+        assert_eq!(shape.cols(), 4);
+        assert_eq!(shape.elements(), 32);
+        assert_eq!(shape.row_stages(), 2);
+        assert_eq!(shape.column_stages(), 3);
+        assert_eq!(shape.stages(), 5);
+        assert_eq!(shape.butterflies(), 80);
+    }
+
+    #[test]
+    #[should_panic(expected = "eBLAS FFT2 row count must be positive")]
+    fn fft2_shape_rejects_zero_rows() {
+        let _ = Fft2Shape::new(0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "eBLAS FFT2 column count must be positive")]
+    fn fft2_shape_rejects_zero_cols() {
+        let _ = Fft2Shape::new(4, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "eBLAS radix-2 FFT2 row count must be a power of two")]
+    fn fft2_shape_rejects_non_power_of_two_rows() {
+        let _ = Fft2Shape::new(3, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "eBLAS radix-2 FFT2 column count must be a power of two")]
+    fn fft2_shape_rejects_non_power_of_two_cols() {
+        let _ = Fft2Shape::new(4, 6);
+    }
+
+    #[test]
+    fn fft2_matches_dense_dft2_reference() {
+        let cases = [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (2, 4),
+            (4, 2),
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+        ];
+
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            for (rows, cols) in cases {
+                let shape = Fft2Shape::new(rows, cols);
+                let input: Vec<Complex64> = (0..shape.elements())
+                    .map(|index| {
+                        let re = ((index * 7 + 3) % 23) as f64 - 11.0;
+                        let im = ((index * 11 + 5) % 29) as f64 - 14.0;
+                        Complex64::new(re / 16.0, im / 16.0)
+                    })
+                    .collect();
+
+                let actual = fft2_pp(shape, direction, &input);
+                let expected = dft2_reference(shape, direction, &input);
+
+                let max_abs = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (*a - *b).norm())
+                    .fold(0.0_f64, f64::max);
+
+                println!(
+                    "FFT2_PP_DFT_CASE=ROWS{rows} COLS{cols} DIRECTION={direction:?} \
+                     ROW_STAGES={} COLUMN_STAGES={} MAX_ABS={max_abs:.12e}",
+                    shape.row_stages(),
+                    shape.column_stages()
+                );
+
+                assert!(
+                    max_abs < 1.0e-11,
+                    "FFT2 mismatch for {rows}x{cols} {direction:?}: {max_abs}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fft2_roundtrip_recovers_input() {
+        let cases = [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (2, 4),
+            (4, 2),
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+        ];
+
+        for (rows, cols) in cases {
+            let shape = Fft2Shape::new(rows, cols);
+            let input: Vec<Complex64> = (0..shape.elements())
+                .map(|index| {
+                    let re = ((index * 13 + 1) % 31) as f64 - 15.0;
+                    let im = ((index * 17 + 9) % 37) as f64 - 18.0;
+                    Complex64::new(re / 32.0, im / 32.0)
+                })
+                .collect();
+
+            let spectrum = fft2_pp(shape, FftDirection::Forward, &input);
+            let recovered = fft2_pp(shape, FftDirection::Inverse, &spectrum);
+
+            let max_abs = recovered
+                .iter()
+                .zip(&input)
+                .map(|(a, b)| (*a - *b).norm())
+                .fold(0.0_f64, f64::max);
+
+            println!(
+                "FFT2_PP_ROUNDTRIP_CASE=ROWS{rows} COLS{cols} \
+                 ROW_STAGES={} COLUMN_STAGES={} MAX_ABS={max_abs:.12e}",
+                shape.row_stages(),
+                shape.column_stages()
+            );
+
+            assert!(
+                max_abs < 1.0e-11,
+                "FFT2 roundtrip mismatch for {rows}x{cols}: {max_abs}"
+            );
+        }
     }
 
     #[test]
