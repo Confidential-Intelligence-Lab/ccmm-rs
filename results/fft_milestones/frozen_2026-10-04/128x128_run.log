@@ -1,0 +1,284 @@
+FFT_PARAMETERIZATION_BEGIN
+FFT_PROFILE=research-65536
+FFT_SECURITY_BEARING=false
+FFT_RING_DEGREE=65536
+FFT_SLOT_COUNT=32768
+FFT_ROWS=64
+FFT_COLS=64
+FFT_ELEMENTS=4096
+FFT_CHAIN_LIMBS=18
+FFT_TOTAL_MODULUS_BITS=990
+FFT_INITIAL_SCALE=3.602879701896e16
+FFT_ENCRYPTION_SIGMA=3.190000
+FFT_GALOIS_KEY_NOISE_BOUND=0
+FFT_PLAINTEXT_MODULUS=2
+FFT_GADGET_BLOCK_POLICY=singleton
+FFT_DIRECTION=forward
+FFT_EXPECTED_LEVELS_CONSUMED=14
+FFT_TRANSPOSES=0
+FFT_MODULUS_0=36028797014376449
+FFT_MODULUS_1=36028797013327873
+FFT_MODULUS_2=36028797010444289
+FFT_MODULUS_3=36028797005856769
+FFT_MODULUS_4=36028797001138177
+FFT_MODULUS_5=36028796997599233
+FFT_MODULUS_6=36028796996681729
+FFT_MODULUS_7=36028796992749569
+FFT_MODULUS_8=36028796991700993
+FFT_MODULUS_9=36028796990390273
+FFT_MODULUS_10=36028796987637761
+FFT_MODULUS_11=36028796986851329
+FFT_MODULUS_12=36028796984098817
+FFT_MODULUS_13=36028796982263809
+FFT_MODULUS_14=36028796982132737
+FFT_MODULUS_15=36028796980953089
+FFT_MODULUS_16=36028796974661633
+FFT_MODULUS_17=36028796973088769
+FFT_PARAMETERIZATION_END
+TILED_FFT_PARAMETERIZATION_BEGIN
+TILED_FFT_IMAGE_ROWS=128
+TILED_FFT_IMAGE_COLS=128
+TILED_FFT_TILE_ROWS=64
+TILED_FFT_TILE_COLS=64
+TILED_FFT_TILES_PER_DIMENSION=2
+TILED_FFT_TILE_COUNT=4
+TILED_FFT_PROFILE=research-65536
+TILED_FFT_RING_DEGREE=65536
+TILED_FFT_SLOT_COUNT=32768
+TILED_FFT_EXACT_LEVELS=14
+TILED_FFT_SECURITY_BEARING=false
+TILED_FFT_SEMANTICS=EXACT_GLOBAL_FACTORED_FFT2
+TILED_FFT_GLOBAL_EXACT=true
+TILED_FFT_PARAMETERIZATION_END
+FHE_FFT_PLAN_BEGIN
+FHE_FFT_PLAN_IMAGE_DIMENSION=128x128
+FHE_FFT_PLAN_TILE_DIMENSION=64x64
+FHE_FFT_PLAN_IMAGE_ELEMENTS=16384
+FHE_FFT_PLAN_TILE_ELEMENTS=4096
+FHE_FFT_PLAN_TILES_PER_ROW=2
+FHE_FFT_PLAN_TILES_PER_COL=2
+FHE_FFT_PLAN_TILE_COUNT=4
+FHE_FFT_PLAN_LOCAL_ROW_STAGES=6
+FHE_FFT_PLAN_GLOBAL_ROW_STAGES=1
+FHE_FFT_PLAN_LOCAL_COLUMN_STAGES=6
+FHE_FFT_PLAN_GLOBAL_COLUMN_STAGES=1
+FHE_FFT_PLAN_LOCAL_STAGES=12
+FHE_FFT_PLAN_CROSS_TILE_STAGES=2
+FHE_FFT_PLAN_TOTAL_EXACT_STAGES=14
+FHE_FFT_PLAN_SELECTED_LOCAL_PROFILE=research-32768
+FHE_FFT_PLAN_EXACT_EXECUTION_PROFILE=research-65536
+FHE_FFT_PLAN_EXACT_EXECUTION_REQUIRED_LEVELS=14
+FHE_FFT_PLAN_EXACT_EXECUTION_CHAIN_LIMBS=18
+FHE_FFT_PLAN_TERMINAL_GUARD_LIMBS=4
+FHE_FFT_PLAN_LOCAL_RING_DEGREE=32768
+FHE_FFT_PLAN_LOCAL_SLOT_COUNT=16384
+FHE_FFT_PLAN_TILE_SLOT_UTILIZATION=0.250000
+FHE_FFT_PLAN_GLOBAL_EXACT_TARGET=true
+FHE_FFT_PLAN_CURRENT_EXECUTOR_GLOBAL_EXACT=true
+FHE_FFT_PLAN_SECURITY_BEARING=false
+FHE_FFT_PLAN_END
+FFT_RESOURCE_PLAN_BEGIN
+FFT_RESOURCE_AVAILABLE_PARALLELISM=10
+FFT_RESOURCE_ENCRYPTION_PARALLELISM=4
+FFT_RESOURCE_LOCAL_TILE_PARALLELISM=2
+FFT_RESOURCE_GLOBAL_PAIR_PARALLELISM=4
+FFT_RESOURCE_KEYGEN_PARALLELISM=2
+FFT_RESOURCE_ROTATION_PARALLELISM=2
+FFT_RESOURCE_CP_PARALLELISM=3
+FFT_RESOURCE_MAX_LOCAL_CP_WORKERS=6
+FFT_RESOURCE_GLOBAL_BRANCH_PARALLELISM=2
+FFT_RESOURCE_MAX_GLOBAL_BRANCH_WORKERS=8
+FFT_RESOURCE_MAX_EXPLICIT_WORKERS=8
+FFT_RESOURCE_PLAINTEXT_IMAGE_BYTES=262144
+FFT_RESOURCE_PLAINTEXT_TILE_TENSOR_BYTES=262144
+FFT_RESOURCE_ENCODED_PLAINTEXT_TENSOR_PAYLOAD_BYTES=37748736
+FFT_RESOURCE_ENCRYPTED_INPUT_PAYLOAD_BYTES=75497472
+FFT_RESOURCE_ENCRYPTED_OUTPUT_PAYLOAD_BYTES=16777216
+FFT_RESOURCE_PEAK_LIVE_ENCRYPTED_ESTIMATE_BYTES=255852544
+FFT_RESOURCE_PAYLOAD_WORD_BYTES=8
+FFT_RESOURCE_COMPLEX_VALUE_BYTES=16
+FFT_RESOURCE_MEMORY_ACCOUNTING=PAYLOAD_PLUS_OS_RSS
+FFT_RESOURCE_PLAN_END
+IMAGE_FFT_INPUT=results/image_filter/source/highres_bw_test.png
+IMAGE_FFT_OUTPUT_DIR=results/image_filter/encrypted_frequency_filter/tiled_fft_128x128_tile_64x64
+FACTORED_CLEAR_REL_L2=5.199692524464e-16
+FACTORED_CLEAR_MAX_ABS=1.258603664694e-12
+FACTORED_CLEAR_STATUS=PASS
+[1/17] tile encryption ... START
+[1/17] tile encryption ... DONE elapsed_ms=841
+FFT_RESOURCE_GALOIS_KEY_COUNT=24
+FFT_RESOURCE_GALOIS_KEY_PAYLOAD_ESTIMATE_BYTES=3426746368
+FHE_FFT_ROTATION_KEY_SCHEDULE_BEGIN
+FHE_FFT_ROTATION_KEY level=1 rotation=32
+FHE_FFT_ROTATION_KEY level=2 rotation=16
+FHE_FFT_ROTATION_KEY level=3 rotation=8
+FHE_FFT_ROTATION_KEY level=4 rotation=4
+FHE_FFT_ROTATION_KEY level=5 rotation=2
+FHE_FFT_ROTATION_KEY level=6 rotation=1
+FHE_FFT_ROTATION_KEY level=8 rotation=2048
+FHE_FFT_ROTATION_KEY level=9 rotation=1024
+FHE_FFT_ROTATION_KEY level=10 rotation=512
+FHE_FFT_ROTATION_KEY level=11 rotation=256
+FHE_FFT_ROTATION_KEY level=12 rotation=128
+FHE_FFT_ROTATION_KEY level=13 rotation=64
+FHE_FFT_ROTATION_KEY_SCHEDULE_END
+[2/17] level-1 Galois keygen ... START
+FFT_GALOIS_LEVEL level=1 rotation=32 limbs=17 degree=65536
+      level=1 rotation=32 direction=left exponent=61313 ... START
+      level=1 rotation=32 direction=right exponent=86145 ... START
+      level=1 rotation=32 direction=left exponent=61313 ... DONE elapsed_ms=12868
+      level=1 rotation=32 direction=right exponent=86145 ... DONE elapsed_ms=12871
+[2/17] level-1 Galois keygen ... DONE elapsed_ms=12871
+[3/17] level-2 Galois keygen ... START
+FFT_GALOIS_LEVEL level=2 rotation=16 limbs=16 degree=65536
+      level=2 rotation=16 direction=left exponent=28609 ... START
+      level=2 rotation=16 direction=right exponent=106561 ... START
+      level=2 rotation=16 direction=left exponent=28609 ... DONE elapsed_ms=11406
+      level=2 rotation=16 direction=right exponent=106561 ... DONE elapsed_ms=11403
+[3/17] level-2 Galois keygen ... DONE elapsed_ms=11406
+[4/17] level-3 Galois keygen ... START
+FFT_GALOIS_LEVEL level=3 rotation=8 limbs=15 degree=65536
+      level=3 rotation=8 direction=left exponent=128481 ... START
+      level=3 rotation=8 direction=right exponent=69153 ... START
+      level=3 rotation=8 direction=left exponent=128481 ... DONE elapsed_ms=10351
+      level=3 rotation=8 direction=right exponent=69153 ... DONE elapsed_ms=10360
+[4/17] level-3 Galois keygen ... DONE elapsed_ms=10360
+[5/17] level-4 Galois keygen ... START
+FFT_GALOIS_LEVEL level=4 rotation=4 limbs=14 degree=65536
+      level=4 rotation=4 direction=left exponent=625 ... START
+      level=4 rotation=4 direction=right exponent=97937 ... START
+      level=4 rotation=4 direction=left exponent=625 ... DONE elapsed_ms=8766
+      level=4 rotation=4 direction=right exponent=97937 ... DONE elapsed_ms=8757
+[5/17] level-4 Galois keygen ... DONE elapsed_ms=8766
+[6/17] level-5 Galois keygen ... START
+FFT_GALOIS_LEVEL level=5 rotation=2 limbs=13 degree=65536
+      level=5 rotation=2 direction=left exponent=25 ... START
+      level=5 rotation=2 direction=right exponent=89129 ... START
+      level=5 rotation=2 direction=left exponent=25 ... DONE elapsed_ms=7591
+      level=5 rotation=2 direction=right exponent=89129 ... DONE elapsed_ms=7592
+[6/17] level-5 Galois keygen ... DONE elapsed_ms=7592
+[7/17] level-6 Galois keygen ... START
+FFT_GALOIS_LEVEL level=6 rotation=1 limbs=12 degree=65536
+      level=6 rotation=1 direction=left exponent=5 ... START
+      level=6 rotation=1 direction=right exponent=52429 ... START
+      level=6 rotation=1 direction=left exponent=5 ... DONE elapsed_ms=6594
+      level=6 rotation=1 direction=right exponent=52429 ... DONE elapsed_ms=6591
+[7/17] level-6 Galois keygen ... DONE elapsed_ms=6594
+[8/17] level-8 Galois keygen ... START
+FFT_GALOIS_LEVEL level=8 rotation=2048 limbs=10 degree=65536
+      level=8 rotation=2048 direction=left exponent=122881 ... START
+      level=8 rotation=2048 direction=right exponent=8193 ... START
+      level=8 rotation=2048 direction=left exponent=122881 ... DONE elapsed_ms=4491
+      level=8 rotation=2048 direction=right exponent=8193 ... DONE elapsed_ms=4490
+[8/17] level-8 Galois keygen ... DONE elapsed_ms=4491
+[9/17] level-9 Galois keygen ... START
+FFT_GALOIS_LEVEL level=9 rotation=1024 limbs=9 degree=65536
+      level=9 rotation=1024 direction=left exponent=126977 ... START
+      level=9 rotation=1024 direction=right exponent=4097 ... START
+      level=9 rotation=1024 direction=left exponent=126977 ... DONE elapsed_ms=3608
+      level=9 rotation=1024 direction=right exponent=4097 ... DONE elapsed_ms=3606
+[9/17] level-9 Galois keygen ... DONE elapsed_ms=3608
+[10/17] level-10 Galois keygen ... START
+FFT_GALOIS_LEVEL level=10 rotation=512 limbs=8 degree=65536
+      level=10 rotation=512 direction=left exponent=63489 ... START
+      level=10 rotation=512 direction=right exponent=67585 ... START
+      level=10 rotation=512 direction=left exponent=63489 ... DONE elapsed_ms=2845
+      level=10 rotation=512 direction=right exponent=67585 ... DONE elapsed_ms=2848
+[10/17] level-10 Galois keygen ... DONE elapsed_ms=2848
+[11/17] level-11 Galois keygen ... START
+FFT_GALOIS_LEVEL level=11 rotation=256 limbs=7 degree=65536
+      level=11 rotation=256 direction=left exponent=31745 ... START
+      level=11 rotation=256 direction=right exponent=99329 ... START
+      level=11 rotation=256 direction=left exponent=31745 ... DONE elapsed_ms=2179
+      level=11 rotation=256 direction=right exponent=99329 ... DONE elapsed_ms=2178
+[11/17] level-11 Galois keygen ... DONE elapsed_ms=2179
+[12/17] level-12 Galois keygen ... START
+FFT_GALOIS_LEVEL level=12 rotation=128 limbs=6 degree=65536
+      level=12 rotation=128 direction=left exponent=81409 ... START
+      level=12 rotation=128 direction=right exponent=49665 ... START
+      level=12 rotation=128 direction=left exponent=81409 ... DONE elapsed_ms=1600
+      level=12 rotation=128 direction=right exponent=49665 ... DONE elapsed_ms=1599
+[12/17] level-12 Galois keygen ... DONE elapsed_ms=1600
+[13/17] level-13 Galois keygen ... START
+FFT_GALOIS_LEVEL level=13 rotation=64 limbs=5 degree=65536
+      level=13 rotation=64 direction=left exponent=7937 ... START
+      level=13 rotation=64 direction=right exponent=57601 ... START
+      level=13 rotation=64 direction=left exponent=7937 ... DONE elapsed_ms=1153
+      level=13 rotation=64 direction=right exponent=57601 ... DONE elapsed_ms=1149
+[13/17] level-13 Galois keygen ... DONE elapsed_ms=1153
+[14/17] exact factored forward FFT2 ... START
+FFT_STAGE_BEGIN level=0 kind=global-row span=128 tiles=4
+FFT_STAGE_END level=0 kind=global-row span=128 tiles=4 elapsed_ms=1614
+FFT_STAGE_BEGIN level=1 kind=local-row span=64 tiles=4
+FFT_STAGE_CHECK level=2 remaining_limbs=16 scale=3.602879701896e16 rel_l2=4.466694058035e-12 max_abs=1.994244265537e-11 inactive_max_abs=5.143876324147e-12
+FFT_STAGE_END level=1 kind=local-row span=64 tiles=4 elapsed_ms=34636
+FFT_STAGE_BEGIN level=2 kind=local-row span=32 tiles=4
+FFT_STAGE_END level=2 kind=local-row span=32 tiles=4 elapsed_ms=27218
+FFT_STAGE_BEGIN level=3 kind=local-row span=16 tiles=4
+FFT_STAGE_END level=3 kind=local-row span=16 tiles=4 elapsed_ms=24119
+FFT_STAGE_BEGIN level=4 kind=local-row span=8 tiles=4
+FFT_STAGE_END level=4 kind=local-row span=8 tiles=4 elapsed_ms=21424
+FFT_STAGE_BEGIN level=5 kind=local-row span=4 tiles=4
+FFT_STAGE_END level=5 kind=local-row span=4 tiles=4 elapsed_ms=18523
+FFT_STAGE_BEGIN level=6 kind=local-row span=2 tiles=4
+FFT_STAGE_END level=6 kind=local-row span=2 tiles=4 elapsed_ms=16120
+FFT_STAGE_BEGIN level=7 kind=global-column span=128 tiles=4
+FFT_STAGE_CHECK level=8 remaining_limbs=10 scale=3.602879701896e16 rel_l2=1.172921441014e-11 max_abs=2.725973092699e-9 inactive_max_abs=1.171884932762e-10
+FFT_STAGE_END level=7 kind=global-column span=128 tiles=4 elapsed_ms=3531
+FFT_STAGE_BEGIN level=8 kind=local-column span=64 tiles=4
+FFT_STAGE_END level=8 kind=local-column span=64 tiles=4 elapsed_ms=11754
+FFT_STAGE_BEGIN level=9 kind=local-column span=32 tiles=4
+FFT_STAGE_CHECK level=10 remaining_limbs=8 scale=3.602879701896e16 rel_l2=1.455740348421e-11 max_abs=1.154262465076e-8 inactive_max_abs=4.407315779571e-10
+FFT_STAGE_END level=9 kind=local-column span=32 tiles=4 elapsed_ms=11870
+FFT_STAGE_BEGIN level=10 kind=local-column span=16 tiles=4
+FFT_STAGE_END level=10 kind=local-column span=16 tiles=4 elapsed_ms=7974
+FFT_STAGE_BEGIN level=11 kind=local-column span=8 tiles=4
+FFT_STAGE_CHECK level=12 remaining_limbs=6 scale=3.602879701896e16 rel_l2=1.728008599828e-11 max_abs=5.324869348979e-8 inactive_max_abs=1.639354440473e-9
+FFT_STAGE_END level=11 kind=local-column span=8 tiles=4 elapsed_ms=7764
+FFT_STAGE_BEGIN level=12 kind=local-column span=4 tiles=4
+FFT_STAGE_END level=12 kind=local-column span=4 tiles=4 elapsed_ms=4922
+FFT_STAGE_BEGIN level=13 kind=local-column span=2 tiles=4
+FFT_STAGE_CHECK level=14 remaining_limbs=4 scale=3.602879701896e16 rel_l2=1.998026922537e-11 max_abs=2.431848272342e-7 inactive_max_abs=6.523084197403e-9
+FFT_STAGE_END level=13 kind=local-column span=2 tiles=4 elapsed_ms=4539
+[14/17] exact factored forward FFT2 ... DONE elapsed_ms=196017
+[15/17] global decrypt/decode ... START
+[15/17] global decrypt/decode ... DONE elapsed_ms=875
+FFT_TIMING_ENCRYPTION_MS=841
+FFT_TIMING_GALOIS_KEY_0_MS=12871
+FFT_TIMING_GALOIS_KEY_1_MS=11406
+FFT_TIMING_GALOIS_KEY_2_MS=10360
+FFT_TIMING_GALOIS_KEY_3_MS=8766
+FFT_TIMING_GALOIS_KEY_4_MS=7592
+FFT_TIMING_GALOIS_KEY_5_MS=6594
+FFT_TIMING_GALOIS_KEY_6_MS=4491
+FFT_TIMING_GALOIS_KEY_7_MS=3608
+FFT_TIMING_GALOIS_KEY_8_MS=2848
+FFT_TIMING_GALOIS_KEY_9_MS=2179
+FFT_TIMING_GALOIS_KEY_10_MS=1600
+FFT_TIMING_GALOIS_KEY_11_MS=1153
+FFT_TIMING_FORWARD_FFT2_MS=196017
+FFT_TIMING_DECRYPT_DECODE_MS=875
+FFT_TIMING_TOTAL_MS=271210
+FFT_METRIC_ENCRYPTED_FFT2_MS=196017
+FFT_METRIC_ENCRYPTED_FFT2_SECONDS=196.017000
+FFT_METRIC_ENCRYPTED_FFT2_ELEMENTS_PER_SECOND=83.584587
+FFT_METRIC_GALOIS_KEYGEN_TOTAL_MS=73468
+FFT_METRIC_ENCRYPTION_MS=841
+FFT_METRIC_DECRYPT_DECODE_MS=875
+FFT_METRIC_END_TO_END_MS=271210
+FACTORED_FFT_RESULT_BEGIN
+FACTORED_FFT_IMAGE_DIMENSION=128x128
+FACTORED_FFT_TILE_DIMENSION=64x64
+FACTORED_FFT_TILE_COUNT=4
+FACTORED_FFT_LOCAL_PROFILE=research-32768
+FACTORED_FFT_EXACT_PROFILE=research-65536
+FACTORED_FFT_LOCAL_STAGES=12
+FACTORED_FFT_CROSS_TILE_STAGES=2
+FACTORED_FFT_TOTAL_LEVELS=14
+FACTORED_FFT_GLOBAL_EXACT=true
+FACTORED_FFT_REL_L2=1.998011797668e-11
+FACTORED_FFT_MAX_ABS=2.431848272342e-7
+FACTORED_FFT_INACTIVE_MAX_ABS=6.523084197403e-9
+FACTORED_FFT_TOLERANCE=5.000000000000e-3
+FACTORED_FFT_RESULT_STATUS=PASS
+FACTORED_FFT_RESULT_END
