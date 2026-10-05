@@ -50,8 +50,9 @@ pub use key_accounting::{
 };
 pub use parameters::{
     correctness_profile_8, research_4096_security_model, research_profile_16384,
-    research_profile_32768, research_profile_4096, research_profile_65536, research_profile_8192,
-    CkksParameterClass, CkksParameterProfile, CkksSecurityModel,
+    research_profile_32768, research_profile_4096, research_profile_65536,
+    research_profile_65536_for_levels, research_profile_8192, CkksParameterClass,
+    CkksParameterProfile, CkksSecurityModel,
 };
 pub use rns_automorphism::apply_rns_automorphism;
 pub use rns_ciphertext::RnsCkksCiphertext;

@@ -1,8 +1,9 @@
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    research_profile_16384, research_profile_32768, research_profile_65536, rotation_exponent_left,
-    rotation_exponent_right, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
-    RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_16384, research_profile_32768, research_profile_65536,
+    research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
+    CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext, RnsCkksEvaluationKeys,
+    RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
 };
 use ccmm_rs::eblas::fft::{
     execute_packed_fft2_dif_stage_cp, fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape,
@@ -737,6 +738,8 @@ fn main() {
         })
         .unwrap_or(64);
 
+    let plan_only = env::args().any(|argument| argument == "--plan-only");
+
     let fft_plan = FactoredFft2Plan::new(dimension, dimension, tile_dimension, tile_dimension);
 
     let image_shape = fft_plan.image_shape();
@@ -771,12 +774,20 @@ fn main() {
         );
     };
 
+    const FFT_TERMINAL_GUARD_LIMBS: usize = 2;
+
     let profile = if required_levels <= 8 {
         research_profile_16384()
     } else if required_levels <= 12 {
         research_profile_32768()
     } else if required_levels <= 16 {
+        /*
+         * Preserve the frozen 18-limb / 990-bit research-65536 baseline
+         * validated through the exact 256x256 FFT2 experiment.
+         */
         research_profile_65536()
+    } else if required_levels <= 24 {
+        research_profile_65536_for_levels(required_levels, FFT_TERMINAL_GUARD_LIMBS)
     } else {
         panic!(
             "no current image-FFT research profile supports {required_levels} exact levels for {dimension}x{dimension}"
@@ -868,10 +879,10 @@ fn main() {
     println!("TILED_FFT_PROFILE={}", profile.name());
     println!("TILED_FFT_RING_DEGREE={degree}");
     println!("TILED_FFT_SLOT_COUNT={slot_count}");
-    println!("TILED_FFT_LEVELS_PER_TILE={required_levels}");
+    println!("TILED_FFT_EXACT_LEVELS={required_levels}");
     println!("TILED_FFT_SECURITY_BEARING={}", profile.security_bearing());
-    println!("TILED_FFT_SEMANTICS=LOCAL_TILE_SPECTRA");
-    println!("TILED_FFT_GLOBAL_EXACT=false");
+    println!("TILED_FFT_SEMANTICS=EXACT_GLOBAL_FACTORED_FFT2");
+    println!("TILED_FFT_GLOBAL_EXACT=true");
     println!("TILED_FFT_PARAMETERIZATION_END");
 
     println!("FHE_FFT_PLAN_BEGIN");
@@ -922,6 +933,14 @@ fn main() {
         "FHE_FFT_PLAN_EXACT_EXECUTION_REQUIRED_LEVELS={}",
         fft_plan.total_stages()
     );
+    println!(
+        "FHE_FFT_PLAN_EXACT_EXECUTION_CHAIN_LIMBS={}",
+        profile.modulus_values().len()
+    );
+    println!(
+        "FHE_FFT_PLAN_TERMINAL_GUARD_LIMBS={}",
+        profile.modulus_values().len() - required_levels
+    );
     println!("FHE_FFT_PLAN_LOCAL_RING_DEGREE={local_degree}");
     println!("FHE_FFT_PLAN_LOCAL_SLOT_COUNT={local_slot_count}");
     println!(
@@ -929,12 +948,19 @@ fn main() {
         fft_plan.tile_elements() as f64 / local_slot_count as f64
     );
     println!("FHE_FFT_PLAN_GLOBAL_EXACT_TARGET=true");
-    println!("FHE_FFT_PLAN_CURRENT_EXECUTOR_GLOBAL_EXACT=false");
+    println!("FHE_FFT_PLAN_CURRENT_EXECUTOR_GLOBAL_EXACT=true");
     println!(
         "FHE_FFT_PLAN_SECURITY_BEARING={}",
         profile.security_bearing()
     );
     println!("FHE_FFT_PLAN_END");
+
+    io::stdout().flush().expect("FFT plan output must flush");
+
+    if plan_only {
+        println!("FHE_FFT_PLAN_ONLY_STATUS=PASS");
+        return;
+    }
 
     let available_parallelism = std::thread::available_parallelism()
         .map(|value| value.get())

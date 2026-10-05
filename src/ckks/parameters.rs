@@ -338,11 +338,48 @@ pub fn research_profile_32768() -> CkksParameterProfile {
     )
 }
 
+/// Validated 55-bit NTT-prime pool for polynomial degree 65536.
+///
+/// The first eighteen limbs form the frozen 990-bit research profile used
+/// by the validated 256x256 exact encrypted FFT2 experiment.  Longer
+/// prefixes support depth-aware FFT research configurations while keeping
+/// the ring degree fixed at 65536.
+///
+/// The complete 26-limb pool has an aggregate 1430-bit RNS modulus budget.
+const RESEARCH_65536_MODULUS_POOL: [u64; 26] = [
+    0x7fffffffba0001,
+    0x7fffffffaa0001,
+    0x7fffffff7e0001,
+    0x7fffffff380001,
+    0x7ffffffef00001,
+    0x7ffffffeba0001,
+    0x7ffffffeac0001,
+    0x7ffffffe700001,
+    0x7ffffffe600001,
+    0x7ffffffe4c0001,
+    0x7ffffffe220001,
+    0x7ffffffe160001,
+    0x7ffffffdec0001,
+    0x7ffffffdd00001,
+    0x7ffffffdce0001,
+    0x7ffffffdbc0001,
+    0x7ffffffd5c0001,
+    0x7ffffffd440001,
+    0x7ffffffd340001,
+    0x7ffffffd280001,
+    0x7ffffffd160001,
+    0x7ffffffcf60001,
+    0x7ffffffcea0001,
+    0x7ffffffcda0001,
+    0x7ffffffccc0001,
+    0x7ffffffcc20001,
+];
+
 /// Large-N research profile for polynomial degree 65536.
 ///
 /// The eighteen 55-bit NTT primes provide an aggregate 990-bit Q basis.
-/// This remains below the 1747-bit 128-bit-classical guideline reference
-/// for a uniform-ternary secret and Gaussian error sigma 3.19.
+/// This remains the frozen baseline used by the validated 256x256 exact
+/// encrypted FFT2 experiment.
 ///
 /// This profile is research infrastructure and remains non-security-bearing
 /// until its complete execution path receives the corresponding validation.
@@ -350,26 +387,39 @@ pub fn research_profile_65536() -> CkksParameterProfile {
     CkksParameterProfile::new(
         "research-65536",
         65536,
-        &[
-            0x7fffffffba0001,
-            0x7fffffffaa0001,
-            0x7fffffff7e0001,
-            0x7fffffff380001,
-            0x7ffffffef00001,
-            0x7ffffffeba0001,
-            0x7ffffffeac0001,
-            0x7ffffffe700001,
-            0x7ffffffe600001,
-            0x7ffffffe4c0001,
-            0x7ffffffe220001,
-            0x7ffffffe160001,
-            0x7ffffffdec0001,
-            0x7ffffffdd00001,
-            0x7ffffffdce0001,
-            0x7ffffffdbc0001,
-            0x7ffffffd5c0001,
-            0x7ffffffd440001,
-        ],
+        &RESEARCH_65536_MODULUS_POOL[..18],
+        2.0_f64.powi(55),
+        CkksParameterClass::Research,
+        None,
+    )
+}
+
+/// Depth-aware large-N research profile for exact encrypted FFT execution.
+///
+/// `required_levels` is the multiplicative/rescale depth of the exact FFT
+/// dependency path. `terminal_guard_limbs` reserves additional RNS limbs
+/// after the final level so the computation does not terminate in the
+/// empirically unstable one-limb regime.
+///
+/// The current validated pool supports at most 26 limbs.
+pub fn research_profile_65536_for_levels(
+    required_levels: usize,
+    terminal_guard_limbs: usize,
+) -> CkksParameterProfile {
+    let limb_count = required_levels
+        .checked_add(terminal_guard_limbs)
+        .expect("65536 research-profile limb-count overflow");
+
+    assert!(
+        limb_count <= RESEARCH_65536_MODULUS_POOL.len(),
+        "65536 research profile requires {limb_count} limbs but the validated pool provides only {}",
+        RESEARCH_65536_MODULUS_POOL.len()
+    );
+
+    CkksParameterProfile::new(
+        "research-65536-depth-aware",
+        65536,
+        &RESEARCH_65536_MODULUS_POOL[..limb_count],
         2.0_f64.powi(55),
         CkksParameterClass::Research,
         None,
