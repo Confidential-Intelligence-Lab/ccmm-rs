@@ -2,11 +2,11 @@ use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_16384, research_profile_32768, research_profile_65536,
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext, RnsCkksEvaluationKeys,
-    RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    CkksCanonicalEmbedding, CkksChainState, PreparedRnsGaloisKey, RnsCkksCiphertext,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
 };
 use ccmm_rs::eblas::fft::{
-    execute_packed_fft2_dif_stage_cp, fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape,
+    execute_packed_fft2_dif_stage_cp_prepared, fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape,
     FftDirection, PackedFft2Axis, PackedFft2DifStageDiagonals,
 };
 use ccmm_rs::grafting::{
@@ -30,6 +30,16 @@ use std::time::Instant;
 
 const SIGMA: f64 = 3.19;
 const TOLERANCE: f64 = 5.0e-3;
+
+/*
+ * Bounded outer parallelism.
+ *
+ * Local FFT tiles already expose inner 2-way rotation and 3-way CP
+ * parallelism, so the outer tile width is intentionally conservative.
+ */
+const FFT_ENCRYPTION_PARALLELISM: usize = 4;
+const FFT_LOCAL_TILE_PARALLELISM: usize = 2;
+const FFT_GLOBAL_PAIR_PARALLELISM: usize = 4;
 
 fn ciphertext_payload_bytes(degree: usize, limbs: usize) -> usize {
     2usize
@@ -1032,11 +1042,27 @@ fn main() {
 
     println!("FFT_RESOURCE_PLAN_BEGIN");
     println!("FFT_RESOURCE_AVAILABLE_PARALLELISM={available_parallelism}");
-    println!("FFT_RESOURCE_TILE_PARALLELISM=1");
+    println!("FFT_RESOURCE_ENCRYPTION_PARALLELISM={FFT_ENCRYPTION_PARALLELISM}");
+    println!("FFT_RESOURCE_LOCAL_TILE_PARALLELISM={FFT_LOCAL_TILE_PARALLELISM}");
+    println!("FFT_RESOURCE_GLOBAL_PAIR_PARALLELISM={FFT_GLOBAL_PAIR_PARALLELISM}");
     println!("FFT_RESOURCE_KEYGEN_PARALLELISM=2");
     println!("FFT_RESOURCE_ROTATION_PARALLELISM=2");
     println!("FFT_RESOURCE_CP_PARALLELISM=3");
-    println!("FFT_RESOURCE_MAX_EXPLICIT_WORKERS=3");
+    println!(
+        "FFT_RESOURCE_MAX_LOCAL_CP_WORKERS={}",
+        FFT_LOCAL_TILE_PARALLELISM * 3
+    );
+    println!("FFT_RESOURCE_GLOBAL_BRANCH_PARALLELISM=2");
+    println!(
+        "FFT_RESOURCE_MAX_GLOBAL_BRANCH_WORKERS={}",
+        FFT_GLOBAL_PAIR_PARALLELISM * 2
+    );
+    println!(
+        "FFT_RESOURCE_MAX_EXPLICIT_WORKERS={}",
+        (FFT_GLOBAL_PAIR_PARALLELISM * 2)
+            .max(FFT_LOCAL_TILE_PARALLELISM * 3)
+            .max(FFT_ENCRYPTION_PARALLELISM)
+    );
 
     println!("FFT_RESOURCE_PLAINTEXT_IMAGE_BYTES={plaintext_image_bytes}");
     println!("FFT_RESOURCE_PLAINTEXT_TILE_TENSOR_BYTES={plaintext_tile_tensor_bytes}");
@@ -1129,24 +1155,63 @@ fn main() {
 
     let encryption_start = phase_start(1, total_phases, "tile encryption");
 
-    let ciphertexts: Vec<RnsCkksCiphertext> = plaintexts
-        .iter()
-        .enumerate()
-        .map(|(tile_index, plaintext)| {
-            let mut encryption_rng =
-                ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4c02 ^ tile_index as u64);
+    let mut encrypted_tiles = Vec::with_capacity(tile_count);
 
-            let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
-                plaintext,
-                2,
-                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                &secret,
-                &top_plan,
-                &mut encryption_rng,
-            );
+    for batch_start in (0..tile_count).step_by(FFT_ENCRYPTION_PARALLELISM) {
+        let batch_end = (batch_start + FFT_ENCRYPTION_PARALLELISM).min(tile_count);
 
-            RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain)
-        })
+        let batch = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(batch_end - batch_start);
+
+            for (tile_index, plaintext) in plaintexts
+                .iter()
+                .enumerate()
+                .take(batch_end)
+                .skip(batch_start)
+            {
+                let secret = &secret;
+                let top_plan = &top_plan;
+                let chain = &chain;
+
+                workers.push((
+                    tile_index,
+                    scope.spawn(move || {
+                        let mut encryption_rng =
+                            ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4c02 ^ tile_index as u64);
+
+                        let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+                            plaintext,
+                            2,
+                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                            secret,
+                            top_plan,
+                            &mut encryption_rng,
+                        );
+
+                        RnsCkksCiphertext::new(rlwe, CkksChainState::top(chain, scale), chain)
+                    }),
+                ));
+            }
+
+            workers
+                .into_iter()
+                .map(|(tile_index, worker)| {
+                    (
+                        tile_index,
+                        worker.join().expect("tile encryption worker panicked"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        encrypted_tiles.extend(batch);
+    }
+
+    encrypted_tiles.sort_by_key(|(tile_index, _)| *tile_index);
+
+    let ciphertexts: Vec<RnsCkksCiphertext> = encrypted_tiles
+        .into_iter()
+        .map(|(_, ciphertext)| ciphertext)
         .collect();
 
     let timing_encryption_ms = phase_done(1, total_phases, "tile encryption", encryption_start);
@@ -1396,6 +1461,8 @@ fn main() {
         let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
             (0..tile_count).map(|_| None).collect();
 
+        let mut pair_jobs = Vec::with_capacity(tile_count / 2);
+
         for tile_row in 0..fft_plan.tiles_per_col {
             for group_start in (0..fft_plan.tiles_per_row).step_by(span_tiles) {
                 for tile_offset in 0..half_tiles {
@@ -1405,34 +1472,65 @@ fn main() {
                     let upper_index = tile_row * fft_plan.tiles_per_row + upper_col;
                     let lower_index = tile_row * fft_plan.tiles_per_row + lower_col;
 
-                    let mut twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
-
-                    for local_row in 0..fft_plan.tile_rows {
-                        for local_col in 0..fft_plan.tile_cols {
-                            let slot = local_row * fft_plan.tile_cols + local_col;
-
-                            let twiddle_index = tile_offset * fft_plan.tile_cols + local_col;
-
-                            let angle = -2.0 * std::f64::consts::PI * twiddle_index as f64
-                                / global_span as f64;
-
-                            twiddles[slot] = Complex64::new(angle.cos(), angle.sin());
-                        }
-                    }
-
-                    let (upper, lower) = packed_fft_dif_butterfly_cp(
-                        &evaluator,
-                        &stage_input[upper_index],
-                        &stage_input[lower_index],
-                        &twiddles,
-                        &embedding,
-                        &chain,
-                        &stage_plan,
-                    );
-
-                    stage_output[upper_index] = Some(upper);
-                    stage_output[lower_index] = Some(lower);
+                    pair_jobs.push((upper_index, lower_index, tile_offset));
                 }
+            }
+        }
+
+        assert_eq!(pair_jobs.len(), tile_count / 2);
+
+        for batch_start in (0..pair_jobs.len()).step_by(FFT_GLOBAL_PAIR_PARALLELISM) {
+            let batch_end = (batch_start + FFT_GLOBAL_PAIR_PARALLELISM).min(pair_jobs.len());
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity(batch_end - batch_start);
+
+                for &(upper_index, lower_index, tile_offset) in &pair_jobs[batch_start..batch_end] {
+                    let evaluator = &evaluator;
+                    let stage_input = &stage_input;
+                    let embedding = &embedding;
+                    let chain = &chain;
+                    let stage_plan = &stage_plan;
+
+                    workers.push(scope.spawn(move || {
+                        let mut twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
+
+                        for local_row in 0..fft_plan.tile_rows {
+                            for local_col in 0..fft_plan.tile_cols {
+                                let slot = local_row * fft_plan.tile_cols + local_col;
+
+                                let twiddle_index = tile_offset * fft_plan.tile_cols + local_col;
+
+                                let angle = -2.0 * std::f64::consts::PI * twiddle_index as f64
+                                    / global_span as f64;
+
+                                twiddles[slot] = Complex64::new(angle.cos(), angle.sin());
+                            }
+                        }
+
+                        let (upper, lower) = packed_fft_dif_butterfly_cp(
+                            evaluator,
+                            &stage_input[upper_index],
+                            &stage_input[lower_index],
+                            &twiddles,
+                            embedding,
+                            chain,
+                            stage_plan,
+                        );
+
+                        (upper_index, lower_index, upper, lower)
+                    }));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("global row FFT pair worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+
+            for (upper_index, lower_index, upper, lower) in batch {
+                stage_output[upper_index] = Some(upper);
+                stage_output[lower_index] = Some(lower);
             }
         }
 
@@ -1478,19 +1576,77 @@ fn main() {
 
         let stage_plan = RnsNttPlan::new(chain.level(execution_level).moduli().to_vec(), degree);
 
-        values = values
-            .iter()
-            .map(|value| {
-                execute_packed_fft2_dif_stage_cp(
-                    value,
-                    &diagonals,
-                    &evaluator,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            })
-            .collect();
+        let rotation = diagonals.rotation();
+        let left_exponent = rotation_exponent_left(degree, rotation);
+        let right_exponent = rotation_exponent_right(degree, rotation);
+
+        let stage_state = values
+            .first()
+            .expect("local-row FFT stage requires at least one encrypted tile")
+            .state();
+
+        let prepared_left = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(stage_state, left_exponent),
+            &stage_plan,
+        );
+
+        let prepared_right = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(stage_state, right_exponent),
+            &stage_plan,
+        );
+
+        let mut stage_results = Vec::with_capacity(tile_count);
+
+        for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
+            let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity(batch_end - batch_start);
+
+                for (tile_index, value) in
+                    values.iter().enumerate().take(batch_end).skip(batch_start)
+                {
+                    let diagonals = &diagonals;
+                    let evaluator = &evaluator;
+                    let prepared_left = &prepared_left;
+                    let prepared_right = &prepared_right;
+                    let embedding = &embedding;
+                    let chain = &chain;
+                    let stage_plan = &stage_plan;
+
+                    workers.push((
+                        tile_index,
+                        scope.spawn(move || {
+                            execute_packed_fft2_dif_stage_cp_prepared(
+                                value,
+                                diagonals,
+                                evaluator,
+                                (prepared_left, prepared_right),
+                                embedding,
+                                chain,
+                                stage_plan,
+                            )
+                        }),
+                    ));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|(tile_index, worker)| {
+                        (
+                            tile_index,
+                            worker.join().expect("local FFT tile worker panicked"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            stage_results.extend(batch);
+        }
+
+        stage_results.sort_by_key(|(tile_index, _)| *tile_index);
+
+        values = stage_results.into_iter().map(|(_, value)| value).collect();
 
         execution_level += 1;
         maybe_check_stage!();
@@ -1534,6 +1690,8 @@ fn main() {
         let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
             (0..tile_count).map(|_| None).collect();
 
+        let mut pair_jobs = Vec::with_capacity(tile_count / 2);
+
         for tile_col in 0..fft_plan.tiles_per_row {
             for group_start in (0..fft_plan.tiles_per_col).step_by(span_tiles) {
                 for tile_offset in 0..half_tiles {
@@ -1543,36 +1701,71 @@ fn main() {
                     let upper_index = upper_row * fft_plan.tiles_per_row + tile_col;
                     let lower_index = lower_row * fft_plan.tiles_per_row + tile_col;
 
-                    let mut twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
-
-                    for local_row in 0..fft_plan.tile_rows {
-                        let twiddle_index = tile_offset * fft_plan.tile_rows + local_row;
-
-                        let angle =
-                            -2.0 * std::f64::consts::PI * twiddle_index as f64 / global_span as f64;
-
-                        let twiddle = Complex64::new(angle.cos(), angle.sin());
-
-                        for local_col in 0..fft_plan.tile_cols {
-                            let slot = local_row * fft_plan.tile_cols + local_col;
-
-                            twiddles[slot] = twiddle;
-                        }
-                    }
-
-                    let (upper, lower) = packed_fft_dif_butterfly_cp(
-                        &evaluator,
-                        &stage_input[upper_index],
-                        &stage_input[lower_index],
-                        &twiddles,
-                        &embedding,
-                        &chain,
-                        &stage_plan,
-                    );
-
-                    stage_output[upper_index] = Some(upper);
-                    stage_output[lower_index] = Some(lower);
+                    pair_jobs.push((upper_index, lower_index, tile_offset));
                 }
+            }
+        }
+
+        assert_eq!(pair_jobs.len(), tile_count / 2);
+
+        for batch_start in (0..pair_jobs.len()).step_by(FFT_GLOBAL_PAIR_PARALLELISM) {
+            let batch_end = (batch_start + FFT_GLOBAL_PAIR_PARALLELISM).min(pair_jobs.len());
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity(batch_end - batch_start);
+
+                for &(upper_index, lower_index, tile_offset) in &pair_jobs[batch_start..batch_end] {
+                    let evaluator = &evaluator;
+                    let stage_input = &stage_input;
+                    let embedding = &embedding;
+                    let chain = &chain;
+                    let stage_plan = &stage_plan;
+
+                    workers.push(scope.spawn(move || {
+                        let mut twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
+
+                        for local_row in 0..fft_plan.tile_rows {
+                            let twiddle_index = tile_offset * fft_plan.tile_rows + local_row;
+
+                            let angle = -2.0 * std::f64::consts::PI * twiddle_index as f64
+                                / global_span as f64;
+
+                            let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                            for local_col in 0..fft_plan.tile_cols {
+                                let slot = local_row * fft_plan.tile_cols + local_col;
+
+                                twiddles[slot] = twiddle;
+                            }
+                        }
+
+                        let (upper, lower) = packed_fft_dif_butterfly_cp(
+                            evaluator,
+                            &stage_input[upper_index],
+                            &stage_input[lower_index],
+                            &twiddles,
+                            embedding,
+                            chain,
+                            stage_plan,
+                        );
+
+                        (upper_index, lower_index, upper, lower)
+                    }));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .expect("global column FFT pair worker panicked")
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            for (upper_index, lower_index, upper, lower) in batch {
+                stage_output[upper_index] = Some(upper);
+                stage_output[lower_index] = Some(lower);
             }
         }
 
@@ -1621,19 +1814,77 @@ fn main() {
 
         let stage_plan = RnsNttPlan::new(chain.level(execution_level).moduli().to_vec(), degree);
 
-        values = values
-            .iter()
-            .map(|value| {
-                execute_packed_fft2_dif_stage_cp(
-                    value,
-                    &diagonals,
-                    &evaluator,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            })
-            .collect();
+        let rotation = diagonals.rotation();
+        let left_exponent = rotation_exponent_left(degree, rotation);
+        let right_exponent = rotation_exponent_right(degree, rotation);
+
+        let stage_state = values
+            .first()
+            .expect("local-column FFT stage requires at least one encrypted tile")
+            .state();
+
+        let prepared_left = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(stage_state, left_exponent),
+            &stage_plan,
+        );
+
+        let prepared_right = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(stage_state, right_exponent),
+            &stage_plan,
+        );
+
+        let mut stage_results = Vec::with_capacity(tile_count);
+
+        for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
+            let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity(batch_end - batch_start);
+
+                for (tile_index, value) in
+                    values.iter().enumerate().take(batch_end).skip(batch_start)
+                {
+                    let diagonals = &diagonals;
+                    let evaluator = &evaluator;
+                    let prepared_left = &prepared_left;
+                    let prepared_right = &prepared_right;
+                    let embedding = &embedding;
+                    let chain = &chain;
+                    let stage_plan = &stage_plan;
+
+                    workers.push((
+                        tile_index,
+                        scope.spawn(move || {
+                            execute_packed_fft2_dif_stage_cp_prepared(
+                                value,
+                                diagonals,
+                                evaluator,
+                                (prepared_left, prepared_right),
+                                embedding,
+                                chain,
+                                stage_plan,
+                            )
+                        }),
+                    ));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|(tile_index, worker)| {
+                        (
+                            tile_index,
+                            worker.join().expect("local FFT tile worker panicked"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            stage_results.extend(batch);
+        }
+
+        stage_results.sort_by_key(|(tile_index, _)| *tile_index);
+
+        values = stage_results.into_iter().map(|(_, value)| value).collect();
 
         execution_level += 1;
         maybe_check_stage!();

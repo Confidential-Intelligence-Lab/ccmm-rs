@@ -11,7 +11,9 @@ use num_complex::Complex64;
 use std::f64::consts::PI;
 
 use crate::ckks::{
-    mod_switch_rns_ckks_to_next, CkksCanonicalEmbedding, RnsCkksCiphertext, RnsCkksEvaluator,
+    mod_switch_rns_ckks_to_next, rotate_left_rns_ckks_with_prepared_ntt,
+    rotate_right_rns_ckks_with_prepared_ntt, CkksCanonicalEmbedding, PreparedRnsGaloisKey,
+    RnsCkksCiphertext, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, RnsNttPlan};
@@ -1090,9 +1092,25 @@ pub fn packed_fft_dif_butterfly_cp(
     let sum = evaluator.add(a, b);
     let diff = evaluator.sub(a, b);
 
-    let weighted_diff = multiply_complex_slots_cp(&diff, twiddles, embedding, chain, plan);
+    /*
+     * The lower weighted-difference path and upper modulus-switch path are
+     * independent once sum and difference have been formed.
+     */
+    let (weighted_diff, aligned_sum) = std::thread::scope(|scope| {
+        let weighted_worker =
+            scope.spawn(|| multiply_complex_slots_cp(&diff, twiddles, embedding, chain, plan));
 
-    let aligned_sum = mod_switch_rns_ckks_to_next(&sum, chain);
+        let aligned_worker = scope.spawn(|| mod_switch_rns_ckks_to_next(&sum, chain));
+
+        (
+            weighted_worker
+                .join()
+                .expect("packed DIF weighted-difference worker panicked"),
+            aligned_worker
+                .join()
+                .expect("packed DIF aligned-sum worker panicked"),
+        )
+    });
 
     assert_eq!(
         aligned_sum.level(),
@@ -1862,6 +1880,103 @@ pub fn execute_packed_fft2_dif_stage_pp(
 /// using three independent public slot-vector multiplications from the same
 /// input level. Therefore the complete stage consumes exactly one CKKS level,
 /// while the two rotations preserve level and scale.
+/// Executes one packed radix-2 DIF FFT2 stage using Galois keys whose
+/// key-switch material has already been transformed to the NTT domain.
+///
+/// This is execution-equivalent to [`execute_packed_fft2_dif_stage_cp`], but
+/// avoids repeatedly preparing the same level-specific Galois keys when the
+/// stage is evaluated across multiple ciphertexts.
+pub fn execute_packed_fft2_dif_stage_cp_prepared(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_galois_key, right_galois_key) = prepared_galois_keys;
+    input.assert_matches_chain(chain);
+
+    let logical_length = diagonals.shape().elements();
+    let slot_count = embedding.slot_count();
+
+    assert!(
+        logical_length <= slot_count,
+        "packed FFT2 logical size must not exceed CKKS slot count"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed FFT2 embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "packed FFT2 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "packed FFT2 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut left = vec![Complex64::new(0.0, 0.0); slot_count];
+    let mut right = vec![Complex64::new(0.0, 0.0); slot_count];
+
+    direct[..logical_length].copy_from_slice(diagonals.direct());
+    left[..logical_length].copy_from_slice(diagonals.rotate_left());
+    right[..logical_length].copy_from_slice(diagonals.rotate_right());
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_rns_ckks_with_prepared_ntt(input, rotation, left_galois_key, chain, plan)
+        });
+
+        let right_worker = scope.spawn(|| {
+            rotate_right_rns_ckks_with_prepared_ntt(input, rotation, right_galois_key, chain, plan)
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("packed FFT2 prepared left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("packed FFT2 prepared right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker =
+            scope.spawn(|| multiply_complex_slots_cp(input, &direct, embedding, chain, plan));
+
+        let left_worker =
+            scope.spawn(|| multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan));
+
+        let right_worker = scope
+            .spawn(|| multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan));
+
+        (
+            direct_worker
+                .join()
+                .expect("packed FFT2 prepared direct CP worker panicked"),
+            left_worker
+                .join()
+                .expect("packed FFT2 prepared left CP worker panicked"),
+            right_worker
+                .join()
+                .expect("packed FFT2 prepared right CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 pub fn execute_packed_fft2_dif_stage_cp(
     input: &RnsCkksCiphertext,
     diagonals: &PackedFft2DifStageDiagonals,
