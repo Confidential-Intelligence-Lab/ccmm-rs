@@ -340,7 +340,7 @@ pub fn research_profile_32768() -> CkksParameterProfile {
 
 /// Large-N research profile for polynomial degree 65536.
 ///
-/// The seventeen 55-bit NTT primes provide an aggregate 935-bit Q basis.
+/// The eighteen 55-bit NTT primes provide an aggregate 990-bit Q basis.
 /// This remains below the 1747-bit 128-bit-classical guideline reference
 /// for a uniform-ternary secret and Gaussian error sigma 3.19.
 ///
@@ -368,6 +368,7 @@ pub fn research_profile_65536() -> CkksParameterProfile {
             0x7ffffffdce0001,
             0x7ffffffdbc0001,
             0x7ffffffd5c0001,
+            0x7ffffffd440001,
         ],
         2.0_f64.powi(55),
         CkksParameterClass::Research,
@@ -504,7 +505,7 @@ mod tests {
             (research_profile_8192(), 200_u32),
             (research_profile_16384(), 405_u32),
             (research_profile_32768(), 650_u32),
-            (research_profile_65536(), 935_u32),
+            (research_profile_65536(), 990_u32),
         ];
 
         for (profile, expected_bits) in cases {

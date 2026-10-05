@@ -30,6 +30,48 @@ use std::time::Instant;
 const SIGMA: f64 = 3.19;
 const TOLERANCE: f64 = 5.0e-3;
 
+fn ciphertext_payload_bytes(degree: usize, limbs: usize) -> usize {
+    2usize
+        .checked_mul(degree)
+        .and_then(|value| value.checked_mul(limbs))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
+        .expect("ciphertext payload byte count overflow")
+}
+
+fn plaintext_rns_payload_bytes(degree: usize, limbs: usize) -> usize {
+    degree
+        .checked_mul(limbs)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
+        .expect("plaintext RNS payload byte count overflow")
+}
+
+fn complex_payload_bytes(elements: usize) -> usize {
+    elements
+        .checked_mul(std::mem::size_of::<Complex64>())
+        .expect("complex payload byte count overflow")
+}
+
+fn galois_key_payload_estimate_bytes(
+    degree: usize,
+    active_limbs: usize,
+    key_count: usize,
+) -> usize {
+    /*
+     * Singleton gadget decomposition:
+     *
+     * each Galois key contains one RLWE key-switch ciphertext per
+     * decomposition block. With singleton blocks there are `active_limbs`
+     * blocks, each containing two RNS polynomials over the active basis.
+     *
+     * This is the cryptographic coefficient payload, not allocator/container
+     * overhead. Peak RSS is measured independently at the OS level.
+     */
+    key_count
+        .checked_mul(active_limbs)
+        .and_then(|value| value.checked_mul(ciphertext_payload_bytes(degree, active_limbs)))
+        .expect("Galois-key payload estimate overflow")
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FactoredFft2Plan {
     image_rows: usize,
@@ -148,6 +190,24 @@ fn phase_done(index: usize, total: usize, name: &str, start: Instant) -> u128 {
     elapsed_ms
 }
 
+fn fft_stage_start(level: usize, kind: &str, span: usize, tile_count: usize) -> Instant {
+    println!("FFT_STAGE_BEGIN level={level} kind={kind} span={span} tiles={tile_count}");
+    std::io::stdout()
+        .flush()
+        .expect("FFT stage progress output must flush");
+    Instant::now()
+}
+
+fn fft_stage_done(level: usize, kind: &str, span: usize, tile_count: usize, start: Instant) {
+    let elapsed_ms = start.elapsed().as_millis();
+    println!(
+        "FFT_STAGE_END level={level} kind={kind} span={span} tiles={tile_count} elapsed_ms={elapsed_ms}"
+    );
+    std::io::stdout()
+        .flush()
+        .expect("FFT stage progress output must flush");
+}
+
 fn block_sizes(limb_count: usize) -> Vec<usize> {
     vec![1; limb_count]
 }
@@ -252,6 +312,271 @@ fn load_grayscale_square(path: &Path, dimension: usize) -> Vec<Complex64> {
         .pixels()
         .map(|pixel| Complex64::new(f64::from(pixel[0]) / 255.0, 0.0))
         .collect()
+}
+
+fn record_clear_stage(snapshots: &mut Vec<Vec<Vec<Complex64>>>, tiles: &[Vec<Complex64>]) {
+    snapshots.push(tiles.to_vec());
+}
+
+fn encrypted_stage_check(
+    level: usize,
+    values: &[RnsCkksCiphertext],
+    expected_tiles: &[Vec<Complex64>],
+    secret: &[i8],
+    embedding: &CkksCanonicalEmbedding,
+    active_elements: usize,
+) {
+    assert_eq!(values.len(), expected_tiles.len());
+
+    let mut actual_flat = Vec::with_capacity(values.len() * active_elements);
+    let mut expected_flat = Vec::with_capacity(values.len() * active_elements);
+    let mut inactive_max_abs = 0.0_f64;
+
+    for (ciphertext, expected) in values.iter().zip(expected_tiles) {
+        assert_eq!(ciphertext.level(), level);
+        assert_eq!(expected.len(), active_elements);
+
+        let decoded = decrypt_slots(ciphertext, secret, embedding);
+
+        actual_flat.extend_from_slice(&decoded[..active_elements]);
+        expected_flat.extend_from_slice(expected);
+
+        inactive_max_abs = inactive_max_abs.max(
+            decoded[active_elements..]
+                .iter()
+                .map(|value| value.norm())
+                .fold(0.0_f64, f64::max),
+        );
+    }
+
+    let (rel_l2, max_abs) = error_metrics(&actual_flat, &expected_flat);
+
+    let representative = &values[0];
+
+    println!(
+        "FFT_STAGE_CHECK level={level} remaining_limbs={} scale={:.12e} rel_l2={rel_l2:.12e} max_abs={max_abs:.12e} inactive_max_abs={inactive_max_abs:.12e}",
+        representative.basis().moduli().len(),
+        representative.scale(),
+    );
+
+    io::stdout()
+        .flush()
+        .expect("FFT stage checkpoint output must flush");
+}
+
+fn factored_fft2_clear_with_stages(
+    logical_image: &[Complex64],
+    plan: FactoredFft2Plan,
+) -> (Vec<Complex64>, Vec<Vec<Vec<Complex64>>>) {
+    let image_shape = plan.image_shape();
+    let tile_shape = plan.tile_shape();
+
+    assert_eq!(logical_image.len(), plan.image_elements());
+
+    let mut tiles = extract_square_tiles(logical_image, image_shape, tile_shape);
+    let mut snapshots = Vec::with_capacity(plan.total_stages());
+
+    /*
+     * Global row DIF stages across tiles.
+     */
+    let mut span_tiles = plan.tiles_per_row;
+
+    while span_tiles >= 2 {
+        let half_tiles = span_tiles / 2;
+        let global_span = span_tiles * plan.tile_cols;
+
+        let input = tiles;
+        let mut output =
+            vec![vec![Complex64::new(0.0, 0.0); plan.tile_elements()]; plan.tile_count];
+
+        for tile_row in 0..plan.tiles_per_col {
+            for group_start in (0..plan.tiles_per_row).step_by(span_tiles) {
+                for tile_offset in 0..half_tiles {
+                    let upper_col = group_start + tile_offset;
+                    let lower_col = upper_col + half_tiles;
+
+                    let upper_index = tile_row * plan.tiles_per_row + upper_col;
+                    let lower_index = tile_row * plan.tiles_per_row + lower_col;
+
+                    for local_row in 0..plan.tile_rows {
+                        for local_col in 0..plan.tile_cols {
+                            let slot = local_row * plan.tile_cols + local_col;
+
+                            let twiddle_index = tile_offset * plan.tile_cols + local_col;
+
+                            let angle = -2.0 * std::f64::consts::PI * twiddle_index as f64
+                                / global_span as f64;
+
+                            let w = Complex64::new(angle.cos(), angle.sin());
+
+                            let a = input[upper_index][slot];
+                            let b = input[lower_index][slot];
+
+                            output[upper_index][slot] = a + b;
+                            output[lower_index][slot] = w * (a - b);
+                        }
+                    }
+                }
+            }
+        }
+
+        tiles = output;
+        record_clear_stage(&mut snapshots, &tiles);
+        span_tiles /= 2;
+    }
+
+    /*
+     * Local row DIF stages.
+     *
+     * Preserve the same physical DIF ordering used by the encrypted packed
+     * executor. Canonical fft1_pp output cannot be inserted in the middle of
+     * this factored stage schedule.
+     */
+    let mut span = plan.tile_cols;
+
+    while span >= 2 {
+        let half = span / 2;
+
+        for tile in &mut tiles {
+            for row in 0..plan.tile_rows {
+                let row_base = row * plan.tile_cols;
+
+                for group_start in (0..plan.tile_cols).step_by(span) {
+                    for offset in 0..half {
+                        let upper_index = row_base + group_start + offset;
+                        let lower_index = upper_index + half;
+
+                        let angle = -2.0 * std::f64::consts::PI * offset as f64 / span as f64;
+                        let w = Complex64::new(angle.cos(), angle.sin());
+
+                        let a = tile[upper_index];
+                        let b = tile[lower_index];
+
+                        tile[upper_index] = a + b;
+                        tile[lower_index] = w * (a - b);
+                    }
+                }
+            }
+        }
+
+        record_clear_stage(&mut snapshots, &tiles);
+        span /= 2;
+    }
+
+    /*
+     * Global column DIF stages across tiles.
+     */
+    span_tiles = plan.tiles_per_col;
+
+    while span_tiles >= 2 {
+        let half_tiles = span_tiles / 2;
+        let global_span = span_tiles * plan.tile_rows;
+
+        let input = tiles;
+        let mut output =
+            vec![vec![Complex64::new(0.0, 0.0); plan.tile_elements()]; plan.tile_count];
+
+        for tile_col in 0..plan.tiles_per_row {
+            for group_start in (0..plan.tiles_per_col).step_by(span_tiles) {
+                for tile_offset in 0..half_tiles {
+                    let upper_row = group_start + tile_offset;
+                    let lower_row = upper_row + half_tiles;
+
+                    let upper_index = upper_row * plan.tiles_per_row + tile_col;
+                    let lower_index = lower_row * plan.tiles_per_row + tile_col;
+
+                    for local_row in 0..plan.tile_rows {
+                        let twiddle_index = tile_offset * plan.tile_rows + local_row;
+
+                        let angle =
+                            -2.0 * std::f64::consts::PI * twiddle_index as f64 / global_span as f64;
+
+                        let w = Complex64::new(angle.cos(), angle.sin());
+
+                        for local_col in 0..plan.tile_cols {
+                            let slot = local_row * plan.tile_cols + local_col;
+
+                            let a = input[upper_index][slot];
+                            let b = input[lower_index][slot];
+
+                            output[upper_index][slot] = a + b;
+                            output[lower_index][slot] = w * (a - b);
+                        }
+                    }
+                }
+            }
+        }
+
+        tiles = output;
+        record_clear_stage(&mut snapshots, &tiles);
+        span_tiles /= 2;
+    }
+
+    /*
+     * Local column DIF stages, preserving physical DIF ordering.
+     */
+    span = plan.tile_rows;
+
+    while span >= 2 {
+        let half = span / 2;
+
+        for tile in &mut tiles {
+            for col in 0..plan.tile_cols {
+                for group_start in (0..plan.tile_rows).step_by(span) {
+                    for offset in 0..half {
+                        let upper_row = group_start + offset;
+                        let lower_row = upper_row + half;
+
+                        let upper_index = upper_row * plan.tile_cols + col;
+                        let lower_index = lower_row * plan.tile_cols + col;
+
+                        let angle = -2.0 * std::f64::consts::PI * offset as f64 / span as f64;
+                        let w = Complex64::new(angle.cos(), angle.sin());
+
+                        let a = tile[upper_index];
+                        let b = tile[lower_index];
+
+                        tile[upper_index] = a + b;
+                        tile[lower_index] = w * (a - b);
+                    }
+                }
+            }
+        }
+
+        record_clear_stage(&mut snapshots, &tiles);
+        span /= 2;
+    }
+
+    assert_eq!(snapshots.len(), plan.total_stages());
+
+    /*
+     * Reassemble tile tensor and convert the global DIF physical ordering
+     * back to logical row-major FFT coordinates.
+     */
+    let mut physical = vec![Complex64::new(0.0, 0.0); plan.image_elements()];
+
+    for tile_row in 0..plan.tiles_per_col {
+        for tile_col in 0..plan.tiles_per_row {
+            let tile_index = tile_row * plan.tiles_per_row + tile_col;
+
+            for local_row in 0..plan.tile_rows {
+                for local_col in 0..plan.tile_cols {
+                    let tile_slot = local_row * plan.tile_cols + local_col;
+
+                    let global_row = tile_row * plan.tile_rows + local_row;
+                    let global_col = tile_col * plan.tile_cols + local_col;
+
+                    physical[global_row * plan.image_cols + global_col] =
+                        tiles[tile_index][tile_slot];
+                }
+            }
+        }
+    }
+
+    (
+        packed_physical_to_logical(&physical, image_shape),
+        snapshots,
+    )
 }
 
 fn extract_square_tiles(
@@ -611,10 +936,126 @@ fn main() {
     );
     println!("FHE_FFT_PLAN_END");
 
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+
+    let top_limbs = chain.level(0).moduli().len();
+    let output_limbs = chain.level(required_levels).moduli().len();
+
+    let plaintext_image_bytes = complex_payload_bytes(fft_plan.image_elements());
+
+    let plaintext_tile_tensor_bytes = complex_payload_bytes(fft_plan.tile_elements())
+        .checked_mul(tile_count)
+        .expect("plaintext tile tensor byte count overflow");
+
+    let encoded_plaintext_tensor_bytes = plaintext_rns_payload_bytes(degree, top_limbs)
+        .checked_mul(tile_count)
+        .expect("encoded plaintext tensor byte count overflow");
+
+    let encrypted_input_tensor_bytes = ciphertext_payload_bytes(degree, top_limbs)
+        .checked_mul(tile_count)
+        .expect("encrypted input tensor byte count overflow");
+
+    let encrypted_output_tensor_bytes = ciphertext_payload_bytes(degree, output_limbs)
+        .checked_mul(tile_count)
+        .expect("encrypted output tensor byte count overflow");
+
+    /*
+     * Conservative encrypted working-set estimate.
+     *
+     * During a packed local stage the complete input tensor remains live
+     * while the output tensor is constructed. One active stage may
+     * additionally hold two level-L rotations plus direct/left/right and
+     * partial/output level-(L+1) ciphertexts.
+     *
+     * Cross-tile stages similarly retain the input tensor while constructing
+     * the next-level output tensor. We take the maximum across all levels.
+     */
+    let mut peak_live_encrypted_estimate_bytes = encrypted_input_tensor_bytes;
+
+    for level in 0..required_levels {
+        let input_ct = ciphertext_payload_bytes(degree, chain.level(level).moduli().len());
+
+        let output_ct = ciphertext_payload_bytes(degree, chain.level(level + 1).moduli().len());
+
+        let tensor_input = input_ct
+            .checked_mul(tile_count)
+            .expect("input tensor byte count overflow");
+
+        let tensor_output = output_ct
+            .checked_mul(tile_count)
+            .expect("output tensor byte count overflow");
+
+        let local_stage_workspace = input_ct
+            .checked_mul(2)
+            .and_then(|value| {
+                output_ct
+                    .checked_mul(4)
+                    .and_then(|other| value.checked_add(other))
+            })
+            .expect("local-stage workspace byte count overflow");
+
+        let candidate = tensor_input
+            .checked_add(tensor_output)
+            .and_then(|value| value.checked_add(local_stage_workspace))
+            .expect("peak live encrypted estimate overflow");
+
+        peak_live_encrypted_estimate_bytes = peak_live_encrypted_estimate_bytes.max(candidate);
+    }
+
+    println!("FFT_RESOURCE_PLAN_BEGIN");
+    println!("FFT_RESOURCE_AVAILABLE_PARALLELISM={available_parallelism}");
+    println!("FFT_RESOURCE_TILE_PARALLELISM=1");
+    println!("FFT_RESOURCE_KEYGEN_PARALLELISM=2");
+    println!("FFT_RESOURCE_ROTATION_PARALLELISM=2");
+    println!("FFT_RESOURCE_CP_PARALLELISM=3");
+    println!("FFT_RESOURCE_MAX_EXPLICIT_WORKERS=3");
+
+    println!("FFT_RESOURCE_PLAINTEXT_IMAGE_BYTES={plaintext_image_bytes}");
+    println!("FFT_RESOURCE_PLAINTEXT_TILE_TENSOR_BYTES={plaintext_tile_tensor_bytes}");
+    println!(
+        "FFT_RESOURCE_ENCODED_PLAINTEXT_TENSOR_PAYLOAD_BYTES={encoded_plaintext_tensor_bytes}"
+    );
+    println!("FFT_RESOURCE_ENCRYPTED_INPUT_PAYLOAD_BYTES={encrypted_input_tensor_bytes}");
+    println!("FFT_RESOURCE_ENCRYPTED_OUTPUT_PAYLOAD_BYTES={encrypted_output_tensor_bytes}");
+    println!(
+        "FFT_RESOURCE_PEAK_LIVE_ENCRYPTED_ESTIMATE_BYTES={peak_live_encrypted_estimate_bytes}"
+    );
+    println!(
+        "FFT_RESOURCE_PAYLOAD_WORD_BYTES={}",
+        std::mem::size_of::<u64>()
+    );
+    println!(
+        "FFT_RESOURCE_COMPLEX_VALUE_BYTES={}",
+        std::mem::size_of::<Complex64>()
+    );
+    println!("FFT_RESOURCE_MEMORY_ACCOUNTING=PAYLOAD_PLUS_OS_RSS");
+    println!("FFT_RESOURCE_PLAN_END");
+
     println!("IMAGE_FFT_INPUT={}", input_path.display());
     println!("IMAGE_FFT_OUTPUT_DIR={}", output_dir.display());
 
     let logical_image = load_grayscale_square(&input_path, dimension);
+
+    let clear_global_reference = fft2_pp(image_shape, FftDirection::Forward, &logical_image);
+
+    let (clear_factored, clear_stage_snapshots) =
+        factored_fft2_clear_with_stages(&logical_image, fft_plan);
+
+    let (clear_factored_rel_l2, clear_factored_max_abs) =
+        error_metrics(&clear_factored, &clear_global_reference);
+
+    println!("FACTORED_CLEAR_REL_L2={clear_factored_rel_l2:.12e}");
+    println!("FACTORED_CLEAR_MAX_ABS={clear_factored_max_abs:.12e}");
+    println!(
+        "FACTORED_CLEAR_STATUS={}",
+        if clear_factored_rel_l2 <= 1.0e-10 && clear_factored_max_abs <= 1.0e-8 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
 
     let input_image_name = format!("01_input_{dimension}x{dimension}.png");
     save_spatial_image(
@@ -726,6 +1167,32 @@ fn main() {
 
     assert_eq!(level, fft_plan.total_stages());
     assert_eq!(level_rotations.len(), fft_plan.local_stages());
+
+    /*
+     * Galois-key payload accounting.
+     *
+     * Each packed local FFT stage requires one left and one right
+     * rotation key. Cross-tile stages require no Galois keys.
+     */
+    let galois_key_count = level_rotations
+        .len()
+        .checked_mul(2)
+        .expect("Galois-key count overflow");
+
+    let mut galois_key_payload_estimate_bytes_total = 0usize;
+
+    for &(key_level, _) in &level_rotations {
+        let limbs = chain.level(key_level).moduli().len();
+
+        galois_key_payload_estimate_bytes_total = galois_key_payload_estimate_bytes_total
+            .checked_add(galois_key_payload_estimate_bytes(degree, limbs, 2))
+            .expect("total Galois-key payload estimate overflow");
+    }
+
+    println!("FFT_RESOURCE_GALOIS_KEY_COUNT={galois_key_count}");
+    println!(
+        "FFT_RESOURCE_GALOIS_KEY_PAYLOAD_ESTIMATE_BYTES={galois_key_payload_estimate_bytes_total}"
+    );
 
     println!("FHE_FFT_ROTATION_KEY_SCHEDULE_BEGIN");
     for &(key_level, key_rotation) in &level_rotations {
@@ -863,6 +1330,23 @@ fn main() {
     let mut values = ciphertexts;
     let mut execution_level = 0usize;
 
+    macro_rules! maybe_check_stage {
+        () => {
+            if matches!(execution_level, 2 | 8 | 10 | 12 | 14 | 15 | 16)
+                && execution_level <= clear_stage_snapshots.len()
+            {
+                encrypted_stage_check(
+                    execution_level,
+                    &values,
+                    &clear_stage_snapshots[execution_level - 1],
+                    &secret,
+                    &embedding,
+                    shape.elements(),
+                );
+            }
+        };
+    }
+
     /*
      * ---------------------------------------------------------------
      * Global row stages.
@@ -871,6 +1355,10 @@ fn main() {
     let mut span_tiles = fft_plan.tiles_per_row;
 
     while span_tiles >= 2 {
+        let stage_level = execution_level;
+        let stage_span = span_tiles * fft_plan.tile_cols;
+        let stage_start = fft_stage_start(stage_level, "global-row", stage_span, tile_count);
+
         let half_tiles = span_tiles / 2;
         let global_span = span_tiles
             .checked_mul(fft_plan.tile_cols)
@@ -928,6 +1416,16 @@ fn main() {
             .collect();
 
         execution_level += 1;
+        maybe_check_stage!();
+
+        fft_stage_done(
+            stage_level,
+            "global-row",
+            stage_span,
+            tile_count,
+            stage_start,
+        );
+
         span_tiles /= 2;
     }
 
@@ -941,6 +1439,10 @@ fn main() {
     let mut span = fft_plan.tile_cols;
 
     while span >= 2 {
+        let stage_level = execution_level;
+        let stage_span = span;
+        let stage_start = fft_stage_start(stage_level, "local-row", stage_span, tile_count);
+
         let diagonals = PackedFft2DifStageDiagonals::new(
             shape,
             PackedFft2Axis::Rows,
@@ -965,6 +1467,16 @@ fn main() {
             .collect();
 
         execution_level += 1;
+        maybe_check_stage!();
+
+        fft_stage_done(
+            stage_level,
+            "local-row",
+            stage_span,
+            tile_count,
+            stage_start,
+        );
+
         span /= 2;
     }
 
@@ -981,6 +1493,10 @@ fn main() {
     span_tiles = fft_plan.tiles_per_col;
 
     while span_tiles >= 2 {
+        let stage_level = execution_level;
+        let stage_span = span_tiles * fft_plan.tile_rows;
+        let stage_start = fft_stage_start(stage_level, "global-column", stage_span, tile_count);
+
         let half_tiles = span_tiles / 2;
         let global_span = span_tiles
             .checked_mul(fft_plan.tile_rows)
@@ -1040,6 +1556,16 @@ fn main() {
             .collect();
 
         execution_level += 1;
+        maybe_check_stage!();
+
+        fft_stage_done(
+            stage_level,
+            "global-column",
+            stage_span,
+            tile_count,
+            stage_start,
+        );
+
         span_tiles /= 2;
     }
 
@@ -1056,6 +1582,10 @@ fn main() {
     span = fft_plan.tile_rows;
 
     while span >= 2 {
+        let stage_level = execution_level;
+        let stage_span = span;
+        let stage_start = fft_stage_start(stage_level, "local-column", stage_span, tile_count);
+
         let diagonals = PackedFft2DifStageDiagonals::new(
             shape,
             PackedFft2Axis::Columns,
@@ -1080,6 +1610,16 @@ fn main() {
             .collect();
 
         execution_level += 1;
+        maybe_check_stage!();
+
+        fft_stage_done(
+            stage_level,
+            "local-column",
+            stage_span,
+            tile_count,
+            stage_start,
+        );
+
         span /= 2;
     }
 
@@ -1172,6 +1712,26 @@ fn main() {
     println!("FFT_TIMING_FORWARD_FFT2_MS={timing_forward_fft2_ms}");
     println!("FFT_TIMING_DECRYPT_DECODE_MS={timing_decrypt_decode_ms}");
     println!("FFT_TIMING_TOTAL_MS={timing_total_ms}");
+
+    let encrypted_fft2_seconds = timing_forward_fft2_ms as f64 / 1000.0;
+
+    let encrypted_fft2_elements_per_second = if encrypted_fft2_seconds > 0.0 {
+        fft_plan.image_elements() as f64 / encrypted_fft2_seconds
+    } else {
+        0.0
+    };
+
+    let timing_galois_total_ms: u128 = timing_galois_ms.iter().copied().sum();
+
+    println!("FFT_METRIC_ENCRYPTED_FFT2_MS={timing_forward_fft2_ms}");
+    println!("FFT_METRIC_ENCRYPTED_FFT2_SECONDS={encrypted_fft2_seconds:.6}");
+    println!(
+        "FFT_METRIC_ENCRYPTED_FFT2_ELEMENTS_PER_SECOND={encrypted_fft2_elements_per_second:.6}"
+    );
+    println!("FFT_METRIC_GALOIS_KEYGEN_TOTAL_MS={timing_galois_total_ms}");
+    println!("FFT_METRIC_ENCRYPTION_MS={timing_encryption_ms}");
+    println!("FFT_METRIC_DECRYPT_DECODE_MS={timing_decrypt_decode_ms}");
+    println!("FFT_METRIC_END_TO_END_MS={timing_total_ms}");
 
     println!("FACTORED_FFT_RESULT_BEGIN");
     println!(
