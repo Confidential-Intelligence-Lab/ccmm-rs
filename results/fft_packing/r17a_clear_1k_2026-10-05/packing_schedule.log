@@ -1,0 +1,52 @@
+FFT_PACKING_SCHEDULE_BEGIN
+FFT_PACKING_GRID=16x16
+FFT_PACKING_LOGICAL_TILES=256
+FFT_PACKING_TILES_PER_CIPHERTEXT=8
+FFT_PACKING_CIPHERTEXT_COUNT=32
+FFT_PACKING_TILE_ELEMENTS=4096
+FFT_PACKING_SLOT_COUNT=32768
+FFT_PACKING_CANDIDATE_BEGIN packing=1x8
+FFT_PACKING_STAGE packing=1x8 axis=row span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=1x8 axis=row span_tiles=8 offset_tiles=4 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=4 intra_slot_rotation=16384
+FFT_PACKING_STAGE packing=1x8 axis=row span_tiles=4 offset_tiles=2 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=2 intra_slot_rotation=8192
+FFT_PACKING_STAGE packing=1x8 axis=row span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=1 intra_slot_rotation=4096
+FFT_PACKING_STAGE packing=1x8 axis=column span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=1x8 axis=column span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=1x8 axis=column span_tiles=4 offset_tiles=2 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=1x8 axis=column span_tiles=2 offset_tiles=1 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_SUMMARY packing=1x8 intra_butterflies=384 inter_butterflies=640 lane_aligned_inter=640
+FFT_PACKING_CANDIDATE_END packing=1x8
+FFT_PACKING_CANDIDATE_BEGIN packing=2x4
+FFT_PACKING_STAGE packing=2x4 axis=row span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=2x4 axis=row span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=2x4 axis=row span_tiles=4 offset_tiles=2 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=2 intra_slot_rotation=8192
+FFT_PACKING_STAGE packing=2x4 axis=row span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=1 intra_slot_rotation=4096
+FFT_PACKING_STAGE packing=2x4 axis=column span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=2x4 axis=column span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=2x4 axis=column span_tiles=4 offset_tiles=2 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=2x4 axis=column span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=4 intra_slot_rotation=16384
+FFT_PACKING_SUMMARY packing=2x4 intra_butterflies=384 inter_butterflies=640 lane_aligned_inter=640
+FFT_PACKING_CANDIDATE_END packing=2x4
+FFT_PACKING_CANDIDATE_BEGIN packing=4x2
+FFT_PACKING_STAGE packing=4x2 axis=row span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=4x2 axis=row span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=4x2 axis=row span_tiles=4 offset_tiles=2 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=4x2 axis=row span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=1 intra_slot_rotation=4096
+FFT_PACKING_STAGE packing=4x2 axis=column span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=4x2 axis=column span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=4x2 axis=column span_tiles=4 offset_tiles=2 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=4 intra_slot_rotation=16384
+FFT_PACKING_STAGE packing=4x2 axis=column span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=2 intra_slot_rotation=8192
+FFT_PACKING_SUMMARY packing=4x2 intra_butterflies=384 inter_butterflies=640 lane_aligned_inter=640
+FFT_PACKING_CANDIDATE_END packing=4x2
+FFT_PACKING_CANDIDATE_BEGIN packing=8x1
+FFT_PACKING_STAGE packing=8x1 axis=row span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=8x1 axis=row span_tiles=8 offset_tiles=4 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=8x1 axis=row span_tiles=4 offset_tiles=2 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=8x1 axis=row span_tiles=2 offset_tiles=1 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=8x1 axis=column span_tiles=16 offset_tiles=8 intra_butterflies=0 inter_butterflies=128 lane_aligned_inter=128 intra_lane_distance=0 intra_slot_rotation=0
+FFT_PACKING_STAGE packing=8x1 axis=column span_tiles=8 offset_tiles=4 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=4 intra_slot_rotation=16384
+FFT_PACKING_STAGE packing=8x1 axis=column span_tiles=4 offset_tiles=2 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=2 intra_slot_rotation=8192
+FFT_PACKING_STAGE packing=8x1 axis=column span_tiles=2 offset_tiles=1 intra_butterflies=128 inter_butterflies=0 lane_aligned_inter=0 intra_lane_distance=1 intra_slot_rotation=4096
+FFT_PACKING_SUMMARY packing=8x1 intra_butterflies=384 inter_butterflies=640 lane_aligned_inter=640
+FFT_PACKING_CANDIDATE_END packing=8x1
+FFT_PACKING_SCHEDULE_END

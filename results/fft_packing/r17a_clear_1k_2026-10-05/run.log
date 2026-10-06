@@ -1,0 +1,46 @@
+R17_CLEAR_BEGIN
+R17_CLEAR_IMAGE_DIMENSION=1024x1024
+R17_CLEAR_TILE_DIMENSION=64x64
+R17_CLEAR_TILE_GRID=16x16
+R17_CLEAR_TILES_PER_CIPHERTEXT=8
+R17_CLEAR_CIPHERTEXT_COUNT=32
+R17_CLEAR_SLOT_COUNT=32768
+R17_CLEAR_SLOT_UTILIZATION=1.000000
+R17_CLEAR_PACKING=8x1
+R17_CLEAR_ORACLE_MS=39
+R17_CLEAR_PACKED_VECTOR_MAX_ABS=1.405831324840e0
+R17_CLEAR_STAGE level=1 kind=global-row span_tiles=16 mode=inter-ct ct_pairs=16 elapsed_ms=3 max_abs=2.424492250288e0
+R17_CLEAR_STAGE level=2 kind=global-row span_tiles=8 mode=inter-ct ct_pairs=16 elapsed_ms=2 max_abs=3.954736093753e0
+R17_CLEAR_STAGE level=3 kind=global-row span_tiles=4 mode=inter-ct ct_pairs=16 elapsed_ms=2 max_abs=7.060965980569e0
+R17_CLEAR_STAGE level=4 kind=global-row span_tiles=2 mode=inter-ct ct_pairs=16 elapsed_ms=2 max_abs=1.302149858702e1
+R17_CLEAR_STAGE level=5 kind=local-row span=64 mode=intra-ct-simd elapsed_ms=3 max_abs=2.379316225826e1
+R17_CLEAR_STAGE level=6 kind=local-row span=32 mode=intra-ct-simd elapsed_ms=3 max_abs=4.672014751548e1
+R17_CLEAR_STAGE level=7 kind=local-row span=16 mode=intra-ct-simd elapsed_ms=4 max_abs=9.170158080698e1
+R17_CLEAR_STAGE level=8 kind=local-row span=8 mode=intra-ct-simd elapsed_ms=4 max_abs=1.811177975009e2
+R17_CLEAR_STAGE level=9 kind=local-row span=4 mode=intra-ct-simd elapsed_ms=4 max_abs=3.610703243335e2
+R17_CLEAR_STAGE level=10 kind=local-row span=2 mode=intra-ct-simd elapsed_ms=3 max_abs=7.213444670434e2
+R17_CLEAR_STAGE level=11 kind=global-column span_tiles=16 mode=inter-ct ct_pairs=16 elapsed_ms=0 max_abs=1.441268808506e3
+R17_CLEAR_STAGE level=12 kind=global-column span_tiles=8 mode=intra-ct tile_rotation_slots=16384 elapsed_ms=0 max_abs=2.880669536059e3
+R17_CLEAR_STAGE level=13 kind=global-column span_tiles=4 mode=intra-ct tile_rotation_slots=8192 elapsed_ms=0 max_abs=5.761211722373e3
+R17_CLEAR_STAGE level=14 kind=global-column span_tiles=2 mode=intra-ct tile_rotation_slots=4096 elapsed_ms=0 max_abs=1.152042802798e4
+R17_CLEAR_STAGE level=15 kind=local-column span=64 mode=intra-ct-simd elapsed_ms=3 max_abs=2.303648895827e4
+R17_CLEAR_STAGE level=16 kind=local-column span=32 mode=intra-ct-simd elapsed_ms=4 max_abs=4.607001930633e4
+R17_CLEAR_STAGE level=17 kind=local-column span=16 mode=intra-ct-simd elapsed_ms=3 max_abs=9.213368634925e4
+R17_CLEAR_STAGE level=18 kind=local-column span=8 mode=intra-ct-simd elapsed_ms=4 max_abs=1.842657937984e5
+R17_CLEAR_STAGE level=19 kind=local-column span=4 mode=intra-ct-simd elapsed_ms=3 max_abs=3.685295894197e5
+R17_CLEAR_STAGE level=20 kind=local-column span=2 mode=intra-ct-simd elapsed_ms=3 max_abs=7.370576345701e5
+R17_CLEAR_RESULT_BEGIN
+R17_CLEAR_TOTAL_LEVELS=20
+R17_CLEAR_GLOBAL_ROW_STAGES=4
+R17_CLEAR_LOCAL_ROW_STAGES=6
+R17_CLEAR_GLOBAL_COLUMN_INTER_STAGES=1
+R17_CLEAR_GLOBAL_COLUMN_INTRA_STAGES=3
+R17_CLEAR_LOCAL_COLUMN_STAGES=6
+R17_CLEAR_INTER_CT_STAGE_COUNT=5
+R17_CLEAR_INTER_CT_PAIRS_PER_STAGE=16
+R17_CLEAR_INTER_CT_PHYSICAL_BUTTERFLIES=80
+R17_CLEAR_EXECUTION_MS=89
+R17_CLEAR_REL_L2=8.079566982475e-15
+R17_CLEAR_MAX_ABS=2.518616632596e-9
+R17_CLEAR_STATUS=PASS
+R17_CLEAR_RESULT_END
