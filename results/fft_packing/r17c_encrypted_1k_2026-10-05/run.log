@@ -1,0 +1,142 @@
+R17_1K_BEGIN
+R17_1K_IMAGE_DIMENSION=1024x1024
+R17_1K_TILE_DIMENSION=64x64
+R17_1K_TILE_GRID=16x16
+R17_1K_PACKING=8x1
+R17_1K_TILES_PER_CIPHERTEXT=8
+R17_1K_CIPHERTEXT_COUNT=32
+R17_1K_SLOT_COUNT=32768
+R17_1K_SLOT_UTILIZATION=1.000000
+R17_1K_PROFILE=research-65536-depth-aware
+R17_1K_RING_DEGREE=65536
+R17_1K_TOP_LIMBS=22
+R17_1K_REQUIRED_LEVELS=20
+R17_1K_LOCAL_OUTER_PARALLELISM=2
+R17_1K_INTER_CT_PARALLELISM=4
+R17_1K_ORACLE_MS=36
+R17_1K_ENCODING_MS=452
+R17_1K_ENCRYPT_PROGRESS completed=2/32
+R17_1K_ENCRYPT_PROGRESS completed=4/32
+R17_1K_ENCRYPT_PROGRESS completed=6/32
+R17_1K_ENCRYPT_PROGRESS completed=8/32
+R17_1K_ENCRYPT_PROGRESS completed=10/32
+R17_1K_ENCRYPT_PROGRESS completed=12/32
+R17_1K_ENCRYPT_PROGRESS completed=14/32
+R17_1K_ENCRYPT_PROGRESS completed=16/32
+R17_1K_ENCRYPT_PROGRESS completed=18/32
+R17_1K_ENCRYPT_PROGRESS completed=20/32
+R17_1K_ENCRYPT_PROGRESS completed=22/32
+R17_1K_ENCRYPT_PROGRESS completed=24/32
+R17_1K_ENCRYPT_PROGRESS completed=26/32
+R17_1K_ENCRYPT_PROGRESS completed=28/32
+R17_1K_ENCRYPT_PROGRESS completed=30/32
+R17_1K_ENCRYPT_PROGRESS completed=32/32
+R17_1K_ENCRYPTION_MS=16185
+R17_1K_GALOIS_LEVEL_COUNT=15
+R17_1K_KEYGEN_BEGIN level=4 rotation=32 limbs=18 left_exponent=61313 right_exponent=86145
+R17_1K_KEYGEN_KEY level=4 direction=left exponent=61313 elapsed_ms=14428
+R17_1K_KEYGEN_KEY level=4 direction=right exponent=86145 elapsed_ms=14428
+R17_1K_KEYGEN_END level=4 elapsed_ms=14429
+R17_1K_KEYGEN_BEGIN level=5 rotation=16 limbs=17 left_exponent=28609 right_exponent=106561
+R17_1K_KEYGEN_KEY level=5 direction=left exponent=28609 elapsed_ms=12869
+R17_1K_KEYGEN_KEY level=5 direction=right exponent=106561 elapsed_ms=12867
+R17_1K_KEYGEN_END level=5 elapsed_ms=12869
+R17_1K_KEYGEN_BEGIN level=6 rotation=8 limbs=16 left_exponent=128481 right_exponent=69153
+R17_1K_KEYGEN_KEY level=6 direction=left exponent=128481 elapsed_ms=11398
+R17_1K_KEYGEN_KEY level=6 direction=right exponent=69153 elapsed_ms=11396
+R17_1K_KEYGEN_END level=6 elapsed_ms=11398
+R17_1K_KEYGEN_BEGIN level=7 rotation=4 limbs=15 left_exponent=625 right_exponent=97937
+R17_1K_KEYGEN_KEY level=7 direction=left exponent=625 elapsed_ms=10022
+R17_1K_KEYGEN_KEY level=7 direction=right exponent=97937 elapsed_ms=10019
+R17_1K_KEYGEN_END level=7 elapsed_ms=10022
+R17_1K_KEYGEN_BEGIN level=8 rotation=2 limbs=14 left_exponent=25 right_exponent=89129
+R17_1K_KEYGEN_KEY level=8 direction=left exponent=25 elapsed_ms=8729
+R17_1K_KEYGEN_KEY level=8 direction=right exponent=89129 elapsed_ms=8723
+R17_1K_KEYGEN_END level=8 elapsed_ms=8729
+R17_1K_KEYGEN_BEGIN level=9 rotation=1 limbs=13 left_exponent=5 right_exponent=52429
+R17_1K_KEYGEN_KEY level=9 direction=left exponent=5 elapsed_ms=7531
+R17_1K_KEYGEN_KEY level=9 direction=right exponent=52429 elapsed_ms=7529
+R17_1K_KEYGEN_END level=9 elapsed_ms=7531
+R17_1K_KEYGEN_BEGIN level=11 rotation=16384 limbs=11 left_exponent=65537 right_exponent=65537
+R17_1K_KEYGEN_KEY level=11 direction=shared exponent=65537
+R17_1K_KEYGEN_END level=11 elapsed_ms=5306
+R17_1K_KEYGEN_BEGIN level=12 rotation=8192 limbs=10 left_exponent=98305 right_exponent=32769
+R17_1K_KEYGEN_KEY level=12 direction=left exponent=98305 elapsed_ms=4450
+R17_1K_KEYGEN_KEY level=12 direction=right exponent=32769 elapsed_ms=4449
+R17_1K_KEYGEN_END level=12 elapsed_ms=4450
+R17_1K_KEYGEN_BEGIN level=13 rotation=4096 limbs=9 left_exponent=114689 right_exponent=16385
+R17_1K_KEYGEN_KEY level=13 direction=left exponent=114689 elapsed_ms=3603
+R17_1K_KEYGEN_KEY level=13 direction=right exponent=16385 elapsed_ms=3604
+R17_1K_KEYGEN_END level=13 elapsed_ms=3604
+R17_1K_KEYGEN_BEGIN level=14 rotation=2048 limbs=8 left_exponent=122881 right_exponent=8193
+R17_1K_KEYGEN_KEY level=14 direction=left exponent=122881 elapsed_ms=2846
+R17_1K_KEYGEN_KEY level=14 direction=right exponent=8193 elapsed_ms=2847
+R17_1K_KEYGEN_END level=14 elapsed_ms=2847
+R17_1K_KEYGEN_BEGIN level=15 rotation=1024 limbs=7 left_exponent=126977 right_exponent=4097
+R17_1K_KEYGEN_KEY level=15 direction=left exponent=126977 elapsed_ms=2178
+R17_1K_KEYGEN_KEY level=15 direction=right exponent=4097 elapsed_ms=2179
+R17_1K_KEYGEN_END level=15 elapsed_ms=2179
+R17_1K_KEYGEN_BEGIN level=16 rotation=512 limbs=6 left_exponent=63489 right_exponent=67585
+R17_1K_KEYGEN_KEY level=16 direction=left exponent=63489 elapsed_ms=1601
+R17_1K_KEYGEN_KEY level=16 direction=right exponent=67585 elapsed_ms=1601
+R17_1K_KEYGEN_END level=16 elapsed_ms=1602
+R17_1K_KEYGEN_BEGIN level=17 rotation=256 limbs=5 left_exponent=31745 right_exponent=99329
+R17_1K_KEYGEN_KEY level=17 direction=left exponent=31745 elapsed_ms=1109
+R17_1K_KEYGEN_KEY level=17 direction=right exponent=99329 elapsed_ms=1109
+R17_1K_KEYGEN_END level=17 elapsed_ms=1109
+R17_1K_KEYGEN_BEGIN level=18 rotation=128 limbs=4 left_exponent=81409 right_exponent=49665
+R17_1K_KEYGEN_KEY level=18 direction=left exponent=81409 elapsed_ms=709
+R17_1K_KEYGEN_KEY level=18 direction=right exponent=49665 elapsed_ms=709
+R17_1K_KEYGEN_END level=18 elapsed_ms=709
+R17_1K_KEYGEN_BEGIN level=19 rotation=64 limbs=3 left_exponent=7937 right_exponent=57601
+R17_1K_KEYGEN_KEY level=19 direction=left exponent=7937 elapsed_ms=398
+R17_1K_KEYGEN_KEY level=19 direction=right exponent=57601 elapsed_ms=398
+R17_1K_KEYGEN_END level=19 elapsed_ms=398
+R17_1K_GALOIS_DISTINCT_KEY_COUNT=29
+R17_1K_KEYGEN_TOTAL_MS=87190
+R17_1K_STAGE level=1 kind=global-row span_tiles=16 limbs=21 elapsed_ms=6380
+R17_1K_STAGE level=2 kind=global-row span_tiles=8 limbs=20 elapsed_ms=6056
+R17_1K_STAGE level=3 kind=global-row span_tiles=4 limbs=19 elapsed_ms=5736
+R17_1K_STAGE level=4 kind=global-row span_tiles=2 limbs=18 elapsed_ms=5451
+R17_1K_CHECK level=4 limbs=18 rel_l2=2.835398402583e-12 max_abs=3.329357259343e-11 elapsed_ms=40276
+R17_1K_STAGE level=5 kind=local-row span=64 rotation=32 limbs=17 elapsed_ms=134413
+R17_1K_STAGE level=6 kind=local-row span=32 rotation=16 limbs=16 elapsed_ms=121595
+R17_1K_STAGE level=7 kind=local-row span=16 rotation=8 limbs=15 elapsed_ms=114664
+R17_1K_STAGE level=8 kind=local-row span=8 rotation=4 limbs=14 elapsed_ms=98313
+R17_1K_STAGE level=9 kind=local-row span=4 rotation=2 limbs=13 elapsed_ms=87517
+R17_1K_STAGE level=10 kind=local-row span=2 rotation=1 limbs=12 elapsed_ms=77427
+R17_1K_CHECK level=10 limbs=12 rel_l2=7.998379065481e-12 max_abs=4.441585473690e-9 elapsed_ms=25157
+R17_1K_STAGE level=11 kind=global-column span_tiles=16 mode=inter-ct limbs=11 elapsed_ms=4401
+R17_1K_CHECK level=11 limbs=11 rel_l2=8.333992727937e-12 max_abs=8.859132059526e-9 elapsed_ms=23018
+R17_1K_STAGE level=12 kind=global-column span_tiles=8 mode=intra-ct rotation=16384 limbs=10 elapsed_ms=69381
+R17_1K_STAGE level=13 kind=global-column span_tiles=4 mode=intra-ct rotation=8192 limbs=9 elapsed_ms=53571
+R17_1K_STAGE level=14 kind=global-column span_tiles=2 mode=intra-ct rotation=4096 limbs=8 elapsed_ms=49468
+R17_1K_CHECK level=14 limbs=8 rel_l2=1.125218223756e-11 max_abs=1.100684911997e-7 elapsed_ms=16588
+R17_1K_STAGE level=15 kind=local-column span=64 rotation=2048 limbs=7 elapsed_ms=40594
+R17_1K_STAGE level=16 kind=local-column span=32 rotation=1024 limbs=6 elapsed_ms=31035
+R17_1K_STAGE level=17 kind=local-column span=16 rotation=512 limbs=5 elapsed_ms=23209
+R17_1K_STAGE level=18 kind=local-column span=8 rotation=256 limbs=4 elapsed_ms=18033
+R17_1K_STAGE level=19 kind=local-column span=4 rotation=128 limbs=3 elapsed_ms=13137
+R17_1K_STAGE level=20 kind=local-column span=2 rotation=64 limbs=2 elapsed_ms=9488
+R17_1K_CHECK level=20 limbs=2 rel_l2=1.627499117330e-11 max_abs=9.799912846418e-6 elapsed_ms=3233
+R17_1K_RESULT_BEGIN
+R17_1K_IMAGE_DIMENSION=1024x1024
+R17_1K_TILE_DIMENSION=64x64
+R17_1K_LOGICAL_TILE_COUNT=256
+R17_1K_CIPHERTEXT_COUNT=32
+R17_1K_TILES_PER_CIPHERTEXT=8
+R17_1K_SLOT_UTILIZATION=1.000000
+R17_1K_TOTAL_LEVELS=20
+R17_1K_FINAL_LIMBS=2
+R17_1K_GALOIS_KEY_COUNT=29
+R17_1K_ENCRYPTION_MS=16185
+R17_1K_KEYGEN_MS=87190
+R17_1K_FFT_MS=1074923
+R17_1K_DECRYPT_MS=3283
+R17_1K_TOTAL_MS=1185320
+R17_1K_ELEMENTS_PER_SECOND=975.489407
+R17_1K_REL_L2=1.627923819358e-11
+R17_1K_MAX_ABS=9.799912846418e-6
+R17_1K_TOLERANCE=5.000000000000e-3
+R17_1K_STATUS=PASS
+R17_1K_RESULT_END
