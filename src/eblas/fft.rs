@@ -1815,6 +1815,201 @@ impl PackedFft2DifStageDiagonals {
     }
 }
 
+/// Public diagonal representation of one DIF stage across fixed-size
+/// contiguous tile blocks packed inside one CKKS slot vector.
+///
+/// Each logical tile occupies `tile_elements` consecutive slots. A stage with
+/// `span_tiles` pairs tile blocks separated by `span_tiles / 2` tiles, so the
+/// corresponding CKKS rotation is:
+///
+/// `rotation = (span_tiles / 2) * tile_elements`.
+///
+/// This is the tile-block analogue of [`PackedFft2DifStageDiagonals`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedTileDifStageDiagonals {
+    tile_elements: usize,
+    tile_rows: usize,
+    tile_cols: usize,
+    packed_tiles: usize,
+    span_tiles: usize,
+    half_tiles: usize,
+    rotation: usize,
+    direct: Vec<Complex64>,
+    rotate_left: Vec<Complex64>,
+    rotate_right: Vec<Complex64>,
+}
+
+impl PackedTileDifStageDiagonals {
+    /// Constructs one packed global-column DIF stage over tile blocks.
+    ///
+    /// The packed representation contains `packed_tiles` vertically adjacent
+    /// logical tiles. Twiddles reproduce the factored global-column FFT2
+    /// schedule:
+    ///
+    /// `twiddle_index = tile_offset * tile_rows + local_row`.
+    pub fn new_column(
+        tile_rows: usize,
+        tile_cols: usize,
+        packed_tiles: usize,
+        span_tiles: usize,
+        direction: FftDirection,
+    ) -> Self {
+        assert!(tile_rows > 0 && tile_rows.is_power_of_two());
+        assert!(tile_cols > 0 && tile_cols.is_power_of_two());
+        assert!(packed_tiles > 0 && packed_tiles.is_power_of_two());
+        assert!(
+            span_tiles >= 2 && span_tiles.is_power_of_two(),
+            "packed tile DIF span must be a power of two of at least two"
+        );
+        assert!(
+            span_tiles <= packed_tiles,
+            "packed tile DIF span must not exceed packed tile count"
+        );
+        assert_eq!(
+            packed_tiles % span_tiles,
+            0,
+            "packed tile DIF span must divide packed tile count"
+        );
+
+        let tile_elements = tile_rows
+            .checked_mul(tile_cols)
+            .expect("packed tile DIF tile element count overflow");
+
+        let half_tiles = span_tiles / 2;
+
+        let rotation = half_tiles
+            .checked_mul(tile_elements)
+            .expect("packed tile DIF rotation overflow");
+
+        let slot_count = packed_tiles
+            .checked_mul(tile_elements)
+            .expect("packed tile DIF slot count overflow");
+
+        let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
+        let mut rotate_left = vec![Complex64::new(0.0, 0.0); slot_count];
+        let mut rotate_right = vec![Complex64::new(0.0, 0.0); slot_count];
+
+        let sign = match direction {
+            FftDirection::Forward => -1.0,
+            FftDirection::Inverse => 1.0,
+        };
+
+        let global_span = span_tiles
+            .checked_mul(tile_rows)
+            .expect("packed tile DIF global span overflow");
+
+        for lane in 0..packed_tiles {
+            let offset = lane % span_tiles;
+            let tile_offset = offset % half_tiles;
+
+            for local_row in 0..tile_rows {
+                let twiddle_index = tile_offset * tile_rows + local_row;
+                let angle = sign * 2.0 * PI * twiddle_index as f64 / global_span as f64;
+                let twiddle = Complex64::new(angle.cos(), angle.sin());
+
+                for local_col in 0..tile_cols {
+                    let tile_slot = local_row * tile_cols + local_col;
+                    let index = lane * tile_elements + tile_slot;
+
+                    if offset < half_tiles {
+                        direct[index] = Complex64::new(1.0, 0.0);
+                        rotate_left[index] = Complex64::new(1.0, 0.0);
+                    } else {
+                        direct[index] = -twiddle;
+                        rotate_right[index] = twiddle;
+                    }
+                }
+            }
+        }
+
+        Self {
+            tile_elements,
+            tile_rows,
+            tile_cols,
+            packed_tiles,
+            span_tiles,
+            half_tiles,
+            rotation,
+            direct,
+            rotate_left,
+            rotate_right,
+        }
+    }
+
+    pub const fn tile_elements(&self) -> usize {
+        self.tile_elements
+    }
+
+    pub const fn tile_rows(&self) -> usize {
+        self.tile_rows
+    }
+
+    pub const fn tile_cols(&self) -> usize {
+        self.tile_cols
+    }
+
+    pub const fn packed_tiles(&self) -> usize {
+        self.packed_tiles
+    }
+
+    pub const fn span_tiles(&self) -> usize {
+        self.span_tiles
+    }
+
+    pub const fn half_tiles(&self) -> usize {
+        self.half_tiles
+    }
+
+    pub const fn rotation(&self) -> usize {
+        self.rotation
+    }
+
+    pub fn direct(&self) -> &[Complex64] {
+        &self.direct
+    }
+
+    pub fn rotate_left(&self) -> &[Complex64] {
+        &self.rotate_left
+    }
+
+    pub fn rotate_right(&self) -> &[Complex64] {
+        &self.rotate_right
+    }
+}
+
+/// Executes one clear packed tile-block DIF stage using exactly the
+/// diagonal-times-rotation algebra required by the encrypted realization.
+pub fn execute_packed_tile_dif_stage_pp(
+    input: &[Complex64],
+    diagonals: &PackedTileDifStageDiagonals,
+) -> Vec<Complex64> {
+    let expected_len = diagonals
+        .packed_tiles()
+        .checked_mul(diagonals.tile_elements())
+        .expect("packed tile DIF input length overflow");
+
+    assert_eq!(
+        input.len(),
+        expected_len,
+        "packed tile DIF input length must match packed tile layout"
+    );
+
+    let left = rotate_left_complex(input, diagonals.rotation());
+    let right = rotate_right_complex(input, diagonals.rotation());
+
+    input
+        .iter()
+        .zip(left.iter())
+        .zip(right.iter())
+        .enumerate()
+        .map(|(index, ((current, left), right))| {
+            diagonals.direct()[index] * *current
+                + diagonals.rotate_left()[index] * *left
+                + diagonals.rotate_right()[index] * *right
+        })
+        .collect()
+}
+
 fn rotate_left_complex(values: &[Complex64], amount: usize) -> Vec<Complex64> {
     if values.is_empty() {
         return Vec::new();
@@ -1901,6 +2096,125 @@ pub fn execute_repeated_packed_fft2_dif_stage_pp(
             direct[index] * *current + left_diagonal[index] * *left + right_diagonal[index] * *right
         })
         .collect()
+}
+
+/// Executes one packed tile-block DIF stage over encrypted CKKS slots using
+/// prepared Galois keys.
+///
+/// This is the encrypted counterpart of [`execute_packed_tile_dif_stage_pp`].
+/// One stage computes
+///
+/// ```text
+/// y = D0 .* x + DL .* rotl(x, r) + DR .* rotr(x, r)
+/// ```
+///
+/// where the public diagonals pair complete contiguous tile blocks. The two
+/// rotations preserve level and scale. The three public slot-vector products
+/// consume one CKKS level and are evaluated independently before addition.
+pub fn execute_packed_tile_dif_stage_cp_prepared(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedTileDifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_galois_key, right_galois_key) = prepared_galois_keys;
+
+    input.assert_matches_chain(chain);
+
+    let slot_count = embedding.slot_count();
+    let logical_length = diagonals
+        .packed_tiles()
+        .checked_mul(diagonals.tile_elements())
+        .expect("packed tile DIF logical length overflow");
+
+    assert_eq!(
+        logical_length, slot_count,
+        "packed tile DIF layout must occupy the complete CKKS slot vector"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed tile DIF embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "packed tile DIF NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "packed tile DIF NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    assert!(
+        rotation > 0 && rotation < slot_count,
+        "packed tile DIF rotation must lie inside the CKKS slot vector"
+    );
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_rns_ckks_with_prepared_ntt(input, rotation, left_galois_key, chain, plan)
+        });
+
+        let right_worker = scope.spawn(|| {
+            rotate_right_rns_ckks_with_prepared_ntt(input, rotation, right_galois_key, chain, plan)
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("packed tile DIF prepared left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("packed tile DIF prepared right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope
+            .spawn(|| multiply_complex_slots_cp(input, diagonals.direct(), embedding, chain, plan));
+
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp(
+                &rotated_left,
+                diagonals.rotate_left(),
+                embedding,
+                chain,
+                plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp(
+                &rotated_right,
+                diagonals.rotate_right(),
+                embedding,
+                chain,
+                plan,
+            )
+        });
+
+        (
+            direct_worker
+                .join()
+                .expect("packed tile DIF prepared direct CP worker panicked"),
+            left_worker
+                .join()
+                .expect("packed tile DIF prepared left CP worker panicked"),
+            right_worker
+                .join()
+                .expect("packed tile DIF prepared right CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
 }
 
 /// Executes one packed cleartext FFT2 DIF stage using the same
@@ -3526,6 +3840,119 @@ mod repeated_packed_fft2_tests {
                     validate_repeated_stage(axis, span, tiles_per_vector);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_tile_dif_tests {
+    use super::{execute_packed_tile_dif_stage_pp, FftDirection, PackedTileDifStageDiagonals};
+    use num_complex::Complex64;
+    use std::f64::consts::PI;
+
+    fn direct_reference(
+        input: &[Complex64],
+        tile_rows: usize,
+        tile_cols: usize,
+        packed_tiles: usize,
+        span_tiles: usize,
+    ) -> Vec<Complex64> {
+        let tile_elements = tile_rows * tile_cols;
+        let half_tiles = span_tiles / 2;
+        let global_span = span_tiles * tile_rows;
+
+        let mut output = vec![Complex64::new(0.0, 0.0); input.len()];
+
+        for group_start in (0..packed_tiles).step_by(span_tiles) {
+            for tile_offset in 0..half_tiles {
+                let upper_lane = group_start + tile_offset;
+                let lower_lane = upper_lane + half_tiles;
+
+                let upper_base = upper_lane * tile_elements;
+                let lower_base = lower_lane * tile_elements;
+
+                for local_row in 0..tile_rows {
+                    let twiddle_index = tile_offset * tile_rows + local_row;
+
+                    let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+
+                    let w = Complex64::new(angle.cos(), angle.sin());
+
+                    for local_col in 0..tile_cols {
+                        let tile_slot = local_row * tile_cols + local_col;
+
+                        let upper_slot = upper_base + tile_slot;
+                        let lower_slot = lower_base + tile_slot;
+
+                        let a = input[upper_slot];
+                        let b = input[lower_slot];
+
+                        output[upper_slot] = a + b;
+                        output[lower_slot] = w * (a - b);
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn packed_tile_dif_rotations_match_r17() {
+        for (span_tiles, rotation) in [
+            (8usize, 16_384usize),
+            (4usize, 8_192usize),
+            (2usize, 4_096usize),
+        ] {
+            let diagonals = PackedTileDifStageDiagonals::new_column(
+                64,
+                64,
+                8,
+                span_tiles,
+                FftDirection::Forward,
+            );
+
+            assert_eq!(diagonals.rotation(), rotation);
+        }
+    }
+
+    #[test]
+    fn packed_tile_dif_matches_direct_r17_column_stages() {
+        let tile_rows = 64usize;
+        let tile_cols = 64usize;
+        let packed_tiles = 8usize;
+        let tile_elements = tile_rows * tile_cols;
+
+        let mut value = (0..packed_tiles * tile_elements)
+            .map(|index| {
+                Complex64::new(
+                    ((17 * index + 11) % 251) as f64 / 251.0,
+                    ((13 * index + 7) % 127) as f64 / 127.0,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for span_tiles in [8usize, 4, 2] {
+            let expected = direct_reference(&value, tile_rows, tile_cols, packed_tiles, span_tiles);
+
+            let diagonals = PackedTileDifStageDiagonals::new_column(
+                tile_rows,
+                tile_cols,
+                packed_tiles,
+                span_tiles,
+                FftDirection::Forward,
+            );
+
+            let actual = execute_packed_tile_dif_stage_pp(&value, &diagonals);
+
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                assert!(
+                    (*actual - *expected).norm() <= 1.0e-12,
+                    "packed tile DIF mismatch"
+                );
+            }
+
+            value = actual;
         }
     }
 }

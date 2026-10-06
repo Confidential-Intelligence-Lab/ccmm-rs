@@ -1,0 +1,32 @@
+R17_TILE_ENCRYPTED_BEGIN
+R17_TILE_PROFILE=research-65536-depth-aware
+R17_TILE_RING_DEGREE=65536
+R17_TILE_SLOT_COUNT=32768
+R17_TILE_TOP_LIMBS=22
+R17_TILE_REQUIRED_LEVELS=20
+R17_TILE_FIRST_EXECUTION_LEVEL=11
+R17_TILE_ENCRYPTION_MS=983
+R17_TILE_ALIGNMENT level=11 limbs=11 elapsed_ms=5
+R17_TILE_KEYGEN_BEGIN level=11 span_tiles=8 rotation=16384 limbs=11
+R17_TILE_KEYGEN_KEY level=11 direction=shared exponent=65537 elapsed_ms=5224
+R17_TILE_KEYGEN_END level=11 elapsed_ms=5224
+R17_TILE_KEYGEN_BEGIN level=12 span_tiles=4 rotation=8192 limbs=10
+R17_TILE_KEYGEN_KEY level=12 direction=left exponent=98305 elapsed_ms=4437
+R17_TILE_KEYGEN_KEY level=12 direction=right exponent=32769 elapsed_ms=4436
+R17_TILE_KEYGEN_END level=12 elapsed_ms=4438
+R17_TILE_KEYGEN_BEGIN level=13 span_tiles=2 rotation=4096 limbs=9
+R17_TILE_KEYGEN_KEY level=13 direction=left exponent=114689 elapsed_ms=3598
+R17_TILE_KEYGEN_KEY level=13 direction=right exponent=16385 elapsed_ms=3596
+R17_TILE_KEYGEN_END level=13 elapsed_ms=3598
+R17_TILE_KEYGEN_TOTAL_MS=13262
+R17_TILE_STAGE_CHECK input_level=11 output_level=12 span_tiles=8 rotation=16384 limbs=10 rel_l2=3.436714184689e-12 max_abs=9.214097427426e-12 elapsed_ms=3296
+R17_TILE_STAGE_CHECK input_level=12 output_level=13 span_tiles=4 rotation=8192 limbs=9 rel_l2=4.440503494589e-12 max_abs=1.916355007657e-11 elapsed_ms=2734
+R17_TILE_STAGE_CHECK input_level=13 output_level=14 span_tiles=2 rotation=4096 limbs=8 rel_l2=5.308104537295e-12 max_abs=3.480241549780e-11 elapsed_ms=2280
+R17_TILE_RESULT_BEGIN
+R17_TILE_FINAL_LEVEL=14
+R17_TILE_FINAL_LIMBS=8
+R17_TILE_EXECUTION_MS=26756
+R17_TILE_REL_L2=5.308104537295e-12
+R17_TILE_MAX_ABS=3.480241549780e-11
+R17_TILE_STATUS=PASS
+R17_TILE_RESULT_END
