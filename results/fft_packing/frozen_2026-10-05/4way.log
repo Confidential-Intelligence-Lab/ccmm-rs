@@ -1,0 +1,100 @@
+MULTI_TILE_FFT_BEGIN
+MULTI_TILE_FFT_TILE_DIMENSION=64x64
+MULTI_TILE_FFT_TILES_PER_CIPHERTEXT=4
+MULTI_TILE_FFT_ACTIVE_SLOTS=16384
+MULTI_TILE_FFT_SLOT_COUNT=32768
+MULTI_TILE_FFT_SLOT_UTILIZATION=0.500000
+MULTI_TILE_FFT_RING_DEGREE=65536
+MULTI_TILE_FFT_TOP_LIMBS=18
+MULTI_TILE_FFT_LOCAL_LEVELS=12
+MULTI_TILE_FFT_ENCRYPTION_MS=812
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=0 axis=Rows span=64 rotation=32 limbs=18
+MULTI_TILE_FFT_KEYGEN_KEY level=0 direction=left exponent=61313 elapsed_ms=14468
+MULTI_TILE_FFT_KEYGEN_KEY level=0 direction=right exponent=86145 elapsed_ms=14464
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=0 elapsed_ms=14468
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=1 axis=Rows span=32 rotation=16 limbs=17
+MULTI_TILE_FFT_KEYGEN_KEY level=1 direction=left exponent=28609 elapsed_ms=12857
+MULTI_TILE_FFT_KEYGEN_KEY level=1 direction=right exponent=106561 elapsed_ms=12858
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=1 elapsed_ms=12858
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=2 axis=Rows span=16 rotation=8 limbs=16
+MULTI_TILE_FFT_KEYGEN_KEY level=2 direction=left exponent=128481 elapsed_ms=11385
+MULTI_TILE_FFT_KEYGEN_KEY level=2 direction=right exponent=69153 elapsed_ms=11387
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=2 elapsed_ms=11388
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=3 axis=Rows span=8 rotation=4 limbs=15
+MULTI_TILE_FFT_KEYGEN_KEY level=3 direction=left exponent=625 elapsed_ms=10961
+MULTI_TILE_FFT_KEYGEN_KEY level=3 direction=right exponent=97937 elapsed_ms=10952
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=3 elapsed_ms=10961
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=4 axis=Rows span=4 rotation=2 limbs=14
+MULTI_TILE_FFT_KEYGEN_KEY level=4 direction=left exponent=25 elapsed_ms=9469
+MULTI_TILE_FFT_KEYGEN_KEY level=4 direction=right exponent=89129 elapsed_ms=9470
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=4 elapsed_ms=9470
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=5 axis=Rows span=2 rotation=1 limbs=13
+MULTI_TILE_FFT_KEYGEN_KEY level=5 direction=left exponent=5 elapsed_ms=7633
+MULTI_TILE_FFT_KEYGEN_KEY level=5 direction=right exponent=52429 elapsed_ms=7632
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=5 elapsed_ms=7633
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=6 axis=Columns span=64 rotation=2048 limbs=12
+MULTI_TILE_FFT_KEYGEN_KEY level=6 direction=left exponent=122881 elapsed_ms=6428
+MULTI_TILE_FFT_KEYGEN_KEY level=6 direction=right exponent=8193 elapsed_ms=6424
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=6 elapsed_ms=6428
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=7 axis=Columns span=32 rotation=1024 limbs=11
+MULTI_TILE_FFT_KEYGEN_KEY level=7 direction=left exponent=126977 elapsed_ms=5432
+MULTI_TILE_FFT_KEYGEN_KEY level=7 direction=right exponent=4097 elapsed_ms=5430
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=7 elapsed_ms=5432
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=8 axis=Columns span=16 rotation=512 limbs=10
+MULTI_TILE_FFT_KEYGEN_KEY level=8 direction=left exponent=63489 elapsed_ms=4450
+MULTI_TILE_FFT_KEYGEN_KEY level=8 direction=right exponent=67585 elapsed_ms=4450
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=8 elapsed_ms=4450
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=9 axis=Columns span=8 rotation=256 limbs=9
+MULTI_TILE_FFT_KEYGEN_KEY level=9 direction=left exponent=31745 elapsed_ms=3613
+MULTI_TILE_FFT_KEYGEN_KEY level=9 direction=right exponent=99329 elapsed_ms=3610
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=9 elapsed_ms=3613
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=10 axis=Columns span=4 rotation=128 limbs=8
+MULTI_TILE_FFT_KEYGEN_KEY level=10 direction=left exponent=81409 elapsed_ms=2843
+MULTI_TILE_FFT_KEYGEN_KEY level=10 direction=right exponent=49665 elapsed_ms=2841
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=10 elapsed_ms=2843
+MULTI_TILE_FFT_KEYGEN_LEVEL_BEGIN level=11 axis=Columns span=2 rotation=64 limbs=7
+MULTI_TILE_FFT_KEYGEN_KEY level=11 direction=left exponent=7937 elapsed_ms=2173
+MULTI_TILE_FFT_KEYGEN_KEY level=11 direction=right exponent=57601 elapsed_ms=2174
+MULTI_TILE_FFT_KEYGEN_LEVEL_END level=11 elapsed_ms=2174
+MULTI_TILE_FFT_KEYGEN_TOTAL_MS=91724
+MULTI_TILE_FFT_ROTATION_LEFT_CHECK rotation=32 rel_l2=2.745496813283e-12 max_abs=4.471471339705e-12
+MULTI_TILE_FFT_ROTATION_RIGHT_CHECK rotation=32 rel_l2=2.747497179201e-12 max_abs=4.756048950070e-12
+MULTI_TILE_FFT_STAGE_CHECK level=1 axis=Rows span=64 rel_l2=3.854256763839e-12 max_abs=1.142648701808e-11 inactive_max_abs=4.785245011867e-12
+MULTI_TILE_FFT_STAGE level=1 axis=Rows span=64 limbs=17 elapsed_ms=8344
+MULTI_TILE_FFT_STAGE_CHECK level=2 axis=Rows span=32 rel_l2=5.007220706528e-12 max_abs=2.380404237008e-11 inactive_max_abs=5.265888592614e-12
+MULTI_TILE_FFT_STAGE level=2 axis=Rows span=32 limbs=16 elapsed_ms=7560
+MULTI_TILE_FFT_STAGE_CHECK level=3 axis=Rows span=16 rel_l2=6.169620228703e-12 max_abs=4.538143706924e-11 inactive_max_abs=7.670578348704e-12
+MULTI_TILE_FFT_STAGE level=3 axis=Rows span=16 limbs=15 elapsed_ms=6861
+MULTI_TILE_FFT_STAGE_CHECK level=4 axis=Rows span=8 rel_l2=7.320446209838e-12 max_abs=9.310402265020e-11 inactive_max_abs=1.263191978940e-11
+MULTI_TILE_FFT_STAGE level=4 axis=Rows span=8 limbs=14 elapsed_ms=6181
+MULTI_TILE_FFT_STAGE_CHECK level=5 axis=Rows span=4 rel_l2=8.514870308528e-12 max_abs=2.088351620549e-10 inactive_max_abs=2.398147024929e-11
+MULTI_TILE_FFT_STAGE level=5 axis=Rows span=4 limbs=13 elapsed_ms=5546
+MULTI_TILE_FFT_STAGE_CHECK level=6 axis=Rows span=2 rel_l2=9.725952888451e-12 max_abs=4.580248563720e-10 inactive_max_abs=4.363673186637e-11
+MULTI_TILE_FFT_STAGE level=6 axis=Rows span=2 limbs=12 elapsed_ms=4937
+MULTI_TILE_FFT_STAGE_CHECK level=7 axis=Columns span=64 rel_l2=1.102708120763e-11 max_abs=9.967156525721e-10 inactive_max_abs=6.317214928618e-11
+MULTI_TILE_FFT_STAGE level=7 axis=Columns span=64 limbs=11 elapsed_ms=4388
+MULTI_TILE_FFT_STAGE_CHECK level=8 axis=Columns span=32 rel_l2=1.219799718229e-11 max_abs=2.213184603791e-9 inactive_max_abs=1.233242955149e-10
+MULTI_TILE_FFT_STAGE level=8 axis=Columns span=32 limbs=10 elapsed_ms=3830
+MULTI_TILE_FFT_STAGE_CHECK level=9 axis=Columns span=16 rel_l2=1.335247722666e-11 max_abs=4.789042997927e-9 inactive_max_abs=2.491334300348e-10
+MULTI_TILE_FFT_STAGE level=9 axis=Columns span=16 limbs=9 elapsed_ms=3343
+MULTI_TILE_FFT_STAGE_CHECK level=10 axis=Columns span=8 rel_l2=1.447729891866e-11 max_abs=1.033544961599e-8 inactive_max_abs=5.020484961189e-10
+MULTI_TILE_FFT_STAGE level=10 axis=Columns span=8 limbs=8 elapsed_ms=2828
+MULTI_TILE_FFT_STAGE_CHECK level=11 axis=Columns span=4 rel_l2=1.563214299578e-11 max_abs=2.210614870039e-8 inactive_max_abs=9.855680756548e-10
+MULTI_TILE_FFT_STAGE level=11 axis=Columns span=4 limbs=7 elapsed_ms=2376
+MULTI_TILE_FFT_STAGE_CHECK level=12 axis=Columns span=2 rel_l2=1.687028240378e-11 max_abs=4.674653111976e-8 inactive_max_abs=1.964343051612e-9
+MULTI_TILE_FFT_STAGE level=12 axis=Columns span=2 limbs=6 elapsed_ms=1958
+MULTI_TILE_FFT_PACKED_PHYSICAL_REL_L2=1.687028240378e-11
+MULTI_TILE_FFT_PACKED_PHYSICAL_MAX_ABS=4.674653111976e-8
+MULTI_TILE_FFT_TILE_0_REL_L2=1.654390415980e-11
+MULTI_TILE_FFT_TILE_0_MAX_ABS=4.483706225404e-8
+MULTI_TILE_FFT_TILE_1_REL_L2=1.705841191891e-11
+MULTI_TILE_FFT_TILE_1_MAX_ABS=4.674653111976e-8
+MULTI_TILE_FFT_TILE_2_REL_L2=1.696629538310e-11
+MULTI_TILE_FFT_TILE_2_MAX_ABS=4.636955598512e-8
+MULTI_TILE_FFT_TILE_3_REL_L2=1.690740492596e-11
+MULTI_TILE_FFT_TILE_3_MAX_ABS=4.642144557516e-8
+MULTI_TILE_FFT_INACTIVE_MAX_ABS=1.964343051612e-9
+MULTI_TILE_FFT_EXECUTION_MS=184964
+MULTI_TILE_FFT_DECRYPT_MS=351
+MULTI_TILE_FFT_STATUS=PASS
+MULTI_TILE_FFT_END

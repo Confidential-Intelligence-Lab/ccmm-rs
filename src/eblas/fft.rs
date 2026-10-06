@@ -1837,6 +1837,72 @@ fn rotate_right_complex(values: &[Complex64], amount: usize) -> Vec<Complex64> {
         .collect()
 }
 
+fn expand_repeated_packed_fft2_dif_diagonals(
+    diagonals: &PackedFft2DifStageDiagonals,
+    tiles_per_vector: usize,
+    vector_length: usize,
+) -> (Vec<Complex64>, Vec<Complex64>, Vec<Complex64>) {
+    assert!(
+        tiles_per_vector > 0,
+        "repeated packed FFT2 requires at least one logical tile"
+    );
+
+    let tile_elements = diagonals.shape().elements();
+    let active_elements = tile_elements
+        .checked_mul(tiles_per_vector)
+        .expect("repeated packed FFT2 active-element count overflow");
+
+    assert!(
+        active_elements <= vector_length,
+        "repeated packed FFT2 requires {active_elements} slots but vector provides only {vector_length}"
+    );
+
+    let mut direct = vec![Complex64::new(0.0, 0.0); vector_length];
+    let mut rotate_left = vec![Complex64::new(0.0, 0.0); vector_length];
+    let mut rotate_right = vec![Complex64::new(0.0, 0.0); vector_length];
+
+    for packed_tile_index in 0..tiles_per_vector {
+        let start = packed_tile_index
+            .checked_mul(tile_elements)
+            .expect("repeated packed FFT2 tile offset overflow");
+        let end = start + tile_elements;
+
+        direct[start..end].copy_from_slice(diagonals.direct());
+        rotate_left[start..end].copy_from_slice(diagonals.rotate_left());
+        rotate_right[start..end].copy_from_slice(diagonals.rotate_right());
+    }
+
+    (direct, rotate_left, rotate_right)
+}
+
+/// Executes one FFT2 DIF stage simultaneously across multiple contiguous
+/// logical tiles packed into one slot vector.
+///
+/// The CKKS-style rotations act on the complete slot vector. Repeated public
+/// diagonals mask those global rotations so each logical FFT tile remains
+/// isolated from neighboring packed tiles.
+pub fn execute_repeated_packed_fft2_dif_stage_pp(
+    input: &[Complex64],
+    diagonals: &PackedFft2DifStageDiagonals,
+    tiles_per_vector: usize,
+) -> Vec<Complex64> {
+    let (direct, left_diagonal, right_diagonal) =
+        expand_repeated_packed_fft2_dif_diagonals(diagonals, tiles_per_vector, input.len());
+
+    let left = rotate_left_complex(input, diagonals.rotation());
+    let right = rotate_right_complex(input, diagonals.rotation());
+
+    input
+        .iter()
+        .zip(left.iter())
+        .zip(right.iter())
+        .enumerate()
+        .map(|(index, ((current, left), right))| {
+            direct[index] * *current + left_diagonal[index] * *left + right_diagonal[index] * *right
+        })
+        .collect()
+}
+
 /// Executes one packed cleartext FFT2 DIF stage using the same
 /// diagonal-times-rotation algebra required by the encrypted realization.
 pub fn execute_packed_fft2_dif_stage_pp(
@@ -1886,6 +1952,88 @@ pub fn execute_packed_fft2_dif_stage_pp(
 /// This is execution-equivalent to [`execute_packed_fft2_dif_stage_cp`], but
 /// avoids repeatedly preparing the same level-specific Galois keys when the
 /// stage is evaluated across multiple ciphertexts.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_stage: (usize, &PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (tiles_per_ciphertext, left_galois_key, right_galois_key) = prepared_stage;
+
+    input.assert_matches_chain(chain);
+
+    let slot_count = embedding.slot_count();
+
+    let (direct, left, right) =
+        expand_repeated_packed_fft2_dif_diagonals(diagonals, tiles_per_ciphertext, slot_count);
+
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "repeated packed FFT2 embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "repeated packed FFT2 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "repeated packed FFT2 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_rns_ckks_with_prepared_ntt(input, rotation, left_galois_key, chain, plan)
+        });
+
+        let right_worker = scope.spawn(|| {
+            rotate_right_rns_ckks_with_prepared_ntt(input, rotation, right_galois_key, chain, plan)
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker =
+            scope.spawn(|| multiply_complex_slots_cp(input, &direct, embedding, chain, plan));
+
+        let left_worker =
+            scope.spawn(|| multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan));
+
+        let right_worker = scope
+            .spawn(|| multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan));
+
+        (
+            direct_worker
+                .join()
+                .expect("repeated packed FFT2 direct CP worker panicked"),
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left CP worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 pub fn execute_packed_fft2_dif_stage_cp_prepared(
     input: &RnsCkksCiphertext,
     diagonals: &PackedFft2DifStageDiagonals,
@@ -3295,6 +3443,89 @@ mod tests {
 
             assert!(vs_fft < 1.0e-12);
             assert!(roundtrip < 1.0e-10);
+        }
+    }
+}
+
+#[cfg(test)]
+mod repeated_packed_fft2_tests {
+    use super::{
+        execute_packed_fft2_dif_stage_pp, execute_repeated_packed_fft2_dif_stage_pp, Fft2Shape,
+        FftDirection, PackedFft2Axis, PackedFft2DifStageDiagonals,
+    };
+    use num_complex::Complex64;
+
+    fn deterministic_tile(tile_index: usize, elements: usize) -> Vec<Complex64> {
+        (0..elements)
+            .map(|element_index| {
+                Complex64::new(
+                    (17 * tile_index + element_index % 251) as f64 / 251.0,
+                    (13 * tile_index + element_index % 127) as f64 / 127.0,
+                )
+            })
+            .collect()
+    }
+
+    fn validate_repeated_stage(axis: PackedFft2Axis, span: usize, tiles_per_vector: usize) {
+        let shape = Fft2Shape::new(64, 64);
+        let tile_elements = shape.elements();
+        let slot_count = 32_768;
+
+        let diagonals = PackedFft2DifStageDiagonals::new(shape, axis, span, FftDirection::Forward);
+
+        let tiles: Vec<Vec<Complex64>> = (0..tiles_per_vector)
+            .map(|tile_index| deterministic_tile(tile_index, tile_elements))
+            .collect();
+
+        let mut packed = vec![Complex64::new(0.0, 0.0); slot_count];
+
+        for (tile_index, tile) in tiles.iter().enumerate() {
+            let start = tile_index * tile_elements;
+            let end = start + tile_elements;
+            packed[start..end].copy_from_slice(tile);
+        }
+
+        let actual =
+            execute_repeated_packed_fft2_dif_stage_pp(&packed, &diagonals, tiles_per_vector);
+
+        for (tile_index, tile) in tiles.iter().enumerate() {
+            let expected = execute_packed_fft2_dif_stage_pp(tile, &diagonals);
+
+            let start = tile_index * tile_elements;
+            let end = start + tile_elements;
+
+            let max_error = actual[start..end]
+                .iter()
+                .zip(expected.iter())
+                .map(|(actual, expected)| (*actual - *expected).norm())
+                .fold(0.0_f64, f64::max);
+
+            assert!(
+                max_error <= 1.0e-12,
+                "repeated packed FFT2 mismatch: axis={axis:?} span={span} tiles={tiles_per_vector} tile={tile_index} max_error={max_error:e}"
+            );
+        }
+
+        let active_elements = tiles_per_vector * tile_elements;
+        let inactive_max = actual[active_elements..]
+            .iter()
+            .map(|value| value.norm())
+            .fold(0.0_f64, f64::max);
+
+        assert!(
+            inactive_max <= 1.0e-15,
+            "repeated packed FFT2 contaminated inactive slots: axis={axis:?} span={span} tiles={tiles_per_vector} inactive_max={inactive_max:e}"
+        );
+    }
+
+    #[test]
+    fn repeated_packed_fft2_stages_isolate_2_4_8_tiles() {
+        for tiles_per_vector in [2, 4, 8] {
+            for axis in [PackedFft2Axis::Rows, PackedFft2Axis::Columns] {
+                for span in [64, 32, 16, 8, 4, 2] {
+                    validate_repeated_stage(axis, span, tiles_per_vector);
+                }
+            }
         }
     }
 }
