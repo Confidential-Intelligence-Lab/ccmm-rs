@@ -1,5 +1,6 @@
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
+    apply_rns_galois_automorphism_with_prepared_dynamic_ntt_profiled,
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
     CkksCanonicalEmbedding, CkksChainState, PreparedRnsGaloisKey, RnsCkksCiphertext,
     RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
@@ -7,14 +8,15 @@ use ccmm_rs::ckks::{
 use ccmm_rs::eblas::fft::{
     execute_packed_tile_dif_stage_cp_prepared, execute_repeated_packed_fft2_dif_stage_cp_prepared,
     fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape, FftDirection, PackedFft2Axis,
-    PackedFft2DifStageDiagonals, PackedTileDifStageDiagonals,
+    PackedFft2DifStageDiagonals, PackedTileDifStageDiagonals, PreparedRepeatedPackedFft2DifStage,
 };
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
     RnsKeygenConfig,
 };
 use ccmm_rs::ring::{
-    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, RnsNttPlan,
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+    PreparedRnsNttPlan, RnsNttPlan,
 };
 use ccmm_rs::rlwe::ErrorDistribution;
 use num_complex::Complex64;
@@ -43,8 +45,31 @@ const CIPHERTEXT_COUNT: usize = ROW_BLOCKS * CIPHERTEXTS_PER_ROW_BLOCK;
 const REQUIRED_LEVELS: usize = 20;
 const TERMINAL_GUARD_LIMBS: usize = 2;
 
-const LOCAL_OUTER_PARALLELISM: usize = 2;
-const INTER_CT_PARALLELISM: usize = 4;
+const DEFAULT_LOCAL_OUTER_PARALLELISM: usize = 2;
+const DEFAULT_INTER_CT_PARALLELISM: usize = 4;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer"));
+
+            assert!(parsed > 0, "{name} must be greater than zero");
+            parsed
+        }
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("failed to read {name}: {error}"),
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("failed to read {name}: {error}"),
+    }
+}
 
 fn block_sizes(limb_count: usize) -> Vec<usize> {
     vec![1; limb_count]
@@ -403,6 +428,14 @@ fn main() {
     assert_eq!(CIPHERTEXT_COUNT, 32);
     assert_eq!(SLOT_COUNT, 32_768);
 
+    let benchmark_mode = env_flag("R17_1K_BENCHMARK");
+
+    let local_outer_parallelism =
+        env_usize("R17_1K_LOCAL_PARALLELISM", DEFAULT_LOCAL_OUTER_PARALLELISM);
+
+    let inter_ct_parallelism =
+        env_usize("R17_1K_INTER_CT_PARALLELISM", DEFAULT_INTER_CT_PARALLELISM);
+
     let profile = research_profile_65536_for_levels(REQUIRED_LEVELS, TERMINAL_GUARD_LIMBS);
 
     let degree = profile.degree();
@@ -434,8 +467,9 @@ fn main() {
     println!("R17_1K_RING_DEGREE={degree}");
     println!("R17_1K_TOP_LIMBS={}", top_basis.len());
     println!("R17_1K_REQUIRED_LEVELS={REQUIRED_LEVELS}");
-    println!("R17_1K_LOCAL_OUTER_PARALLELISM={LOCAL_OUTER_PARALLELISM}");
-    println!("R17_1K_INTER_CT_PARALLELISM={INTER_CT_PARALLELISM}");
+    println!("R17_1K_BENCHMARK_MODE={benchmark_mode}");
+    println!("R17_1K_LOCAL_OUTER_PARALLELISM={local_outer_parallelism}");
+    println!("R17_1K_INTER_CT_PARALLELISM={inter_ct_parallelism}");
 
     io::stdout().flush().expect("R17 header output must flush");
 
@@ -484,8 +518,8 @@ fn main() {
 
     let mut encrypted = Vec::with_capacity(CIPHERTEXT_COUNT);
 
-    for batch_start in (0..CIPHERTEXT_COUNT).step_by(LOCAL_OUTER_PARALLELISM) {
-        let batch_end = (batch_start + LOCAL_OUTER_PARALLELISM).min(CIPHERTEXT_COUNT);
+    for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+        let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
 
         let mut batch = std::thread::scope(|scope| {
             let mut workers = Vec::new();
@@ -728,6 +762,37 @@ fn main() {
         let half_tiles = span_tiles / 2;
         let global_span = span_tiles * TILE_DIM;
 
+        /*
+         * Public row twiddles depend only on the current global span and
+         * tile offset. Build each distinct vector once per stage and share
+         * it across all ciphertext-pair workers.
+         */
+        let row_twiddle_cache = (0..half_tiles)
+            .map(|tile_offset| {
+                let mut twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
+
+                for lane in 0..TILES_PER_CIPHERTEXT {
+                    let lane_base = lane * TILE_ELEMENTS;
+
+                    for local_row in 0..TILE_DIM {
+                        for local_col in 0..TILE_DIM {
+                            let tile_slot = local_row * TILE_DIM + local_col;
+
+                            let slot = lane_base + tile_slot;
+
+                            let twiddle_index = tile_offset * TILE_DIM + local_col;
+
+                            let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+
+                            twiddles[slot] = Complex64::new(angle.cos(), angle.sin());
+                        }
+                    }
+                }
+
+                twiddles
+            })
+            .collect::<Vec<_>>();
+
         let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
 
         let stage_input = values;
@@ -750,8 +815,8 @@ fn main() {
             }
         }
 
-        for batch_start in (0..jobs.len()).step_by(INTER_CT_PARALLELISM) {
-            let batch_end = (batch_start + INTER_CT_PARALLELISM).min(jobs.len());
+        for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
+            let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
 
             let batch = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -765,36 +830,17 @@ fn main() {
                     let chain_ref = &chain;
                     let stage_plan_ref = &stage_plan;
 
+                    let twiddles = &row_twiddle_cache[tile_offset];
+
                     workers.push((
                         upper_index,
                         lower_index,
                         scope.spawn(move || {
-                            let mut twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
-
-                            for lane in 0..TILES_PER_CIPHERTEXT {
-                                let lane_base = lane * TILE_ELEMENTS;
-
-                                for local_row in 0..TILE_DIM {
-                                    for local_col in 0..TILE_DIM {
-                                        let tile_slot = local_row * TILE_DIM + local_col;
-
-                                        let slot = lane_base + tile_slot;
-
-                                        let twiddle_index = tile_offset * TILE_DIM + local_col;
-
-                                        let angle =
-                                            -2.0 * PI * twiddle_index as f64 / global_span as f64;
-
-                                        twiddles[slot] = Complex64::new(angle.cos(), angle.sin());
-                                    }
-                                }
-                            }
-
                             packed_fft_dif_butterfly_cp(
                                 evaluator_ref,
                                 a,
                                 b,
-                                &twiddles,
+                                twiddles,
                                 embedding_ref,
                                 chain_ref,
                                 stage_plan_ref,
@@ -843,7 +889,9 @@ fn main() {
 
     assert_eq!(level, 4);
 
-    print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    if !benchmark_mode {
+        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    }
 
     /*
      * Local row stages: levels 4..9.
@@ -880,11 +928,120 @@ fn main() {
             &stage_plan,
         );
 
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+            &values[0],
+            &diagonals,
+            TILES_PER_CIPHERTEXT,
+            &embedding,
+            &chain,
+            &stage_plan,
+        );
+
         let stage_input = values;
+
+        if env_flag("R17_1K_ROTATION_PROFILE") && level == 4 && span == TILE_DIM {
+            let prepared_stage_plan = PreparedRnsNttPlan::new(&stage_plan);
+            let input = &stage_input[0];
+
+            println!("R17_1K_ROTATION_PROFILE_BEGIN");
+            println!("R17_1K_ROTATION_PROFILE_LEVEL={}", level);
+            println!("R17_1K_ROTATION_PROFILE_SPAN={}", span);
+            println!("R17_1K_ROTATION_PROFILE_ROTATION={}", rotation);
+            println!(
+                "R17_1K_ROTATION_PROFILE_LIMBS={}",
+                input.basis().moduli().len()
+            );
+
+            let profile_one = |name: &str, key: &PreparedRnsGaloisKey| {
+                let total_start = Instant::now();
+
+                let (_output, automorphism_seconds, profile) =
+                    apply_rns_galois_automorphism_with_prepared_dynamic_ntt_profiled(
+                        input.rlwe(),
+                        key,
+                        &prepared_stage_plan,
+                    );
+
+                let total_seconds = total_start.elapsed().as_secs_f64();
+
+                let accounted_key_switch_seconds = profile.decompose_seconds
+                    + profile.base_forward_seconds
+                    + profile.digit_prepare_seconds
+                    + profile.digit_forward_seconds
+                    + profile.mac_seconds
+                    + profile.inverse_seconds;
+
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_AUTOMORPHISM_MS={:.3}",
+                    name,
+                    automorphism_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_DECOMPOSE_MS={:.3}",
+                    name,
+                    profile.decompose_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_BASE_FORWARD_MS={:.3}",
+                    name,
+                    profile.base_forward_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_DIGIT_PREPARE_MS={:.3}",
+                    name,
+                    profile.digit_prepare_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_DIGIT_FORWARD_MS={:.3}",
+                    name,
+                    profile.digit_forward_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_MAC_MS={:.3}",
+                    name,
+                    profile.mac_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_INVERSE_MS={:.3}",
+                    name,
+                    profile.inverse_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_KEY_SWITCH_ACCOUNTED_MS={:.3}",
+                    name,
+                    accounted_key_switch_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_TOTAL_MS={:.3}",
+                    name,
+                    total_seconds * 1.0e3
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_BASE_FORWARD_COUNT={}",
+                    name, profile.base_forward_count
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_DIGIT_FORWARD_COUNT={}",
+                    name, profile.digit_forward_count
+                );
+                println!(
+                    "R17_1K_ROTATION_PROFILE_{}_INVERSE_COUNT={}",
+                    name, profile.inverse_count
+                );
+            };
+
+            profile_one("LEFT", &prepared_left);
+            profile_one("RIGHT", &prepared_right);
+
+            println!("R17_1K_ROTATION_PROFILE_END");
+            return;
+        }
+
         let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
 
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(LOCAL_OUTER_PARALLELISM) {
-            let batch_end = (batch_start + LOCAL_OUTER_PARALLELISM).min(CIPHERTEXT_COUNT);
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
 
             let batch = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -893,12 +1050,12 @@ fn main() {
                     workers.push(scope.spawn(|| {
                         execute_repeated_packed_fft2_dif_stage_cp_prepared(
                             input,
-                            &diagonals,
+                            &prepared_fft_stage,
                             &evaluator,
-                            (TILES_PER_CIPHERTEXT, &prepared_left, &prepared_right),
-                            &embedding,
+                            (&prepared_left, &prepared_right),
                             &chain,
                             &stage_plan,
+                            &prepared_plan,
                         )
                     }));
                 }
@@ -943,7 +1100,9 @@ fn main() {
 
     assert_eq!(level, 10);
 
-    print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    if !benchmark_mode {
+        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    }
 
     /*
      * Global column span 16: level 10.
@@ -952,6 +1111,31 @@ fn main() {
         let stage_start = Instant::now();
 
         let global_span = 16usize * TILE_DIM;
+
+        /*
+         * The level-10 inter-ciphertext column stage uses the same public
+         * twiddle vector for every ciphertext pair. Construct it once and
+         * share it across all workers.
+         */
+        let mut column_twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
+
+        for lane in 0..TILES_PER_CIPHERTEXT {
+            let lane_base = lane * TILE_ELEMENTS;
+
+            for local_row in 0..TILE_DIM {
+                let twiddle_index = lane * TILE_DIM + local_row;
+
+                let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+
+                let w = Complex64::new(angle.cos(), angle.sin());
+
+                for local_col in 0..TILE_DIM {
+                    let tile_slot = local_row * TILE_DIM + local_col;
+
+                    column_twiddles[lane_base + tile_slot] = w;
+                }
+            }
+        }
 
         let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
 
@@ -963,8 +1147,8 @@ fn main() {
             .map(|tile_col| (tile_col, TILES_PER_AXIS + tile_col))
             .collect::<Vec<_>>();
 
-        for batch_start in (0..jobs.len()).step_by(INTER_CT_PARALLELISM) {
-            let batch_end = (batch_start + INTER_CT_PARALLELISM).min(jobs.len());
+        for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
+            let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
 
             let batch = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -977,32 +1161,11 @@ fn main() {
                         upper_index,
                         lower_index,
                         scope.spawn(|| {
-                            let mut twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
-
-                            for lane in 0..TILES_PER_CIPHERTEXT {
-                                let lane_base = lane * TILE_ELEMENTS;
-
-                                for local_row in 0..TILE_DIM {
-                                    let twiddle_index = lane * TILE_DIM + local_row;
-
-                                    let angle =
-                                        -2.0 * PI * twiddle_index as f64 / global_span as f64;
-
-                                    let w = Complex64::new(angle.cos(), angle.sin());
-
-                                    for local_col in 0..TILE_DIM {
-                                        let tile_slot = local_row * TILE_DIM + local_col;
-
-                                        twiddles[lane_base + tile_slot] = w;
-                                    }
-                                }
-                            }
-
                             packed_fft_dif_butterfly_cp(
                                 &evaluator,
                                 a,
                                 b,
-                                &twiddles,
+                                &column_twiddles,
                                 &embedding,
                                 &chain,
                                 &stage_plan,
@@ -1047,7 +1210,9 @@ fn main() {
 
     assert_eq!(level, 11);
 
-    print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    if !benchmark_mode {
+        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    }
 
     /*
      * Global column intra-CT tile-block stages: levels 11..13.
@@ -1088,8 +1253,8 @@ fn main() {
         let stage_input = values;
         let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
 
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(LOCAL_OUTER_PARALLELISM) {
-            let batch_end = (batch_start + LOCAL_OUTER_PARALLELISM).min(CIPHERTEXT_COUNT);
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
 
             let batch = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -1142,7 +1307,9 @@ fn main() {
 
     assert_eq!(level, 14);
 
-    print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    if !benchmark_mode {
+        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    }
 
     /*
      * Local column stages: levels 14..19.
@@ -1179,11 +1346,21 @@ fn main() {
             &stage_plan,
         );
 
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+            &values[0],
+            &diagonals,
+            TILES_PER_CIPHERTEXT,
+            &embedding,
+            &chain,
+            &stage_plan,
+        );
+
         let stage_input = values;
         let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
 
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(LOCAL_OUTER_PARALLELISM) {
-            let batch_end = (batch_start + LOCAL_OUTER_PARALLELISM).min(CIPHERTEXT_COUNT);
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
 
             let batch = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -1192,12 +1369,12 @@ fn main() {
                     workers.push(scope.spawn(|| {
                         execute_repeated_packed_fft2_dif_stage_cp_prepared(
                             input,
-                            &diagonals,
+                            &prepared_fft_stage,
                             &evaluator,
-                            (TILES_PER_CIPHERTEXT, &prepared_left, &prepared_right),
-                            &embedding,
+                            (&prepared_left, &prepared_right),
                             &chain,
                             &stage_plan,
+                            &prepared_plan,
                         )
                     }));
                 }
@@ -1244,7 +1421,9 @@ fn main() {
 
     let fft_ms = fft_start.elapsed().as_millis();
 
-    print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    if !benchmark_mode {
+        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+    }
 
     /*
      * ---------------------------------------------------------------

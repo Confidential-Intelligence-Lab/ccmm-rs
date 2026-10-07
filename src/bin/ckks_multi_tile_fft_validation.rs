@@ -8,13 +8,15 @@ use ccmm_rs::ckks::{
 use ccmm_rs::eblas::fft::{
     execute_repeated_packed_fft2_dif_stage_cp_prepared, execute_repeated_packed_fft2_dif_stage_pp,
     fft2_pp, Fft2Shape, FftDirection, PackedFft2Axis, PackedFft2DifStageDiagonals,
+    PreparedRepeatedPackedFft2DifStage,
 };
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
     RnsKeygenConfig,
 };
 use ccmm_rs::ring::{
-    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, RnsNttPlan,
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+    PreparedRnsNttPlan, RnsNttPlan,
 };
 use ccmm_rs::rlwe::ErrorDistribution;
 use num_complex::Complex64;
@@ -400,6 +402,16 @@ fn main() {
                 &stage_plan,
             );
 
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &value,
+                &diagonals,
+                TILES_PER_CIPHERTEXT,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
             if execution_level == 0 {
                 let rotated_left = rotate_left_rns_ckks_with_prepared_ntt(
                     &value,
@@ -446,12 +458,12 @@ fn main() {
 
             value = execute_repeated_packed_fft2_dif_stage_cp_prepared(
                 &value,
-                &diagonals,
+                &prepared_fft_stage,
                 &evaluator,
-                (TILES_PER_CIPHERTEXT, &prepared_left, &prepared_right),
-                &embedding,
+                (&prepared_left, &prepared_right),
                 &chain,
                 &stage_plan,
+                &prepared_plan,
             );
 
             execution_level += 1;

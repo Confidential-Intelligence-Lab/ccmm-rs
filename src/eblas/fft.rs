@@ -16,9 +16,12 @@ use crate::ckks::{
     RnsCkksCiphertext, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
-use crate::ring::{ModulusChain, RnsNttPlan};
+use crate::ring::{ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
 
-use super::level1::{multiply_complex_slots_cp, scale_complex_cp};
+use super::level1::{
+    multiply_complex_slots_cp, multiply_complex_slots_cp_prepared, scale_complex_cp,
+    PreparedComplexSlotsCp,
+};
 
 /// Direction of a complex Fourier transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2070,6 +2073,52 @@ fn expand_repeated_packed_fft2_dif_diagonals(
     (direct, rotate_left, rotate_right)
 }
 
+/// Reusable public operands for one repeated packed FFT2 DIF stage.
+///
+/// The three public diagonals are expanded to the complete CKKS slot vector,
+/// encoded at the active ciphertext level, and transformed to the RNS NTT
+/// domain once. The resulting operands can be reused across every ciphertext
+/// evaluated at the same stage and level.
+#[derive(Debug, Clone)]
+pub struct PreparedRepeatedPackedFft2DifStage {
+    rotation: usize,
+    direct: PreparedComplexSlotsCp,
+    rotate_left: PreparedComplexSlotsCp,
+    rotate_right: PreparedComplexSlotsCp,
+}
+
+impl PreparedRepeatedPackedFft2DifStage {
+    pub fn new(
+        input: &RnsCkksCiphertext,
+        diagonals: &PackedFft2DifStageDiagonals,
+        tiles_per_ciphertext: usize,
+        embedding: &CkksCanonicalEmbedding,
+        chain: &ModulusChain,
+        plan: &RnsNttPlan,
+    ) -> Self {
+        input.assert_matches_chain(chain);
+
+        let slot_count = embedding.slot_count();
+        let (direct, rotate_left, rotate_right) =
+            expand_repeated_packed_fft2_dif_diagonals(diagonals, tiles_per_ciphertext, slot_count);
+
+        Self {
+            rotation: diagonals.rotation(),
+            direct: PreparedComplexSlotsCp::new(input, &direct, embedding, chain, plan),
+            rotate_left: PreparedComplexSlotsCp::new(input, &rotate_left, embedding, chain, plan),
+            rotate_right: PreparedComplexSlotsCp::new(input, &rotate_right, embedding, chain, plan),
+        }
+    }
+
+    pub const fn rotation(&self) -> usize {
+        self.rotation
+    }
+
+    pub const fn level(&self) -> usize {
+        self.direct.level()
+    }
+}
+
 /// Executes one FFT2 DIF stage simultaneously across multiple contiguous
 /// logical tiles packed into one slot vector.
 ///
@@ -2264,30 +2313,25 @@ pub fn execute_packed_fft2_dif_stage_pp(
 /// key-switch material has already been transformed to the NTT domain.
 ///
 /// This is execution-equivalent to [`execute_packed_fft2_dif_stage_cp`], but
-/// avoids repeatedly preparing the same level-specific Galois keys when the
-/// stage is evaluated across multiple ciphertexts.
+/// reuses both level-specific prepared Galois material and prepared public
+/// D0/D1/D2 operands when the stage is evaluated across multiple ciphertexts.
 pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
     input: &RnsCkksCiphertext,
-    diagonals: &PackedFft2DifStageDiagonals,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
     evaluator: &RnsCkksEvaluator<'_>,
-    prepared_stage: (usize, &PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
-    embedding: &CkksCanonicalEmbedding,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
     chain: &ModulusChain,
     plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
 ) -> RnsCkksCiphertext {
-    let (tiles_per_ciphertext, left_galois_key, right_galois_key) = prepared_stage;
+    let (left_galois_key, right_galois_key) = prepared_galois_keys;
 
     input.assert_matches_chain(chain);
 
-    let slot_count = embedding.slot_count();
-
-    let (direct, left, right) =
-        expand_repeated_packed_fft2_dif_diagonals(diagonals, tiles_per_ciphertext, slot_count);
-
     assert_eq!(
-        embedding.degree(),
-        input.rlwe().degree(),
-        "repeated packed FFT2 embedding degree must match ciphertext ring degree"
+        prepared_fft_stage.level(),
+        input.level(),
+        "prepared repeated packed FFT2 stage level must match ciphertext level"
     );
     assert_eq!(
         plan.degree(),
@@ -2300,7 +2344,7 @@ pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
         "repeated packed FFT2 NTT plan basis must match ciphertext basis"
     );
 
-    let rotation = diagonals.rotation();
+    let rotation = prepared_fft_stage.rotation();
 
     let (rotated_left, rotated_right) = std::thread::scope(|scope| {
         let left_worker = scope.spawn(|| {
@@ -2322,25 +2366,43 @@ pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
     });
 
     let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
-        let direct_worker =
-            scope.spawn(|| multiply_complex_slots_cp(input, &direct, embedding, chain, plan));
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
 
-        let left_worker =
-            scope.spawn(|| multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan));
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_left,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
 
-        let right_worker = scope
-            .spawn(|| multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan));
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_right,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
 
         (
             direct_worker
                 .join()
-                .expect("repeated packed FFT2 direct CP worker panicked"),
+                .expect("repeated packed FFT2 direct prepared CP worker panicked"),
             left_worker
                 .join()
-                .expect("repeated packed FFT2 left CP worker panicked"),
+                .expect("repeated packed FFT2 left prepared CP worker panicked"),
             right_worker
                 .join()
-                .expect("repeated packed FFT2 right CP worker panicked"),
+                .expect("repeated packed FFT2 right prepared CP worker panicked"),
         )
     });
 

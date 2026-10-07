@@ -60,7 +60,10 @@ pub use gemv::{
 
 pub mod level1;
 
-pub use level1::{add_cc, axpy_cp, multiply_complex_slots_cp, scale_complex_cp, scale_cp};
+pub use level1::{
+    add_cc, axpy_cp, multiply_complex_slots_cp, multiply_complex_slots_cp_prepared,
+    scale_complex_cp, scale_cp, PreparedComplexSlotsCp,
+};
 
 pub mod transpose;
 

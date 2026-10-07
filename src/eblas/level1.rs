@@ -1,9 +1,12 @@
 use crate::ckks::{
-    mod_switch_rns_ckks_to_next, multiply_plain_rns_ckks_with_ntt, rescale_rns_ckks_to_next,
-    CkksCanonicalEmbedding, RnsCkksEvaluator,
+    mod_switch_rns_ckks_to_next, multiply_plain_rns_ckks_with_ntt,
+    multiply_plain_rns_ckks_with_prepared_ntt, rescale_rns_ckks_to_next, CkksCanonicalEmbedding,
+    PreparedRnsPlaintextNtt, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
-use crate::ring::{ModulusBasis, ModulusChain, Polynomial, RnsNttPlan, RnsPolynomial};
+use crate::ring::{
+    ModulusBasis, ModulusChain, Polynomial, PreparedRnsNttPlan, RnsNttPlan, RnsPolynomial,
+};
 use num_complex::Complex64;
 
 fn encode_complex_slots(
@@ -198,6 +201,100 @@ pub fn scale_complex_cp(
 /// This is the packed public-mask/twiddle primitive used by structured eBLAS
 /// transforms. It performs no ciphertext-ciphertext multiplication and requires
 /// no relinearization.
+/// Reusable prepared public complex-slot operand for packed CKKS CP multiplication.
+///
+/// The public slot vector is encoded once at the active CKKS level and transformed
+/// once to the RNS NTT domain. The prepared representation can then be reused
+/// across ciphertexts with the same level, basis, degree, and plaintext scale.
+#[derive(Debug, Clone)]
+pub struct PreparedComplexSlotsCp {
+    plaintext: PreparedRnsPlaintextNtt,
+    plaintext_scale: f64,
+    level: usize,
+}
+
+impl PreparedComplexSlotsCp {
+    pub fn new(
+        input: &crate::ckks::RnsCkksCiphertext,
+        public_slots: &[Complex64],
+        embedding: &CkksCanonicalEmbedding,
+        chain: &ModulusChain,
+        plan: &RnsNttPlan,
+    ) -> Self {
+        input.assert_matches_chain(chain);
+
+        assert_eq!(
+            embedding.degree(),
+            input.rlwe().degree(),
+            "eBLAS prepared packed CP embedding degree must match ciphertext ring degree"
+        );
+        assert_eq!(
+            public_slots.len(),
+            embedding.slot_count(),
+            "eBLAS prepared packed CP public slot count must match CKKS embedding slot count"
+        );
+        assert_eq!(
+            plan.degree(),
+            input.rlwe().degree(),
+            "eBLAS prepared packed CP NTT plan degree must match ciphertext ring degree"
+        );
+        assert_eq!(
+            plan.moduli(),
+            input.basis().moduli(),
+            "eBLAS prepared packed CP NTT plan basis must match ciphertext basis"
+        );
+
+        let dropped = chain.dropped_modulus(input.level()).expect(
+            "eBLAS prepared packed CP multiplication cannot consume the final CKKS chain level",
+        );
+        let plaintext_scale = dropped.value() as f64;
+
+        let plaintext =
+            encode_complex_slots(public_slots, embedding, input.basis(), plaintext_scale);
+        let prepared_plan = PreparedRnsNttPlan::new(plan);
+        let plaintext = PreparedRnsPlaintextNtt::new(&plaintext, &prepared_plan);
+
+        Self {
+            plaintext,
+            plaintext_scale,
+            level: input.level(),
+        }
+    }
+
+    pub const fn level(&self) -> usize {
+        self.level
+    }
+}
+
+/// Multiplies an encrypted packed CKKS value by a prepared public complex-slot
+/// operand and consumes exactly one CKKS level.
+///
+/// Preparation is amortized across repeated ciphertexts at the same level.
+pub fn multiply_complex_slots_cp_prepared(
+    input: &crate::ckks::RnsCkksCiphertext,
+    prepared: &PreparedComplexSlotsCp,
+    chain: &ModulusChain,
+    plan: &PreparedRnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        input.level(),
+        prepared.level(),
+        "eBLAS prepared packed CP ciphertext level must match prepared plaintext level"
+    );
+
+    let product = multiply_plain_rns_ckks_with_prepared_ntt(
+        input,
+        &prepared.plaintext,
+        prepared.plaintext_scale,
+        chain,
+        plan,
+    );
+
+    rescale_rns_ckks_to_next(&product, chain)
+}
+
 pub fn multiply_complex_slots_cp(
     input: &crate::ckks::RnsCkksCiphertext,
     public_slots: &[Complex64],
@@ -235,6 +332,7 @@ pub fn multiply_complex_slots_cp(
 
     let plaintext = encode_complex_slots(public_slots, embedding, input.basis(), plaintext_scale);
     let product = multiply_plain_rns_ckks_with_ntt(input, &plaintext, plaintext_scale, chain, plan);
+
     rescale_rns_ckks_to_next(&product, chain)
 }
 
