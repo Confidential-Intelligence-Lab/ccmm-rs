@@ -7,9 +7,10 @@ use ccmm_rs::ckks::{
 };
 use ccmm_rs::eblas::fft::{
     execute_packed_tile_dif_stage_cp_prepared, execute_repeated_packed_fft2_dif_stage_cp_prepared,
-    fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape, FftDirection, PackedFft2Axis,
+    fft2_pp, packed_fft_dif_butterfly_cp_prepared, Fft2Shape, FftDirection, PackedFft2Axis,
     PackedFft2DifStageDiagonals, PackedTileDifStageDiagonals, PreparedRepeatedPackedFft2DifStage,
 };
+use ccmm_rs::eblas::PreparedComplexSlotsCp;
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
     RnsKeygenConfig,
@@ -794,6 +795,14 @@ fn main() {
             .collect::<Vec<_>>();
 
         let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+        let prepared_row_twiddle_cache = row_twiddle_cache
+            .iter()
+            .map(|twiddles| {
+                PreparedComplexSlotsCp::new(&values[0], twiddles, &embedding, &chain, &stage_plan)
+            })
+            .collect::<Vec<_>>();
 
         let stage_input = values;
         let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
@@ -826,24 +835,21 @@ fn main() {
                     let b = &stage_input[lower_index];
 
                     let evaluator_ref = &evaluator;
-                    let embedding_ref = &embedding;
                     let chain_ref = &chain;
-                    let stage_plan_ref = &stage_plan;
-
-                    let twiddles = &row_twiddle_cache[tile_offset];
+                    let prepared_plan_ref = &prepared_plan;
+                    let prepared_twiddles = &prepared_row_twiddle_cache[tile_offset];
 
                     workers.push((
                         upper_index,
                         lower_index,
                         scope.spawn(move || {
-                            packed_fft_dif_butterfly_cp(
+                            packed_fft_dif_butterfly_cp_prepared(
                                 evaluator_ref,
                                 a,
                                 b,
-                                twiddles,
-                                embedding_ref,
+                                prepared_twiddles,
                                 chain_ref,
-                                stage_plan_ref,
+                                prepared_plan_ref,
                             )
                         }),
                     ));
@@ -1138,6 +1144,14 @@ fn main() {
         }
 
         let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+        let prepared_column_twiddles = PreparedComplexSlotsCp::new(
+            &values[0],
+            &column_twiddles,
+            &embedding,
+            &chain,
+            &stage_plan,
+        );
 
         let stage_input = values;
         let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
@@ -1161,14 +1175,13 @@ fn main() {
                         upper_index,
                         lower_index,
                         scope.spawn(|| {
-                            packed_fft_dif_butterfly_cp(
+                            packed_fft_dif_butterfly_cp_prepared(
                                 &evaluator,
                                 a,
                                 b,
-                                &column_twiddles,
-                                &embedding,
+                                &prepared_column_twiddles,
                                 &chain,
-                                &stage_plan,
+                                &prepared_plan,
                             )
                         }),
                     ));

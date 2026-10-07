@@ -1134,6 +1134,114 @@ pub fn packed_fft_dif_butterfly_cp(
     (aligned_sum, weighted_diff)
 }
 
+/// Executes one packed radix-2 DIF butterfly using a prepared public
+/// complex-slot twiddle operand.
+///
+/// For encrypted packed operands `a` and `b`, this computes
+///
+/// ```text
+/// sum  = a + b
+/// diff = a - b
+/// u    = mod_switch(sum)
+/// v    = prepared_twiddles .* diff
+/// ```
+///
+/// This is the prepared-public-operand counterpart of
+/// [`packed_fft_dif_butterfly_cp`]. The public twiddle vector is encoded and
+/// transformed to the RNS NTT domain before this call and can therefore be
+/// reused across multiple ciphertext pairs at the same CKKS level.
+///
+/// This operation consumes exactly one CKKS level.
+pub fn packed_fft_dif_butterfly_cp_prepared(
+    evaluator: &RnsCkksEvaluator<'_>,
+    a: &RnsCkksCiphertext,
+    b: &RnsCkksCiphertext,
+    prepared_twiddles: &PreparedComplexSlotsCp,
+    chain: &ModulusChain,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> (RnsCkksCiphertext, RnsCkksCiphertext) {
+    a.assert_matches_chain(chain);
+    b.assert_matches_chain(chain);
+
+    assert_eq!(
+        a.rlwe().degree(),
+        b.rlwe().degree(),
+        "prepared packed DIF butterfly operands must have matching ring degrees"
+    );
+    assert_eq!(
+        a.level(),
+        b.level(),
+        "prepared packed DIF butterfly operands must have matching levels"
+    );
+    assert_eq!(
+        a.scale(),
+        b.scale(),
+        "prepared packed DIF butterfly operands must have matching scales"
+    );
+    assert_eq!(
+        a.basis(),
+        b.basis(),
+        "prepared packed DIF butterfly operands must have matching RNS bases"
+    );
+    assert_eq!(
+        a.level(),
+        prepared_twiddles.level(),
+        "prepared packed DIF butterfly ciphertext level must match prepared twiddle level"
+    );
+    assert_eq!(
+        prepared_plan.degree(),
+        a.rlwe().degree(),
+        "prepared packed DIF butterfly NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        prepared_plan.moduli(),
+        a.basis().moduli(),
+        "prepared packed DIF butterfly NTT plan basis must match ciphertext basis"
+    );
+    assert!(
+        chain.has_next_level(a.level()),
+        "prepared packed DIF butterfly requires another CKKS chain level"
+    );
+
+    let sum = evaluator.add(a, b);
+    let diff = evaluator.sub(a, b);
+
+    let (weighted_diff, aligned_sum) = std::thread::scope(|scope| {
+        let weighted_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(&diff, prepared_twiddles, chain, prepared_plan)
+        });
+
+        let aligned_worker = scope.spawn(|| mod_switch_rns_ckks_to_next(&sum, chain));
+
+        (
+            weighted_worker
+                .join()
+                .expect("prepared packed DIF weighted-difference worker panicked"),
+            aligned_worker
+                .join()
+                .expect("prepared packed DIF aligned-sum worker panicked"),
+        )
+    });
+
+    assert_eq!(
+        aligned_sum.level(),
+        weighted_diff.level(),
+        "prepared packed DIF butterfly aligned outputs must have matching levels"
+    );
+    assert_eq!(
+        aligned_sum.scale(),
+        weighted_diff.scale(),
+        "prepared packed DIF butterfly aligned outputs must have matching scales"
+    );
+    assert_eq!(
+        aligned_sum.basis(),
+        weighted_diff.basis(),
+        "prepared packed DIF butterfly aligned outputs must have matching bases"
+    );
+
+    (aligned_sum, weighted_diff)
+}
+
 /// Executes one radix-2 FFT butterfly over encrypted operands and a public
 /// complex twiddle.
 ///
