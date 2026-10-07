@@ -12,8 +12,8 @@ use std::f64::consts::PI;
 
 use crate::ckks::{
     mod_switch_rns_ckks_to_next, rotate_left_rns_ckks_with_prepared_ntt,
-    rotate_right_rns_ckks_with_prepared_ntt, CkksCanonicalEmbedding, PreparedRnsGaloisKey,
-    RnsCkksCiphertext, RnsCkksEvaluator,
+    rotate_right_rns_ckks_with_prepared_ntt, rotation_exponent_left, rotation_exponent_right,
+    CkksCanonicalEmbedding, PreparedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
@@ -1240,6 +1240,614 @@ pub fn packed_fft_dif_butterfly_cp_prepared(
     );
 
     (aligned_sum, weighted_diff)
+}
+
+/// Executes the row half of the packed 1024x1024 FFT2 representation.
+///
+/// Physical layout:
+///
+/// - 1024x1024 logical image;
+/// - 64x64 logical tiles;
+/// - 16x16 tile grid;
+/// - eight vertically adjacent tiles packed per ciphertext;
+/// - 32 ciphertexts total.
+///
+/// The execution is level-relative. If the input starts at CKKS level `L`,
+/// the returned ciphertexts are at level `L + 10`.
+///
+/// The ten consumed levels are:
+///
+/// ```text
+/// 4 inter-ciphertext global-row DIF stages
+/// 6 repeated packed local-row DIF stages
+/// ```
+///
+/// Public row twiddles and local-stage diagonals are prepared once per stage
+/// and reused across all ciphertext operations at that stage.
+pub fn execute_packed_1k_fft_rows_cp(
+    mut values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+) -> Vec<RnsCkksCiphertext> {
+    const TILE_DIM: usize = 64;
+    const TILE_ELEMENTS: usize = TILE_DIM * TILE_DIM;
+    const TILES_PER_AXIS: usize = 16;
+    const TILES_PER_CIPHERTEXT: usize = 8;
+    const ROW_BLOCKS: usize = TILES_PER_AXIS / TILES_PER_CIPHERTEXT;
+    const CIPHERTEXT_COUNT: usize = ROW_BLOCKS * TILES_PER_AXIS;
+
+    assert_eq!(
+        values.len(),
+        CIPHERTEXT_COUNT,
+        "packed 1K row engine requires exactly 32 ciphertexts"
+    );
+    assert!(inter_ct_parallelism > 0);
+    assert!(local_outer_parallelism > 0);
+
+    let degree = embedding.degree();
+    let slot_count = embedding.slot_count();
+
+    assert_eq!(
+        slot_count,
+        TILE_ELEMENTS * TILES_PER_CIPHERTEXT,
+        "packed 1K row engine requires eight complete 64x64 tiles per ciphertext"
+    );
+
+    let tile_shape = Fft2Shape::new(TILE_DIM, TILE_DIM);
+    let start_level = values[0].level();
+
+    for value in &values {
+        value.assert_matches_chain(chain);
+        assert_eq!(
+            value.level(),
+            start_level,
+            "packed 1K row-engine inputs must begin at the same CKKS level"
+        );
+        assert_eq!(
+            value.rlwe().degree(),
+            degree,
+            "packed 1K row-engine ciphertext degree must match embedding"
+        );
+    }
+
+    /*
+     * Four inter-ciphertext global-row stages.
+     */
+    let mut span_tiles = TILES_PER_AXIS;
+
+    while span_tiles >= 2 {
+        let level = values[0].level();
+        let half_tiles = span_tiles / 2;
+        let global_span = span_tiles * TILE_DIM;
+
+        let row_twiddle_cache = (0..half_tiles)
+            .map(|tile_offset| {
+                let mut twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
+
+                for lane in 0..TILES_PER_CIPHERTEXT {
+                    let lane_base = lane * TILE_ELEMENTS;
+
+                    for local_row in 0..TILE_DIM {
+                        for local_col in 0..TILE_DIM {
+                            let tile_slot = local_row * TILE_DIM + local_col;
+                            let slot = lane_base + tile_slot;
+                            let twiddle_index = tile_offset * TILE_DIM + local_col;
+                            let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+
+                            twiddles[slot] = Complex64::new(angle.cos(), angle.sin());
+                        }
+                    }
+                }
+
+                twiddles
+            })
+            .collect::<Vec<_>>();
+
+        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+        let prepared_row_twiddle_cache = row_twiddle_cache
+            .iter()
+            .map(|twiddles| {
+                PreparedComplexSlotsCp::new(&values[0], twiddles, embedding, chain, &stage_plan)
+            })
+            .collect::<Vec<_>>();
+
+        let stage_input = values;
+        let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
+            (0..CIPHERTEXT_COUNT).map(|_| None).collect();
+
+        let mut jobs = Vec::new();
+
+        for row_block in 0..ROW_BLOCKS {
+            for group_start in (0..TILES_PER_AXIS).step_by(span_tiles) {
+                for tile_offset in 0..half_tiles {
+                    let upper_col = group_start + tile_offset;
+                    let lower_col = upper_col + half_tiles;
+
+                    let upper_index = row_block * TILES_PER_AXIS + upper_col;
+                    let lower_index = row_block * TILES_PER_AXIS + lower_col;
+
+                    jobs.push((upper_index, lower_index, tile_offset));
+                }
+            }
+        }
+
+        for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
+            let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+
+                for &(upper_index, lower_index, tile_offset) in &jobs[batch_start..batch_end] {
+                    let a = &stage_input[upper_index];
+                    let b = &stage_input[lower_index];
+                    let prepared_twiddles = &prepared_row_twiddle_cache[tile_offset];
+
+                    workers.push((
+                        upper_index,
+                        lower_index,
+                        scope.spawn(|| {
+                            packed_fft_dif_butterfly_cp_prepared(
+                                evaluator,
+                                a,
+                                b,
+                                prepared_twiddles,
+                                chain,
+                                &prepared_plan,
+                            )
+                        }),
+                    ));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|(upper_index, lower_index, worker)| {
+                        let (upper, lower) =
+                            worker.join().expect("packed 1K global-row worker panicked");
+
+                        (upper_index, lower_index, upper, lower)
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            for (upper_index, lower_index, upper, lower) in batch {
+                stage_output[upper_index] = Some(upper);
+                stage_output[lower_index] = Some(lower);
+            }
+        }
+
+        values = stage_output
+            .into_iter()
+            .map(|value| value.expect("packed 1K global-row output missing"))
+            .collect();
+
+        span_tiles /= 2;
+    }
+
+    assert_eq!(
+        values[0].level(),
+        start_level + 4,
+        "packed 1K global-row phase must consume four CKKS levels"
+    );
+
+    /*
+     * Six repeated packed local-row stages.
+     */
+    let mut span = TILE_DIM;
+
+    while span >= 2 {
+        let level = values[0].level();
+
+        let diagonals = PackedFft2DifStageDiagonals::new(
+            tile_shape,
+            PackedFft2Axis::Rows,
+            span,
+            FftDirection::Forward,
+        );
+
+        let rotation = diagonals.rotation();
+        let left_exponent = rotation_exponent_left(degree, rotation);
+        let right_exponent = rotation_exponent_right(degree, rotation);
+
+        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+
+        let state = values[0].state();
+
+        let prepared_left = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, left_exponent),
+            &stage_plan,
+        );
+
+        let prepared_right = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, right_exponent),
+            &stage_plan,
+        );
+
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+            &values[0],
+            &diagonals,
+            TILES_PER_CIPHERTEXT,
+            embedding,
+            chain,
+            &stage_plan,
+        );
+
+        let stage_input = values;
+        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+
+                for input in stage_input.iter().take(batch_end).skip(batch_start) {
+                    workers.push(scope.spawn(|| {
+                        execute_repeated_packed_fft2_dif_stage_cp_prepared(
+                            input,
+                            &prepared_fft_stage,
+                            evaluator,
+                            (&prepared_left, &prepared_right),
+                            chain,
+                            &stage_plan,
+                            &prepared_plan,
+                        )
+                    }));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("packed 1K local-row worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+
+            stage_output.extend(batch);
+        }
+
+        values = stage_output;
+        span /= 2;
+    }
+
+    assert_eq!(
+        values[0].level(),
+        start_level + 10,
+        "packed 1K row phase must consume exactly ten CKKS levels"
+    );
+
+    values
+}
+
+/// Executes the column half of the packed 1024x1024 FFT2 representation.
+///
+/// The execution is level-relative. If the input starts at CKKS level `L`,
+/// the returned ciphertexts are at level `L + 10`.
+///
+/// The ten consumed levels are:
+///
+/// ```text
+/// 1 inter-ciphertext global-column DIF stage
+/// 3 intra-ciphertext packed tile-block DIF stages
+/// 6 repeated packed local-column DIF stages
+/// ```
+pub fn execute_packed_1k_fft_columns_cp(
+    mut values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+) -> Vec<RnsCkksCiphertext> {
+    const TILE_DIM: usize = 64;
+    const TILE_ELEMENTS: usize = TILE_DIM * TILE_DIM;
+    const TILES_PER_AXIS: usize = 16;
+    const TILES_PER_CIPHERTEXT: usize = 8;
+    const CIPHERTEXT_COUNT: usize = 32;
+
+    assert_eq!(
+        values.len(),
+        CIPHERTEXT_COUNT,
+        "packed 1K column engine requires exactly 32 ciphertexts"
+    );
+    assert!(inter_ct_parallelism > 0);
+    assert!(local_outer_parallelism > 0);
+
+    let degree = embedding.degree();
+    let slot_count = embedding.slot_count();
+    let tile_shape = Fft2Shape::new(TILE_DIM, TILE_DIM);
+    let start_level = values[0].level();
+
+    assert_eq!(
+        slot_count,
+        TILE_ELEMENTS * TILES_PER_CIPHERTEXT,
+        "packed 1K column engine requires eight complete 64x64 tiles per ciphertext"
+    );
+
+    for value in &values {
+        value.assert_matches_chain(chain);
+        assert_eq!(
+            value.level(),
+            start_level,
+            "packed 1K column-engine inputs must begin at the same CKKS level"
+        );
+        assert_eq!(
+            value.rlwe().degree(),
+            degree,
+            "packed 1K column-engine ciphertext degree must match embedding"
+        );
+    }
+
+    /*
+     * One inter-ciphertext global-column stage.
+     */
+    {
+        let level = values[0].level();
+        let global_span = TILES_PER_AXIS * TILE_DIM;
+
+        let mut column_twiddles = vec![Complex64::new(0.0, 0.0); slot_count];
+
+        for lane in 0..TILES_PER_CIPHERTEXT {
+            let lane_base = lane * TILE_ELEMENTS;
+
+            for local_row in 0..TILE_DIM {
+                let twiddle_index = lane * TILE_DIM + local_row;
+                let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+                let w = Complex64::new(angle.cos(), angle.sin());
+
+                for local_col in 0..TILE_DIM {
+                    let tile_slot = local_row * TILE_DIM + local_col;
+                    column_twiddles[lane_base + tile_slot] = w;
+                }
+            }
+        }
+
+        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+        let prepared_column_twiddles = PreparedComplexSlotsCp::new(
+            &values[0],
+            &column_twiddles,
+            embedding,
+            chain,
+            &stage_plan,
+        );
+
+        let stage_input = values;
+        let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
+            (0..CIPHERTEXT_COUNT).map(|_| None).collect();
+
+        let jobs = (0..TILES_PER_AXIS)
+            .map(|tile_col| (tile_col, TILES_PER_AXIS + tile_col))
+            .collect::<Vec<_>>();
+
+        for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
+            let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+
+                for &(upper_index, lower_index) in &jobs[batch_start..batch_end] {
+                    let a = &stage_input[upper_index];
+                    let b = &stage_input[lower_index];
+
+                    workers.push((
+                        upper_index,
+                        lower_index,
+                        scope.spawn(|| {
+                            packed_fft_dif_butterfly_cp_prepared(
+                                evaluator,
+                                a,
+                                b,
+                                &prepared_column_twiddles,
+                                chain,
+                                &prepared_plan,
+                            )
+                        }),
+                    ));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|(upper_index, lower_index, worker)| {
+                        let (upper, lower) = worker
+                            .join()
+                            .expect("packed 1K global-column worker panicked");
+
+                        (upper_index, lower_index, upper, lower)
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            for (upper_index, lower_index, upper, lower) in batch {
+                stage_output[upper_index] = Some(upper);
+                stage_output[lower_index] = Some(lower);
+            }
+        }
+
+        values = stage_output
+            .into_iter()
+            .map(|value| value.expect("packed 1K global-column output missing"))
+            .collect();
+    }
+
+    assert_eq!(
+        values[0].level(),
+        start_level + 1,
+        "packed 1K inter-CT column stage must consume one CKKS level"
+    );
+
+    /*
+     * Three intra-ciphertext tile-block column stages.
+     */
+    let mut span_tiles = 8usize;
+
+    while span_tiles >= 2 {
+        let level = values[0].level();
+
+        let diagonals = PackedTileDifStageDiagonals::new_column(
+            TILE_DIM,
+            TILE_DIM,
+            TILES_PER_CIPHERTEXT,
+            span_tiles,
+            FftDirection::Forward,
+        );
+
+        let rotation = diagonals.rotation();
+        let left_exponent = rotation_exponent_left(degree, rotation);
+        let right_exponent = rotation_exponent_right(degree, rotation);
+
+        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+
+        let state = values[0].state();
+
+        let prepared_left = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, left_exponent),
+            &stage_plan,
+        );
+
+        let prepared_right = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, right_exponent),
+            &stage_plan,
+        );
+
+        let stage_input = values;
+        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+
+                for input in stage_input.iter().take(batch_end).skip(batch_start) {
+                    workers.push(scope.spawn(|| {
+                        execute_packed_tile_dif_stage_cp_prepared(
+                            input,
+                            &diagonals,
+                            evaluator,
+                            (&prepared_left, &prepared_right),
+                            embedding,
+                            chain,
+                            &stage_plan,
+                        )
+                    }));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("packed 1K tile-block worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+
+            stage_output.extend(batch);
+        }
+
+        values = stage_output;
+        span_tiles /= 2;
+    }
+
+    assert_eq!(
+        values[0].level(),
+        start_level + 4,
+        "packed 1K global-column phase must consume four CKKS levels"
+    );
+
+    /*
+     * Six repeated packed local-column stages.
+     */
+    let mut span = TILE_DIM;
+
+    while span >= 2 {
+        let level = values[0].level();
+
+        let diagonals = PackedFft2DifStageDiagonals::new(
+            tile_shape,
+            PackedFft2Axis::Columns,
+            span,
+            FftDirection::Forward,
+        );
+
+        let rotation = diagonals.rotation();
+        let left_exponent = rotation_exponent_left(degree, rotation);
+        let right_exponent = rotation_exponent_right(degree, rotation);
+
+        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+
+        let state = values[0].state();
+
+        let prepared_left = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, left_exponent),
+            &stage_plan,
+        );
+
+        let prepared_right = PreparedRnsGaloisKey::new(
+            evaluator.keys().galois_for(state, right_exponent),
+            &stage_plan,
+        );
+
+        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+            &values[0],
+            &diagonals,
+            TILES_PER_CIPHERTEXT,
+            embedding,
+            chain,
+            &stage_plan,
+        );
+
+        let stage_input = values;
+        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
+
+            let batch = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+
+                for input in stage_input.iter().take(batch_end).skip(batch_start) {
+                    workers.push(scope.spawn(|| {
+                        execute_repeated_packed_fft2_dif_stage_cp_prepared(
+                            input,
+                            &prepared_fft_stage,
+                            evaluator,
+                            (&prepared_left, &prepared_right),
+                            chain,
+                            &stage_plan,
+                            &prepared_plan,
+                        )
+                    }));
+                }
+
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .expect("packed 1K local-column worker panicked")
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            stage_output.extend(batch);
+        }
+
+        values = stage_output;
+        span /= 2;
+    }
+
+    assert_eq!(
+        values[0].level(),
+        start_level + 10,
+        "packed 1K column phase must consume exactly ten CKKS levels"
+    );
+
+    values
 }
 
 /// Executes one radix-2 FFT butterfly over encrypted operands and a public
