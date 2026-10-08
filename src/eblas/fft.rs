@@ -11,9 +11,11 @@ use num_complex::Complex64;
 use std::f64::consts::PI;
 
 use crate::ckks::{
-    mod_switch_rns_ckks_to_next, rotate_left_rns_ckks_with_prepared_ntt,
+    mod_switch_rns_ckks_to_next, rotate_left_bounded_rns_ckks_with_prepared_execution,
+    rotate_left_rns_ckks_with_prepared_ntt, rotate_right_bounded_rns_ckks_with_prepared_execution,
     rotate_right_rns_ckks_with_prepared_ntt, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, PreparedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluator,
+    CkksCanonicalEmbedding, PreparedBoundedRnsGaloisKey, PreparedRnsGaloisKey, RnsCkksCiphertext,
+    RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
@@ -3031,6 +3033,120 @@ pub fn execute_packed_fft2_dif_stage_pp(
 /// This is execution-equivalent to [`execute_packed_fft2_dif_stage_cp`], but
 /// reuses both level-specific prepared Galois material and prepared public
 /// D0/D1/D2 operands when the stage is evaluated across multiple ciphertexts.
+/// Executes a repeated packed FFT2 DIF stage using Gaussian-noisy
+/// bounded Galois keys and reusable prepared NTT execution.
+///
+/// The public diagonal operands and butterfly semantics match
+/// the existing prepared FFT2 executor.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedBoundedRnsGaloisKey, &PreparedBoundedRnsGaloisKey),
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_galois_key, right_galois_key) = prepared_galois_keys;
+
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "prepared repeated packed FFT2 stage level must match ciphertext level"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "repeated packed FFT2 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "repeated packed FFT2 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = prepared_fft_stage.rotation();
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_bounded_rns_ckks_with_prepared_execution(
+                input,
+                rotation,
+                left_galois_key,
+                chain,
+                plan,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            rotate_right_bounded_rns_ckks_with_prepared_execution(
+                input,
+                rotation,
+                right_galois_key,
+                chain,
+                plan,
+                prepared_plan,
+            )
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_left,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_right,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        (
+            direct_worker
+                .join()
+                .expect("repeated packed FFT2 direct prepared CP worker panicked"),
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left prepared CP worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right prepared CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
     input: &RnsCkksCiphertext,
     prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
@@ -3952,6 +4068,633 @@ mod tests {
         }
 
         output
+    }
+
+    #[test]
+    fn r23_2b_fft2_bounded_encrypted_numerical() {
+        use crate::application_support::ckks::encode_rns;
+        use crate::ckks::{
+            research_profile_4096, rotation_exponent_left, rotation_exponent_right,
+            BoundedRnsGaloisKey, CkksChainState, RnsCkksEvaluationKeys,
+        };
+        use crate::grafting::{
+            decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+        };
+        use crate::ring::{
+            centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+        };
+        use crate::rlwe::ErrorDistribution;
+        use num_traits::ToPrimitive;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let profile = research_profile_4096();
+        let degree = profile.degree();
+        let scale = profile.initial_scale();
+        let chain = profile.modulus_chain();
+        let basis = chain.top().clone();
+
+        let embedding = CkksCanonicalEmbedding::new(degree);
+        let slot_count = embedding.slot_count();
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
+
+        let shape = Fft2Shape::new(2, 2);
+        let input_tile = [
+            Complex64::new(0.125, 0.0625),
+            Complex64::new(0.25, -0.125),
+            Complex64::new(0.375, 0.1875),
+            Complex64::new(0.5, -0.25),
+        ];
+
+        let input: Vec<Complex64> = (0..slot_count)
+            .map(|index| input_tile[index % input_tile.len()])
+            .collect();
+
+        let plaintext = encode_rns(&input, &embedding, &basis, scale);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 0,
+            })
+            .collect();
+
+        let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x232B_0201);
+
+        let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &plan,
+            &mut encryption_rng,
+        );
+
+        let ciphertext = RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let evaluation_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+        for axis in [PackedFft2Axis::Rows, PackedFft2Axis::Columns] {
+            let diagonals = PackedFft2DifStageDiagonals::new(shape, axis, 2, FftDirection::Forward);
+
+            let rotation = diagonals.rotation();
+
+            let mut key_rng = ChaCha20Rng::seed_from_u64(0x232B_0202 + rotation as u64);
+
+            let make_key = |exponent, rng: &mut ChaCha20Rng| {
+                use crate::grafting::{BoundedGadgetLayout, BoundedRnsKeygenConfig};
+
+                BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: BoundedGadgetLayout::new(basis.clone(), 8),
+                        plan: &plan,
+                    },
+                    &secret,
+                    exponent,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    rng,
+                )
+            };
+
+            let left_key = make_key(rotation_exponent_left(degree, rotation), &mut key_rng);
+            let right_key = make_key(rotation_exponent_right(degree, rotation), &mut key_rng);
+
+            let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &plan);
+            let prepared_right = PreparedBoundedRnsGaloisKey::new(&right_key, &plan);
+
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &ciphertext,
+                &diagonals,
+                slot_count / shape.elements(),
+                &embedding,
+                &chain,
+                &plan,
+            );
+
+            let encrypted_result = execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
+                &ciphertext,
+                &prepared_fft_stage,
+                &evaluator,
+                (&prepared_left, &prepared_right),
+                &chain,
+                &plan,
+                &prepared_plan,
+            );
+
+            let result_plan = RnsNttPlan::new(encrypted_result.basis().moduli().to_vec(), degree);
+
+            let decrypted =
+                decrypt_rns_raw_with_ntt(encrypted_result.rlwe(), &secret, &result_plan);
+
+            let modulus = composite_modulus_big(decrypted.basis());
+
+            let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+                .into_iter()
+                .map(|value| {
+                    centered_representative_big(&value, &modulus)
+                        .to_f64()
+                        .expect("CKKS coefficient must fit f64")
+                        / encrypted_result.scale()
+                })
+                .collect();
+
+            let actual = embedding.coefficients_to_slots(&coefficients);
+
+            let expected: Vec<Complex64> = (0..slot_count)
+                .map(|index| {
+                    let tile_index = index % 4;
+                    let base = index - tile_index;
+
+                    match (axis, tile_index) {
+                        (PackedFft2Axis::Rows, 0) => input[base] + input[base + 1],
+                        (PackedFft2Axis::Rows, 1) => input[base] - input[base + 1],
+                        (PackedFft2Axis::Rows, 2) => input[base + 2] + input[base + 3],
+                        (PackedFft2Axis::Rows, _) => input[base + 2] - input[base + 3],
+
+                        (PackedFft2Axis::Columns, 0) => input[base] + input[base + 2],
+                        (PackedFft2Axis::Columns, 1) => input[base + 1] + input[base + 3],
+                        (PackedFft2Axis::Columns, 2) => input[base] - input[base + 2],
+                        (PackedFft2Axis::Columns, _) => input[base + 1] - input[base + 3],
+                    }
+                })
+                .collect();
+
+            let mut max_abs = 0.0_f64;
+            let mut squared_error = 0.0_f64;
+            let mut squared_reference = 0.0_f64;
+
+            for (a, e) in actual.iter().zip(&expected) {
+                let error = (*a - *e).norm();
+                max_abs = max_abs.max(error);
+                squared_error += error * error;
+                squared_reference += e.norm_sqr();
+            }
+
+            let rel_l2 = (squared_error / squared_reference).sqrt();
+
+            println!(
+                "R23_2B_FFT2_ENCRYPTED_METRICS axis={axis:?} \
+                 rotation={rotation} max_abs={max_abs:.9e} \
+                 rel_l2={rel_l2:.9e} level={} scale={:.9e}",
+                encrypted_result.level(),
+                encrypted_result.scale(),
+            );
+
+            assert_eq!(
+                encrypted_result.level(),
+                ciphertext.level() + 1,
+                "FFT2 prepared CP stage must consume exactly one CKKS level",
+            );
+
+            assert!(encrypted_result.scale().is_finite());
+            assert!(encrypted_result.scale() > 0.0);
+
+            assert!(
+                max_abs < 5.0e-3 && rel_l2 < 5.0e-3,
+                "bounded encrypted FFT2 numerical error on {axis:?}",
+            );
+
+            println!("R23_2B_FFT2_ENCRYPTED_AXIS={axis:?} PASS");
+        }
+
+        println!("R23_2B_FFT2_ENCRYPTED=PASS");
+    }
+
+    #[test]
+    fn r23_3a_bounded_encrypted_fft2_composition() {
+        use crate::application_support::ckks::encode_rns;
+        use crate::ckks::{
+            rotation_exponent_left, rotation_exponent_right, BoundedRnsGaloisKey, CkksChainState,
+            CkksParameterClass, CkksParameterProfile, RnsCkksEvaluationKeys,
+        };
+        use crate::grafting::{
+            decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+        };
+        use crate::ring::{
+            centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+        };
+        use crate::rlwe::ErrorDistribution;
+        use num_traits::ToPrimitive;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        // R23.3A.5: retain a 50-bit final modulus after two
+        // approximately 35-bit CKKS rescaling operations.
+        // Research-only configuration; no security claim.
+        let profile = CkksParameterProfile::new(
+            "research-4096-fft2",
+            4096,
+            &[0x3ffffffdf0001, 0x7fffba001, 0x7fffb0001],
+            2.0_f64.powi(35),
+            CkksParameterClass::Research,
+            None,
+        );
+        let degree = profile.degree();
+        let scale = profile.initial_scale();
+        let chain = profile.modulus_chain();
+        let basis = chain.top().clone();
+
+        let embedding = CkksCanonicalEmbedding::new(degree);
+        let slot_count = embedding.slot_count();
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let shape = Fft2Shape::new(2, 2);
+        let input_tile = [
+            Complex64::new(0.125, 0.0625),
+            Complex64::new(0.25, -0.125),
+            Complex64::new(0.375, 0.1875),
+            Complex64::new(0.5, -0.25),
+        ];
+
+        let input: Vec<Complex64> = (0..slot_count)
+            .map(|index| input_tile[index % input_tile.len()])
+            .collect();
+
+        let plaintext = encode_rns(&input, &embedding, &basis, scale);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 0,
+            })
+            .collect();
+
+        let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x232B_0201);
+
+        let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &plan,
+            &mut encryption_rng,
+        );
+
+        let ciphertext = RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let evaluation_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+        assert!(
+            chain.len() >= 3,
+            "two FFT stages require at least three CKKS chain levels"
+        );
+
+        let mut current = ciphertext;
+
+        for (stage_index, axis) in [PackedFft2Axis::Rows, PackedFft2Axis::Columns]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(current.level(), stage_index);
+
+            let stage_basis = current.basis().clone();
+            let stage_plan = RnsNttPlan::new(stage_basis.moduli().to_vec(), degree);
+            let stage_prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+            let diagonals = PackedFft2DifStageDiagonals::new(shape, axis, 2, FftDirection::Forward);
+
+            let rotation = diagonals.rotation();
+
+            let mut key_rng = ChaCha20Rng::seed_from_u64(0x233A_0001 + stage_index as u64);
+
+            use crate::grafting::{BoundedGadgetLayout, BoundedRnsKeygenConfig};
+
+            let make_key = |exponent, rng: &mut ChaCha20Rng| {
+                BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: BoundedGadgetLayout::new(stage_basis.clone(), 8),
+                        plan: &stage_plan,
+                    },
+                    &secret,
+                    exponent,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    rng,
+                )
+            };
+
+            let left_key = make_key(rotation_exponent_left(degree, rotation), &mut key_rng);
+            let right_key = make_key(rotation_exponent_right(degree, rotation), &mut key_rng);
+
+            let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &stage_plan);
+            let prepared_right = PreparedBoundedRnsGaloisKey::new(&right_key, &stage_plan);
+
+            if stage_index == 1 {
+                let rotated_left = rotate_left_bounded_rns_ckks_with_prepared_execution(
+                    &current,
+                    rotation,
+                    &prepared_left,
+                    &chain,
+                    &stage_plan,
+                    &stage_prepared_plan,
+                );
+
+                let rotated_right = rotate_right_bounded_rns_ckks_with_prepared_execution(
+                    &current,
+                    rotation,
+                    &prepared_right,
+                    &chain,
+                    &stage_plan,
+                    &stage_prepared_plan,
+                );
+
+                for (label, rotated, left) in [
+                    ("LEFT", &rotated_left, true),
+                    ("RIGHT", &rotated_right, false),
+                ] {
+                    let plaintext = decrypt_rns_raw_with_ntt(rotated.rlwe(), &secret, &stage_plan);
+
+                    let modulus = composite_modulus_big(plaintext.basis());
+
+                    let coefficients: Vec<f64> = reconstruct_coefficients_big(&plaintext)
+                        .into_iter()
+                        .map(|value| {
+                            centered_representative_big(&value, &modulus)
+                                .to_f64()
+                                .expect("coefficient must fit f64")
+                                / rotated.scale()
+                        })
+                        .collect();
+
+                    let slots = embedding.coefficients_to_slots(&coefficients);
+
+                    let mut max_abs = 0.0_f64;
+
+                    for (index, actual_slot) in slots.iter().enumerate() {
+                        let source_index = if left {
+                            (index + rotation) % slot_count
+                        } else {
+                            (index + slot_count - rotation) % slot_count
+                        };
+
+                        let tile = source_index % 4;
+                        let base = source_index - tile;
+
+                        let expected = match tile {
+                            0 => input[base] + input[base + 1],
+                            1 => input[base] - input[base + 1],
+                            2 => input[base + 2] + input[base + 3],
+                            _ => input[base + 2] - input[base + 3],
+                        };
+
+                        max_abs = max_abs.max((*actual_slot - expected).norm());
+                    }
+
+                    println!(
+                        "R23_3A_LEVEL1_ROTATION direction={label} \
+                         rotation={rotation} max_abs={max_abs:.9e}"
+                    );
+                }
+            }
+
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &current,
+                &diagonals,
+                slot_count / shape.elements(),
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
+            let next = execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
+                &current,
+                &prepared_fft_stage,
+                &evaluator,
+                (&prepared_left, &prepared_right),
+                &chain,
+                &stage_plan,
+                &stage_prepared_plan,
+            );
+
+            assert_eq!(
+                next.level(),
+                current.level() + 1,
+                "each FFT2 stage must consume exactly one CKKS level"
+            );
+            assert!(next.scale().is_finite());
+            assert!(next.scale() > 0.0);
+
+            println!(
+                "R23_3A_STAGE={} axis={axis:?} rotation={} \
+                 input_level={} output_level={} scale={:.9e} PASS",
+                stage_index + 1,
+                rotation,
+                current.level(),
+                next.level(),
+                next.scale(),
+            );
+
+            // Diagnostic decryption only; the next stage still
+            // consumes the encrypted ciphertext directly.
+            let diagnostic_plan = RnsNttPlan::new(next.basis().moduli().to_vec(), degree);
+
+            let diagnostic_plaintext =
+                decrypt_rns_raw_with_ntt(next.rlwe(), &secret, &diagnostic_plan);
+
+            let diagnostic_modulus = composite_modulus_big(diagnostic_plaintext.basis());
+
+            let diagnostic_coefficients: Vec<f64> =
+                reconstruct_coefficients_big(&diagnostic_plaintext)
+                    .into_iter()
+                    .map(|value| {
+                        centered_representative_big(&value, &diagnostic_modulus)
+                            .to_f64()
+                            .expect("diagnostic coefficient must fit f64")
+                            / next.scale()
+                    })
+                    .collect();
+
+            let diagnostic_slots = embedding.coefficients_to_slots(&diagnostic_coefficients);
+
+            let diagnostic_reference: Vec<Complex64> = (0..slot_count)
+                .map(|index| {
+                    let tile = index % 4;
+                    let base = index - tile;
+
+                    if stage_index == 0 {
+                        match tile {
+                            0 => input[base] + input[base + 1],
+                            1 => input[base] - input[base + 1],
+                            2 => input[base + 2] + input[base + 3],
+                            _ => input[base + 2] - input[base + 3],
+                        }
+                    } else {
+                        // Full 2x2 FFT reference.
+                        let reference = fft2_pp(shape, FftDirection::Forward, &input_tile);
+                        reference[tile]
+                    }
+                })
+                .collect();
+
+            let mut diagnostic_max_abs = 0.0_f64;
+            let mut diagnostic_error_sq = 0.0_f64;
+            let mut diagnostic_ref_sq = 0.0_f64;
+
+            for (actual, expected) in diagnostic_slots.iter().zip(&diagnostic_reference) {
+                let error = (*actual - *expected).norm();
+                diagnostic_max_abs = diagnostic_max_abs.max(error);
+                diagnostic_error_sq += error * error;
+                diagnostic_ref_sq += expected.norm_sqr();
+            }
+
+            let diagnostic_rel_l2 = (diagnostic_error_sq / diagnostic_ref_sq).sqrt();
+
+            println!(
+                "R23_3A_STAGE_NUMERICS stage={} axis={axis:?}                  level={} max_abs={diagnostic_max_abs:.9e}                  rel_l2={diagnostic_rel_l2:.9e}",
+                stage_index + 1,
+                next.level(),
+            );
+
+            current = next;
+        }
+
+        let result_plan = RnsNttPlan::new(current.basis().moduli().to_vec(), degree);
+
+        let decrypted = decrypt_rns_raw_with_ntt(current.rlwe(), &secret, &result_plan);
+
+        let modulus = composite_modulus_big(decrypted.basis());
+
+        let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+            .into_iter()
+            .map(|value| {
+                centered_representative_big(&value, &modulus)
+                    .to_f64()
+                    .expect("CKKS coefficient must fit f64")
+                    / current.scale()
+            })
+            .collect();
+
+        let actual = embedding.coefficients_to_slots(&coefficients);
+
+        // A 2x2 DIF FFT has no nontrivial bit-reversal permutation.
+        let reference = fft2_pp(shape, FftDirection::Forward, &input_tile);
+
+        let expected: Vec<Complex64> = (0..slot_count)
+            .map(|i| reference[i % reference.len()])
+            .collect();
+
+        let mut max_abs = 0.0_f64;
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+
+        for (a, e) in actual.iter().zip(&expected) {
+            let error = (*a - *e).norm();
+            max_abs = max_abs.max(error);
+            squared_error += error * error;
+            squared_reference += e.norm_sqr();
+        }
+
+        let rel_l2 = (squared_error / squared_reference).sqrt();
+
+        // Diagnostic only: inspect the first complete FFT2 tile.
+        // Do not modify the numerical acceptance criteria.
+        for index in 0..4 {
+            println!(
+                "R23_3A_SLOT={} actual_re={:.9e} actual_im={:.9e} expected_re={:.9e} expected_im={:.9e} abs_error={:.9e}",
+                index,
+                actual[index].re,
+                actual[index].im,
+                expected[index].re,
+                expected[index].im,
+                (actual[index] - expected[index]).norm(),
+            );
+        }
+
+        let alternate = [expected[0], expected[2], expected[1], expected[3]];
+
+        let alternate_max_abs = (0..4)
+            .map(|i| (actual[i] - alternate[i]).norm())
+            .fold(0.0_f64, f64::max);
+
+        println!("R23_3A_ORDER_DIAGNOSTIC alternate_max_abs={alternate_max_abs:.9e}");
+
+        println!(
+            "R23_3A_FFT2_METRICS max_abs={max_abs:.9e} \
+             rel_l2={rel_l2:.9e} final_level={} scale={:.9e}",
+            current.level(),
+            current.scale(),
+        );
+
+        assert_eq!(current.level(), 2);
+        assert!(max_abs.is_finite());
+        assert!(rel_l2.is_finite());
+
+        // Initial engineering tolerance; report measured error before
+        // changing it if the composed computation exceeds this bound.
+        assert!(
+            max_abs < 5.0e-3 && rel_l2 < 5.0e-3,
+            "composed bounded encrypted FFT2 numerical error exceeds tolerance"
+        );
+
+        println!("R23_3A_BOUNDED_ENCRYPTED_FFT2=PASS");
+    }
+
+    #[test]
+    fn r23_2b_fft2_diagonal_rotation_algebra() {
+        let shape = Fft2Shape::new(2, 2);
+        let input = [
+            Complex64::new(1.0, 0.25),
+            Complex64::new(2.0, -0.5),
+            Complex64::new(3.0, 0.75),
+            Complex64::new(4.0, -1.0),
+        ];
+
+        for axis in [PackedFft2Axis::Rows, PackedFft2Axis::Columns] {
+            let diagonals = PackedFft2DifStageDiagonals::new(shape, axis, 2, FftDirection::Forward);
+
+            let rotation = diagonals.rotation();
+            let n = input.len();
+
+            let actual: Vec<Complex64> = (0..n)
+                .map(|i| {
+                    diagonals.direct()[i] * input[i]
+                        + diagonals.rotate_left()[i] * input[(i + rotation) % n]
+                        + diagonals.rotate_right()[i] * input[(i + n - rotation) % n]
+                })
+                .collect();
+
+            let expected = match axis {
+                PackedFft2Axis::Rows => vec![
+                    input[0] + input[1],
+                    input[0] - input[1],
+                    input[2] + input[3],
+                    input[2] - input[3],
+                ],
+                PackedFft2Axis::Columns => vec![
+                    input[0] + input[2],
+                    input[1] + input[3],
+                    input[0] - input[2],
+                    input[1] - input[3],
+                ],
+            };
+
+            let max_abs = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (*a - *b).norm())
+                .fold(0.0_f64, f64::max);
+
+            assert!(
+                max_abs < 1.0e-12,
+                "FFT2 diagonal algebra mismatch: axis={axis:?}, error={max_abs}"
+            );
+
+            println!(
+                "R23_2B_FFT2_DIAGONAL axis={axis:?} rotation={rotation} max_abs={max_abs:.3e} PASS"
+            );
+        }
+
+        println!("R23_2B_FFT2_DIAGONAL_STATUS=PASS");
     }
 
     #[test]

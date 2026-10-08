@@ -22,7 +22,11 @@ impl BoundedGadgetLayout {
         );
 
         let modulus_bits = composite_modulus_big(&full_basis).bits();
-        let digit_count = modulus_bits.div_ceil(u64::from(base_log)) as usize;
+
+        // Balanced radix-2^base_log digits have a signed leading
+        // digit. Reserve one additional bit of representation
+        // capacity to cover the full centered modulus interval.
+        let digit_count = (modulus_bits + 1).div_ceil(u64::from(base_log)) as usize;
 
         Self {
             full_basis,
@@ -413,7 +417,7 @@ mod wide_modulus_tests {
         let polynomial = rns_from_big_coefficients(basis.moduli().to_vec(), &coefficients);
 
         let layout = BoundedGadgetLayout::new(basis.clone(), 20);
-        assert_eq!(layout.digit_count(), 10);
+        assert_eq!(layout.digit_count(), 11);
 
         let decomposition = layout.decompose(&polynomial);
 
