@@ -1,6 +1,8 @@
 use super::parameters::{CkksErrorDistribution, CkksSecretDistribution};
 use super::CkksParameterProfile;
 use crate::grafting::BoundedGadgetLayout;
+use crate::ring::composite_modulus_big;
+use num_bigint::BigUint;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CkksSecurityExposure {
@@ -9,7 +11,7 @@ pub struct CkksSecurityExposure {
     slot_count: usize,
     level: usize,
     modulus_values: Vec<u64>,
-    composite_modulus: u128,
+    composite_modulus: BigUint,
     composite_modulus_bits: u32,
     secret_distribution: CkksSecretDistribution,
     error_distribution: CkksErrorDistribution,
@@ -39,8 +41,9 @@ impl CkksSecurityExposure {
         let basis = chain.level(level).clone();
         let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
 
-        let composite_modulus = basis.composite_modulus();
-        let composite_modulus_bits = u128::BITS - composite_modulus.leading_zeros();
+        let composite_modulus = composite_modulus_big(&basis);
+        let composite_modulus_bits = u32::try_from(composite_modulus.bits())
+            .expect("CKKS composite modulus bit length exceeds u32");
 
         let digit_count = layout.digit_count();
 
@@ -90,8 +93,8 @@ impl CkksSecurityExposure {
         &self.modulus_values
     }
 
-    pub fn composite_modulus(&self) -> u128 {
-        self.composite_modulus
+    pub fn composite_modulus(&self) -> &BigUint {
+        &self.composite_modulus
     }
 
     pub fn composite_modulus_bits(&self) -> u32 {
@@ -209,6 +212,49 @@ mod tests {
         assert_eq!(exposure.multiplication_key_rlwe_samples(), 6);
         assert_eq!(exposure.multiplication_key_logical_bytes(), 1_179_648);
         assert!(!exposure.auxiliary_modulus_present());
+    }
+
+    #[test]
+    fn seven_prime_fft2_security_exposure_supports_wide_modulus() {
+        use crate::ckks::{CkksParameterClass, CkksParameterProfile};
+
+        let profile = CkksParameterProfile::new(
+            "research-4096-fft2-six-stage",
+            4096,
+            &[
+                0x3ffffffdf0001,
+                0x7fffba001,
+                0x7fffb0001,
+                0x7ffff6001,
+                0x7fffa4001,
+                0x7fff80001,
+                0x7fff7e001,
+            ],
+            2.0_f64.powi(35),
+            CkksParameterClass::Research,
+            None,
+        );
+
+        let exposure = CkksSecurityExposure::bounded_reference(
+            &profile,
+            0,
+            8,
+            CkksSecretDistribution::UniformTernary,
+            CkksErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+        );
+
+        assert_eq!(exposure.modulus_values(), profile.modulus_values());
+        assert!(exposure.composite_modulus_bits() > 128);
+        assert_eq!(
+            exposure.composite_modulus().bits(),
+            u64::from(exposure.composite_modulus_bits())
+        );
+        assert!(!profile.security_bearing());
+
+        let report = exposure.to_report_string();
+        assert!(report.contains("RNS_LIMBS=7"));
+        assert!(report.contains("PROFILE=research-4096-fft2-six-stage"));
+        assert!(report.contains("AUXILIARY_MODULUS_PRESENT=false"));
     }
 
     #[test]
