@@ -1,0 +1,128 @@
+{
+  "schema_version": "1.0",
+  "project": "FHE-rs",
+  "repository": "ccmm-rs",
+  "milestone": "R16.5.18",
+  "experiment": "hybrid UHD selected-spectrum FFT2",
+  "validation": {
+    "commit": "82ef7beb224980b815ba58fd35fe379c5abc8156",
+    "tag": "r16.5.18-hybrid-uhd-fft2",
+    "status": "PASS",
+    "full_numerical_rerun_performed": false
+  },
+  "reproducibility": {
+    "commit": "ccae7788c17e6ca930d93938a1964ea6562ab948",
+    "tag": "r16.5.18-reproducible",
+    "isolated_release_test_compilation": "PASS",
+    "isolated_format_check": "PASS",
+    "isolated_library_clippy": "PASS"
+  },
+  "hardware": {
+    "processor": "Apple M4",
+    "model_identifier": "Mac16,1",
+    "physical_cpu_cores": 10,
+    "logical_cpu_cores": 10,
+    "memory_bytes": 25769803776,
+    "operating_system": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.89.0 (29483883e 2025-08-04)",
+    "cargo": "cargo 1.89.0 (c24e10642 2025-06-23)",
+    "target": "aarch64-apple-darwin"
+  },
+  "configuration": {
+    "image_width": 3840,
+    "image_height": 2160,
+    "selected_spectral_bins": 4096,
+    "ckks_polynomial_degree": 32768,
+    "horizontal_ciphertexts": 135,
+    "horizontal_handoff_level": 7,
+    "final_ckks_level": 13,
+    "intermediate_decryptions": 0,
+    "horizontal_tile_group_execution": "serial"
+  },
+  "reported_results": {
+    "relative_l2_error": 8.734300537894e-06,
+    "maximum_absolute_error": 4.474216955315e-07,
+    "total_runtime_seconds": 42802.938
+  },
+  "raw_measurements": {
+    "validation_log": {
+      "R16_5_18I9_EXTRACTION_KEYGEN_MS": 32720.216,
+      "R16_5_18I9_EXTRACTION_KEY_TYPE": "HYBRID_QP",
+      "R16_5_18I3_HYBRID_KEYGEN_MS": 435418.519,
+      "R16_16C_SHARED_HORIZONTAL_KEYGEN_MS": 468141.374,
+      "R16_5_18I3_EXTRACTION_FFT15_MS": 114132.076,
+      "R16_5_18I3_HYBRID_FFT256_STAGE_1_MS": 59592.696,
+      "R16_5_18I3_HYBRID_FFT256_STAGE_2_MS": 51218.766,
+      "R16_5_18I3_HYBRID_FFT256_STAGE_3_MS": 43742.651,
+      "R16_5_18I3_HYBRID_FFT256_STAGE_4_MS": 36887.278,
+      "R16_16C_HORIZONTAL_TILE_ROWS_DONE": 135,
+      "R16_5_18I11_HORIZONTAL_HANDOFF_STATUS": "PASS",
+      "R16_5_18I11_HORIZONTAL_CIPHERTEXTS": 135,
+      "R16_5_18I11_HORIZONTAL_HANDOFF_LEVEL": 7,
+      "R16_16C_HORIZONTAL_HANDOFF_LEVEL": 7,
+      "R16_16C_HORIZONTAL_CIPHERTEXTS": 135,
+      "R16_16C_FFT135_STAGE_1_LEVEL": 8,
+      "R16_16C_FFT135_STAGE_1_MS": 62716.588,
+      "R16_16C_FFT135_STAGE_2_LEVEL": 9,
+      "R16_16C_FFT135_STAGE_2_MS": 25482.017,
+      "R16_16C_FFT135_STAGE_3_LEVEL": 10,
+      "R16_16C_FFT135_STAGE_3_MS": 21252.074,
+      "R16_16C_FFT135_STAGE_4_LEVEL": 11,
+      "R16_16C_FFT135_STAGE_4_MS": 13764.402,
+      "R16_16C_VERTICAL_CROSS_FREQUENCY": 0,
+      "R16_16C_FFT16_STAGE_1_MS": 38367.085,
+      "R16_16C_FFT16_STAGE_2_MS": 24885.683,
+      "R16_5_18I11_FINAL_LEVEL": 13,
+      "R16_16C_UHD_ROWS": 2160,
+      "R16_16C_UHD_COLUMNS": 3840,
+      "R16_16C_HORIZONTAL_BRANCH": 7,
+      "R16_16C_OUTPUT_BINS": 4096,
+      "R16_16C_FINAL_LEVEL": 13,
+      "R16_16C_INTERMEDIATE_DECRYPTIONS": 0,
+      "R16_5_18I11_REL_L2": 8.734300537894e-06,
+      "R16_5_18I11_MAX_ABS": 4.474216955315e-07,
+      "R16_5_18I11_TOTAL_MS": 42802938.258,
+      "R16_5_18I11_STATUS": "PASS"
+    },
+    "benchmark_record": {
+      "R16_5_18I9_EXTRACTION_KEYGEN_MS": 32720.216,
+      "R16_5_18I3_HYBRID_KEYGEN_MS": 435418.519,
+      "R16_16C_SHARED_HORIZONTAL_KEYGEN_MS": 468141.374,
+      "R16_5_18I11_HORIZONTAL_HANDOFF_STATUS": "PASS",
+      "R16_5_18I11_HORIZONTAL_CIPHERTEXTS": 135,
+      "R16_5_18I11_HORIZONTAL_HANDOFF_LEVEL": 7,
+      "R16_16C_FFT135_STAGE_1_LEVEL": 8,
+      "R16_16C_FFT135_STAGE_1_MS": 62716.588,
+      "R16_16C_FFT135_STAGE_2_LEVEL": 9,
+      "R16_16C_FFT135_STAGE_2_MS": 25482.017,
+      "R16_16C_FFT135_STAGE_3_LEVEL": 10,
+      "R16_16C_FFT135_STAGE_3_MS": 21252.074,
+      "R16_16C_FFT135_STAGE_4_LEVEL": 11,
+      "R16_16C_FFT135_STAGE_4_MS": 13764.402,
+      "R16_16C_FFT16_STAGE_1_MS": 38367.085,
+      "R16_16C_FFT16_STAGE_2_MS": 24885.683,
+      "R16_5_18I11_FINAL_LEVEL": 13,
+      "R16_16C_UHD_ROWS": 2160,
+      "R16_16C_UHD_COLUMNS": 3840,
+      "R16_16C_OUTPUT_BINS": 4096,
+      "R16_16C_INTERMEDIATE_DECRYPTIONS": 0,
+      "R16_5_18I11_REL_L2": 8.734300537894e-06,
+      "R16_5_18I11_MAX_ABS": 4.474216955315e-07,
+      "R16_5_18I11_TOTAL_MS": 42802938.258,
+      "R16_5_18I11_STATUS": "PASS"
+    }
+  },
+  "evidence": {
+    "validation_log": "/tmp/r16_5_18i11_hybrid_uhd_fft2.log",
+    "benchmark_record": "benchmarks/results/r16_5_18i11_hybrid_uhd_fft2.md"
+  },
+  "limitations": [
+    "Research-only CKKS parameter configuration.",
+    "Cryptographic security strength not independently validated.",
+    "Peak memory consumption not established.",
+    "No second full UHD numerical execution was performed.",
+    "Some separately recorded timing measurements may overlap."
+  ]
+}
