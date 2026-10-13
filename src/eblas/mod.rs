@@ -13,6 +13,7 @@
 pub mod backend_policy;
 pub mod correlation;
 pub mod fft;
+pub mod mixed_radix_ckks;
 
 pub mod batched_gemm;
 

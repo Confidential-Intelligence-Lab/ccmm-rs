@@ -30,15 +30,18 @@ pub use prime_resurrection::PrimeSproutKeySwitchPlan;
 pub mod prime_resurrection;
 pub use rns_key_switch::{
     decrypt_rns_quadratic_raw, decrypt_rns_raw, decrypt_rns_raw_with_ntt,
-    encrypt_rns_raw_with_distribution_ntt_rng, encrypt_rns_raw_with_ntt_rng,
-    rns_key_switch_with_ntt, rns_key_switch_with_prepared_dynamic_ntt_profiled,
+    encrypt_rns_raw_prepared_with_cached_secret_ntt_profiled_rng,
+    encrypt_rns_raw_prepared_with_cached_secret_ntt_rng,
+    encrypt_rns_raw_prepared_with_distribution_ntt_rng, encrypt_rns_raw_with_distribution_ntt_rng,
+    encrypt_rns_raw_with_ntt_rng, rns_key_switch_with_ntt,
+    rns_key_switch_with_prepared_dynamic_ntt_profiled,
     rns_key_switch_with_prepared_dynamic_ntt_resident, rns_key_switch_with_prepared_ntt,
     rns_key_switch_with_prepared_ntt_profiled, rns_relinearize, rns_relinearize_with_ntt,
     rns_relinearize_with_prepared_dynamic_ntt, rns_relinearize_with_prepared_ntt,
-    rns_tensor_with_ntt, ternary_secret_coefficients, PreparedRnsKeySwitchEntry,
-    PreparedRnsKeySwitchKey, PreparedRnsMultiplicationKey, PreparedRnsMultiplicationKeyEntry,
-    RnsKeySwitchKey, RnsKeygenConfig, RnsMultiplicationKey, RnsNttRlweCiphertext,
-    RnsPreparedKeySwitchProfile, RnsQuadraticCiphertext, RnsRlweCiphertext,
+    rns_tensor_with_ntt, ternary_secret_coefficients, PreparedRlweEncryptionProfile,
+    PreparedRnsKeySwitchEntry, PreparedRnsKeySwitchKey, PreparedRnsMultiplicationKey,
+    PreparedRnsMultiplicationKeyEntry, RnsKeySwitchKey, RnsKeygenConfig, RnsMultiplicationKey,
+    RnsNttRlweCiphertext, RnsPreparedKeySwitchProfile, RnsQuadraticCiphertext, RnsRlweCiphertext,
 };
 pub mod rns_key_switch;
 pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};

@@ -43,6 +43,9 @@ pub use basis_transition::{drop_basis_prefix, extend_basis_prefix};
 #[cfg(test)]
 mod basis_differential;
 
+pub mod auxiliary_modulus;
+pub use auxiliary_modulus::{auxiliary_mod_down_reference, auxiliary_mod_down_rns_candidate};
+
 pub mod wide_crt;
 
 pub use wide_crt::{

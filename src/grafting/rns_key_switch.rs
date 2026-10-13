@@ -318,6 +318,199 @@ where
     RnsRlweCiphertext::from_limbs(limbs)
 }
 
+/// Encrypts an RNS message directly into prepared NTT-domain RLWE limbs.
+///
+/// Each output limb contains `(b_ntt, a_ntt)`.
+///
+/// The RNG consumption order matches
+/// `encrypt_rns_raw_with_distribution_ntt_rng`: one logical error
+/// polynomial followed by one uniform `a` polynomial per RNS limb.
+pub fn encrypt_rns_raw_prepared_with_distribution_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+) -> Vec<(NttPolynomial, NttPolynomial)>
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(secret_coefficients.len(), message.degree());
+    assert_eq!(plan.degree(), message.degree());
+    assert_eq!(plan.moduli(), message.moduli());
+    assert!(secret_coefficients
+        .iter()
+        .all(|&value| matches!(value, -1..=1)));
+
+    distribution.validate();
+
+    let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+
+    message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            let _params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
+
+            let q = modulus.value();
+            let limb_plan = plan.plan(index);
+
+            let secret = project_secret(modulus, secret_coefficients);
+
+            let a = Polynomial::new(
+                modulus,
+                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+            );
+
+            let error = project_error(modulus, &logical_error);
+
+            let a_ntt = NttPolynomial::from_polynomial(limb_plan, &a);
+            let s_ntt = NttPolynomial::from_polynomial(limb_plan, secret.polynomial());
+
+            let product_ntt = a_ntt.pointwise_mul(&s_ntt);
+
+            let message_plus_error = message.residue(index).add(&error);
+
+            let message_ntt = NttPolynomial::from_polynomial(limb_plan, &message_plus_error);
+
+            let b_values = message_ntt
+                .values()
+                .iter()
+                .zip(product_ntt.values())
+                .map(|(&lhs, &rhs)| modulus.sub(lhs, rhs))
+                .collect();
+
+            let b_ntt = NttPolynomial::from_values(limb_plan, b_values);
+
+            (b_ntt, a_ntt)
+        })
+        .collect()
+}
+
+/// Encrypt directly into the NTT domain using a precomputed secret NTT.
+///
+/// The caller must construct `secret_ntt` from the same secret, degree,
+/// modulus ordering, and NTT plans used for this encryption.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedRlweEncryptionProfile {
+    pub error_sampling_ns: u128,
+    pub uniform_sampling_ns: u128,
+    pub random_ntt_ns: u128,
+    pub message_ntt_ns: u128,
+    pub rlwe_arithmetic_ns: u128,
+    pub total_ns: u128,
+}
+
+pub fn encrypt_rns_raw_prepared_with_cached_secret_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_ntt: &[NttPolynomial],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+) -> Vec<(NttPolynomial, NttPolynomial)>
+where
+    R: RngCore + CryptoRng,
+{
+    encrypt_rns_raw_prepared_with_cached_secret_ntt_profiled_rng(
+        message,
+        plaintext_modulus,
+        distribution,
+        secret_ntt,
+        plan,
+        rng,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_rns_raw_prepared_with_cached_secret_ntt_profiled_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_ntt: &[NttPolynomial],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+    mut profile: Option<&mut PreparedRlweEncryptionProfile>,
+) -> Vec<(NttPolynomial, NttPolynomial)>
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(plan.degree(), message.degree());
+    assert_eq!(plan.moduli(), message.moduli());
+    assert_eq!(secret_ntt.len(), message.moduli().len());
+
+    distribution.validate();
+
+    let total_start = profile.as_ref().map(|_| std::time::Instant::now());
+
+    let start = profile.as_ref().map(|_| std::time::Instant::now());
+    let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+    if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
+        p.error_sampling_ns += start.elapsed().as_nanos();
+    }
+
+    let result = message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            let _params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
+
+            let q = modulus.value();
+            let limb_plan = plan.plan(index);
+
+            let start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a = Polynomial::new(
+                modulus,
+                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+            );
+            if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
+                p.uniform_sampling_ns += start.elapsed().as_nanos();
+            }
+
+            let start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a_ntt = NttPolynomial::from_polynomial(limb_plan, &a);
+            if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
+                p.random_ntt_ns += start.elapsed().as_nanos();
+            }
+
+            let start = profile.as_ref().map(|_| std::time::Instant::now());
+            let error = project_error(modulus, &logical_error);
+            let message_plus_error = message.residue(index).add(&error);
+            let message_ntt = NttPolynomial::from_polynomial(limb_plan, &message_plus_error);
+            if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
+                p.message_ntt_ns += start.elapsed().as_nanos();
+            }
+
+            let start = profile.as_ref().map(|_| std::time::Instant::now());
+            let product_ntt = a_ntt.pointwise_mul(&secret_ntt[index]);
+            let b_values = message_ntt
+                .values()
+                .iter()
+                .zip(product_ntt.values())
+                .map(|(&lhs, &rhs)| modulus.sub(lhs, rhs))
+                .collect();
+            let b_ntt = NttPolynomial::from_values(limb_plan, b_values);
+            if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
+                p.rlwe_arithmetic_ns += start.elapsed().as_nanos();
+            }
+
+            (b_ntt, a_ntt)
+        })
+        .collect();
+
+    if let (Some(start), Some(p)) = (total_start, profile) {
+        p.total_ns += start.elapsed().as_nanos();
+    }
+
+    result
+}
+
 /// NTT-backed raw RNS RLWE decryption.
 ///
 /// This is semantically identical to `decrypt_rns_raw`, but evaluates `a*s`

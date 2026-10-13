@@ -338,6 +338,53 @@ pub fn research_profile_32768() -> CkksParameterProfile {
     )
 }
 
+/// Extended 50-bit NTT-prime pool for depth-aware degree-32768 research.
+/// The first thirteen limbs reproduce the frozen research-32768 profile.
+/// Three additional candidates are checked by CkksParameterProfile::validate,
+/// including negacyclic NTT plan construction. No security claim is implied.
+const RESEARCH_32768_DEPTH_MODULUS_POOL: [u64; 16] = [
+    0x3ffffffdf0001,
+    0x3ffffffd20001,
+    0x3ffffffcd0001,
+    0x3ffffffc70001,
+    0x3ffffffb80001,
+    0x3ffffffb10001,
+    0x3ffffff8b0001,
+    0x3ffffff5d0001,
+    0x3fffffed60001,
+    0x3fffffec80001,
+    0x3fffffebe0001,
+    0x3fffffeb90001,
+    0x3fffffead0001,
+    0x3fffffea60001,
+    0x3fffffea40001,
+    0x3fffffe9e0001,
+];
+
+/// Depth-aware research profile. Arithmetic depth plus terminal guard limbs
+/// must fit the validated 16-limb pool. This is not security-bearing.
+pub fn research_profile_32768_for_levels(
+    required_levels: usize,
+    terminal_guard_limbs: usize,
+) -> CkksParameterProfile {
+    let limb_count = required_levels
+        .checked_add(terminal_guard_limbs)
+        .expect("32768 research-profile limb-count overflow");
+    assert!(
+        (1..=RESEARCH_32768_DEPTH_MODULUS_POOL.len()).contains(&limb_count),
+        "32768 research profile requires {limb_count} limbs; pool supports 1..={}",
+        RESEARCH_32768_DEPTH_MODULUS_POOL.len()
+    );
+    CkksParameterProfile::new(
+        "research-32768-depth-aware",
+        32768,
+        &RESEARCH_32768_DEPTH_MODULUS_POOL[..limb_count],
+        2.0_f64.powi(50),
+        CkksParameterClass::Research,
+        None,
+    )
+}
+
 /// Validated 55-bit NTT-prime pool for polynomial degree 65536.
 ///
 /// The first eighteen limbs form the frozen 990-bit research profile used
