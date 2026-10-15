@@ -1330,6 +1330,13 @@ pub enum ParkModPpMmBackend {
     /// profile, a complete 4096-term dot product fits in one u128
     /// accumulation interval.
     WideAccumulator,
+
+    /// Exact wide-accumulator backend with independent output rows
+    /// evaluated in parallel.
+    ///
+    /// Arithmetic is identical to `WideAccumulator`; only the scheduling
+    /// of independent result rows differs.
+    ParallelWide,
 }
 
 /// Runtime characterization of one Park RNS quadratic CC-MM execution.
@@ -1554,6 +1561,66 @@ fn park_matrix_mul_wide_accumulator(
     result
 }
 
+/// Exact Park Mod-PP-MM using wide integer accumulation with parallel rows.
+///
+/// This preserves the arithmetic of `park_matrix_mul_wide_accumulator`.
+/// The right operand is transposed once, and independent output rows are
+/// evaluated in parallel. No higher-level Algorithm 8 parallelism is used.
+fn park_matrix_mul_parallel_wide(lhs: &[Vec<u64>], rhs: &[Vec<u64>], modulus: u64) -> ParkMatrix {
+    use rayon::prelude::*;
+
+    assert!(!lhs.is_empty());
+    assert!(!rhs.is_empty());
+    assert!(modulus > 1);
+
+    let rows = lhs.len();
+    let inner = lhs[0].len();
+    let cols = rhs[0].len();
+
+    assert!(lhs.iter().all(|row| row.len() == inner));
+    assert_eq!(rhs.len(), inner);
+    assert!(rhs.iter().all(|row| row.len() == cols));
+
+    let mut rhs_transposed = vec![vec![0_u64; inner]; cols];
+
+    for (k, rhs_row) in rhs.iter().enumerate() {
+        for (col, &value) in rhs_row.iter().enumerate() {
+            rhs_transposed[col][k] = value;
+        }
+    }
+
+    let modulus_u128 = u128::from(modulus);
+    let safe_terms = park_wide_accumulator_safe_terms(modulus);
+
+    let mut result = vec![vec![0_u64; cols]; rows];
+
+    lhs.par_iter()
+        .zip(result.par_iter_mut())
+        .for_each(|(lhs_row, result_row)| {
+            for (rhs_column, result_value) in rhs_transposed.iter().zip(result_row.iter_mut()) {
+                let mut residue = 0_u128;
+
+                for (lhs_chunk, rhs_chunk) in lhs_row
+                    .chunks(safe_terms)
+                    .zip(rhs_column.chunks(safe_terms))
+                {
+                    let mut wide_sum = 0_u128;
+
+                    for (&lhs_value, &rhs_value) in lhs_chunk.iter().zip(rhs_chunk.iter()) {
+                        wide_sum += u128::from(lhs_value) * u128::from(rhs_value);
+                    }
+
+                    let chunk_residue = wide_sum % modulus_u128;
+                    residue = (residue + chunk_residue) % modulus_u128;
+                }
+
+                *result_value = residue as u64;
+            }
+        });
+
+    result
+}
+
 /// Public Park Mod-PP-MM entry point.
 ///
 /// This exposes the plaintext kernel independently of Algorithm 8 so backend
@@ -1583,6 +1650,7 @@ fn park_matrix_mul_with_backend(
         ParkModPpMmBackend::Reference => park_matrix_mul_reference(lhs, rhs, modulus),
         ParkModPpMmBackend::TransposedRhs => park_matrix_mul_transposed_rhs(lhs, rhs, modulus),
         ParkModPpMmBackend::WideAccumulator => park_matrix_mul_wide_accumulator(lhs, rhs, modulus),
+        ParkModPpMmBackend::ParallelWide => park_matrix_mul_parallel_wide(lhs, rhs, modulus),
     }
 }
 
@@ -1666,40 +1734,18 @@ fn park_rns_components_by_columns(
     )
 }
 
-fn park_rns_synthetic_a_bundle_from_rows(
-    matrices_by_limb: &[ParkMatrix],
-    moduli: &[crate::ring::Modulus],
+fn park_rns_synthetic_a_bundle_from_limb_rows(
+    rows_by_ciphertext: Vec<Vec<RlweCiphertext>>,
 ) -> Vec<crate::grafting::RnsRlweCiphertext> {
-    assert!(!matrices_by_limb.is_empty());
-    assert_eq!(
-        matrices_by_limb.len(),
-        moduli.len(),
-        "Park RNS synthetic bundle requires one matrix per modulus"
-    );
-
-    let degree = matrices_by_limb[0].len();
-
+    assert!(!rows_by_ciphertext.is_empty());
     assert!(
-        matrices_by_limb.iter().all(|matrix| {
-            matrix.len() == degree && matrix.iter().all(|row| row.len() == degree)
-        }),
-        "Park RNS synthetic matrices must be square and dimension-compatible"
+        rows_by_ciphertext.iter().all(|limbs| !limbs.is_empty()),
+        "Park RNS synthetic bundle requires at least one limb per ciphertext"
     );
 
-    (0..degree)
-        .map(|row| {
-            let limbs = matrices_by_limb
-                .iter()
-                .zip(moduli.iter().copied())
-                .map(|(matrix, modulus)| {
-                    let a = Polynomial::new(modulus, matrix[row].clone());
-                    let b = Polynomial::zero(modulus, degree);
-                    RlweCiphertext::new(b, a)
-                })
-                .collect();
-
-            crate::grafting::RnsRlweCiphertext::from_limbs(limbs)
-        })
+    rows_by_ciphertext
+        .into_iter()
+        .map(crate::grafting::RnsRlweCiphertext::from_limbs)
         .collect()
 }
 
@@ -1791,9 +1837,13 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
 
     // Algorithm 8, Step 2: four Mod-PP-MM operations independently
     // in every CRT residue.
-    let mut c00_by_limb = Vec::with_capacity(moduli.len());
+    let mut c00_rows: Vec<Vec<RlweCiphertext>> = (0..degree)
+        .map(|_| Vec::with_capacity(moduli.len()))
+        .collect();
     let mut c01_by_limb = Vec::with_capacity(moduli.len());
-    let mut c10_by_limb = Vec::with_capacity(moduli.len());
+    let mut c10_rows: Vec<Vec<RlweCiphertext>> = (0..degree)
+        .map(|_| Vec::with_capacity(moduli.len()))
+        .collect();
     let mut c11_by_limb = Vec::with_capacity(moduli.len());
 
     for (limb_index, modulus) in moduli.iter().copied().enumerate() {
@@ -1814,9 +1864,15 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
         ));
 
         let mod_pp_mm_start = std::time::Instant::now();
-        c00_by_limb.push(park_matrix_mul_with_backend(&a, &a_tilde, q, backend));
+        let c00 = park_matrix_mul_with_backend(&a, &a_tilde, q, backend);
         measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
         measurement.physical_mod_pp_mm_calls += 1;
+
+        for (row_limbs, row) in c00_rows.iter_mut().zip(c00.into_iter()) {
+            let a = Polynomial::new(modulus, row);
+            let b = Polynomial::zero(modulus, degree);
+            row_limbs.push(RlweCiphertext::new(b, a));
+        }
 
         let mod_pp_mm_start = std::time::Instant::now();
         c01_by_limb.push(park_matrix_mul_with_backend(&a, &b_tilde, q, backend));
@@ -1824,9 +1880,15 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
         measurement.physical_mod_pp_mm_calls += 1;
 
         let mod_pp_mm_start = std::time::Instant::now();
-        c10_by_limb.push(park_matrix_mul_with_backend(&b, &a_tilde, q, backend));
+        let c10 = park_matrix_mul_with_backend(&b, &a_tilde, q, backend);
         measurement.mod_pp_mm_ns += mod_pp_mm_start.elapsed().as_nanos();
         measurement.physical_mod_pp_mm_calls += 1;
+
+        for (row_limbs, row) in c10_rows.iter_mut().zip(c10.into_iter()) {
+            let a = Polynomial::new(modulus, row);
+            let b = Polynomial::zero(modulus, degree);
+            row_limbs.push(RlweCiphertext::new(b, a));
+        }
 
         let mod_pp_mm_start = std::time::Instant::now();
         c11_by_limb.push(park_matrix_mul_with_backend(&b, &b_tilde, q, backend));
@@ -1838,13 +1900,11 @@ pub fn rns_ccmm_quadratic_with_backend_measured(
     // been computed for every limb.
     drop(rhs_transposed);
 
-    // Algorithm 8, Steps 3 and 4. C00 and C10 enter C-MT packed by rows.
-    let c00_bundle = park_rns_synthetic_a_bundle_from_rows(&c00_by_limb, moduli);
-    let c10_bundle = park_rns_synthetic_a_bundle_from_rows(&c10_by_limb, moduli);
-
-    // The synthetic bundles now own the information required by the two C-MTs.
-    drop(c00_by_limb);
-    drop(c10_by_limb);
+    // Algorithm 8, Steps 3 and 4. C00 and C10 were packed directly by rows
+    // while each residue-limb product was available, avoiding retention and
+    // subsequent cloning of complete per-limb dense matrices.
+    let c00_bundle = park_rns_synthetic_a_bundle_from_limb_rows(c00_rows);
+    let c10_bundle = park_rns_synthetic_a_bundle_from_limb_rows(c10_rows);
 
     let cmt_start = std::time::Instant::now();
     let d01 = rns_transpose(&c00_bundle, galois_keys);
@@ -1954,7 +2014,28 @@ pub fn rns_ccmm_relinearized(
     galois_keys: &[crate::ckks::RnsGaloisKey],
     multiplication_key: &crate::grafting::RnsMultiplicationKey,
 ) -> Vec<crate::grafting::RnsRlweCiphertext> {
-    rns_ccmm_quadratic(lhs, rhs, galois_keys)
+    rns_ccmm_relinearized_with_backend(
+        lhs,
+        rhs,
+        galois_keys,
+        multiplication_key,
+        ParkModPpMmBackend::Reference,
+    )
+}
+
+/// Executes Park RNS CC-MM and relinearization with an explicitly selected
+/// Mod-PP-MM backend.
+///
+/// This is intended for controlled characterization. The existing
+/// `rns_ccmm_relinearized` entry point remains the Reference-backend default.
+pub fn rns_ccmm_relinearized_with_backend(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    multiplication_key: &crate::grafting::RnsMultiplicationKey,
+    backend: ParkModPpMmBackend,
+) -> Vec<crate::grafting::RnsRlweCiphertext> {
+    rns_ccmm_quadratic_with_backend(lhs, rhs, galois_keys, backend)
         .iter()
         .map(|product| crate::grafting::rns_relinearize(product, multiplication_key))
         .collect()
@@ -1981,6 +2062,29 @@ pub fn rns_ckks_ccmm_relinearize_rescale(
     galois_keys: &[crate::ckks::RnsGaloisKey],
     multiplication_key: &crate::grafting::RnsMultiplicationKey,
     chain: &crate::ring::ModulusChain,
+) -> Vec<crate::ckks::RnsCkksCiphertext> {
+    rns_ckks_ccmm_relinearize_rescale_with_backend(
+        lhs,
+        rhs,
+        galois_keys,
+        multiplication_key,
+        chain,
+        ParkModPpMmBackend::Reference,
+    )
+}
+
+/// Executes complete Park CKKS CC-MM with an explicitly selected Mod-PP-MM
+/// backend, followed by relinearization and one rescale.
+///
+/// The existing `rns_ckks_ccmm_relinearize_rescale` API remains the
+/// Reference-backend default.
+pub fn rns_ckks_ccmm_relinearize_rescale_with_backend(
+    lhs: &[crate::ckks::RnsCkksCiphertext],
+    rhs: &[crate::ckks::RnsCkksCiphertext],
+    galois_keys: &[crate::ckks::RnsGaloisKey],
+    multiplication_key: &crate::grafting::RnsMultiplicationKey,
+    chain: &crate::ring::ModulusChain,
+    backend: ParkModPpMmBackend,
 ) -> Vec<crate::ckks::RnsCkksCiphertext> {
     assert!(!lhs.is_empty(), "Park CKKS CC-MM lhs must not be empty");
 
@@ -2073,7 +2177,13 @@ pub fn rns_ckks_ccmm_relinearize_rescale(
         .map(|ciphertext| ciphertext.rlwe().clone())
         .collect();
 
-    let relinearized = rns_ccmm_relinearized(&lhs_rlwe, &rhs_rlwe, galois_keys, multiplication_key);
+    let relinearized = rns_ccmm_relinearized_with_backend(
+        &lhs_rlwe,
+        &rhs_rlwe,
+        galois_keys,
+        multiplication_key,
+        backend,
+    );
 
     let product_state = lhs_state.after_multiply(rhs_state, chain);
 
@@ -4393,6 +4503,36 @@ mod tests {
                      modulus {}",
                     profile.name(),
                     q,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn park_parallel_wide_matches_wide_and_reference() {
+        for modulus in [97_u64, 12_289, 65_537, 0x7ffff6001] {
+            for (rows, inner, cols) in [
+                (1_usize, 1_usize, 1_usize),
+                (2, 3, 4),
+                (3, 7, 5),
+                (8, 8, 8),
+                (11, 5, 13),
+                (16, 17, 9),
+            ] {
+                let lhs = deterministic_mod_matrix(rows, inner, modulus, 0x1357);
+                let rhs = deterministic_mod_matrix(inner, cols, modulus, 0x2468);
+
+                let reference = park_matrix_mul_reference(&lhs, &rhs, modulus);
+                let wide = park_matrix_mul_wide_accumulator(&lhs, &rhs, modulus);
+                let parallel = park_matrix_mul_parallel_wide(&lhs, &rhs, modulus);
+
+                assert_eq!(
+                    wide, reference,
+                    "wide mismatch for {rows}x{inner} * {inner}x{cols}, q={modulus}"
+                );
+                assert_eq!(
+                    parallel, reference,
+                    "parallel-wide mismatch for {rows}x{inner} * {inner}x{cols}, q={modulus}"
                 );
             }
         }

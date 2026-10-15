@@ -70,15 +70,16 @@ fn main() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(512);
 
-    let sizes = [64_usize, 128, 256, 512, 1024];
+    let sizes = [256_usize, 512, 1024, 2048, 4096];
 
-    println!("PARK_MOD_PP_MM_CHARACTERIZATION_VERSION=1");
+    println!("PARK_MOD_PP_MM_CHARACTERIZATION_VERSION=2");
+    println!("RAYON_THREADS={}", rayon::current_num_threads());
     println!("PROFILE={}", profile.name());
     println!("MODULUS={modulus}");
     println!("MAX_N={max_n}");
     println!("SETUP_INCLUDED_IN_TIMING=NO");
     println!("TIMING_STATISTIC=median");
-    println!("CSV_HEADER=n,backend,median_us,speedup_vs_reference");
+    println!("CSV_HEADER=n,backend,median_us,speedup_vs_wide");
 
     for n in sizes.into_iter().filter(|&n| n <= max_n) {
         let lhs = matrix(n, n, modulus, 0x5041_524b ^ n as u64);
@@ -87,24 +88,6 @@ fn main() {
 
         let warmups = 1;
         let repeats = if n <= 256 { 5 } else { 3 };
-
-        let reference_ns = benchmark(
-            &lhs,
-            &rhs,
-            modulus,
-            ParkModPpMmBackend::Reference,
-            warmups,
-            repeats,
-        );
-
-        let transposed_ns = benchmark(
-            &lhs,
-            &rhs,
-            modulus,
-            ParkModPpMmBackend::TransposedRhs,
-            warmups,
-            repeats,
-        );
 
         let wide_ns = benchmark(
             &lhs,
@@ -115,30 +98,31 @@ fn main() {
             repeats,
         );
 
-        let reference_us = reference_ns as f64 / 1.0e3;
-
-        let transposed_us = transposed_ns as f64 / 1.0e3;
-
-        let wide_us = wide_ns as f64 / 1.0e3;
-
-        println!("RESULT,{n},Reference,{reference_us:.3},1.000000");
-
-        println!(
-            "RESULT,{n},TransposedRhs,{transposed_us:.3},{:.6}",
-            reference_ns as f64 / transposed_ns as f64,
+        let parallel_ns = benchmark(
+            &lhs,
+            &rhs,
+            modulus,
+            ParkModPpMmBackend::ParallelWide,
+            warmups,
+            repeats,
         );
 
+        let wide_us = wide_ns as f64 / 1.0e3;
+        let parallel_us = parallel_ns as f64 / 1.0e3;
+
+        println!("RESULT,{n},WideAccumulator,{wide_us:.3},1.000000");
+
         println!(
-            "RESULT,{n},WideAccumulator,{wide_us:.3},{:.6}",
-            reference_ns as f64 / wide_ns as f64,
+            "RESULT,{n},ParallelWide,{parallel_us:.3},{:.6}",
+            wide_ns as f64 / parallel_ns as f64,
         );
 
         // Characterization must never benchmark an incorrect backend.
-        let reference = park_mod_pp_mm(&lhs, &rhs, modulus, ParkModPpMmBackend::Reference);
-
         let wide = park_mod_pp_mm(&lhs, &rhs, modulus, ParkModPpMmBackend::WideAccumulator);
 
-        assert_eq!(wide, reference, "WideAccumulator mismatch at N={n}");
+        let parallel = park_mod_pp_mm(&lhs, &rhs, modulus, ParkModPpMmBackend::ParallelWide);
+
+        assert_eq!(parallel, wide, "ParallelWide mismatch at N={n}");
     }
 
     println!("PARK_MOD_PP_MM_CHARACTERIZATION_STATUS=PASS");

@@ -28,9 +28,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 const MODULI: [u64; 3] = [12_289, 40_961, 65_537];
-const WARMUPS: usize = 1;
-const REPEATS: usize = 5;
-const DEGREES: &[usize] = &[8, 16, 32, 64];
+const DEFAULT_WARMUPS: usize = 1;
+const DEFAULT_REPEATS: usize = 5;
+const DEGREES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 #[derive(Debug, Clone, Copy)]
 struct Summary {
@@ -247,7 +247,7 @@ fn characterize_cmt(
     ciphertexts: &[RnsRlweCiphertext],
     galois_keys: &[RnsGaloisKey],
 ) -> CmtSummary {
-    for _ in 0..WARMUPS {
+    for _ in 0..DEFAULT_WARMUPS {
         let (output, measurement) =
             rns_transpose_measured(black_box(ciphertexts), black_box(galois_keys));
 
@@ -259,9 +259,9 @@ fn characterize_cmt(
         black_box(output);
     }
 
-    let mut samples = Vec::with_capacity(REPEATS);
+    let mut samples = Vec::with_capacity(DEFAULT_REPEATS);
 
-    for _ in 0..REPEATS {
+    for _ in 0..DEFAULT_REPEATS {
         let (output, measurement) =
             rns_transpose_measured(black_box(ciphertexts), black_box(galois_keys));
 
@@ -278,7 +278,7 @@ fn characterize_cmt_ntt(
     galois_keys: &[RnsGaloisKey],
     plan: &RnsNttPlan,
 ) -> CmtSummary {
-    for _ in 0..WARMUPS {
+    for _ in 0..DEFAULT_WARMUPS {
         let (output, measurement) = rns_transpose_measured_with_ntt_key_switch(
             black_box(ciphertexts),
             black_box(galois_keys),
@@ -293,9 +293,9 @@ fn characterize_cmt_ntt(
         black_box(output);
     }
 
-    let mut samples = Vec::with_capacity(REPEATS);
+    let mut samples = Vec::with_capacity(DEFAULT_REPEATS);
 
-    for _ in 0..REPEATS {
+    for _ in 0..DEFAULT_REPEATS {
         let (output, measurement) = rns_transpose_measured_with_ntt_key_switch(
             black_box(ciphertexts),
             black_box(galois_keys),
@@ -310,7 +310,7 @@ fn characterize_cmt_ntt(
 }
 
 fn characterize_tweak(ciphertexts: &[RnsRlweCiphertext], native: bool) -> u128 {
-    for _ in 0..WARMUPS {
+    for _ in 0..DEFAULT_WARMUPS {
         let output = if native {
             rns_tweak_native(black_box(ciphertexts))
         } else {
@@ -320,9 +320,9 @@ fn characterize_tweak(ciphertexts: &[RnsRlweCiphertext], native: bool) -> u128 {
         black_box(output);
     }
 
-    let mut samples = Vec::with_capacity(REPEATS);
+    let mut samples = Vec::with_capacity(DEFAULT_REPEATS);
 
-    for _ in 0..REPEATS {
+    for _ in 0..DEFAULT_REPEATS {
         let start = std::time::Instant::now();
 
         let output = if native {
@@ -345,6 +345,7 @@ fn backend_name(backend: ParkModPpMmBackend) -> &'static str {
         ParkModPpMmBackend::Reference => "Reference",
         ParkModPpMmBackend::TransposedRhs => "TransposedRhs",
         ParkModPpMmBackend::WideAccumulator => "WideAccumulator",
+        ParkModPpMmBackend::ParallelWide => "ParallelWide",
     }
 }
 
@@ -354,8 +355,10 @@ fn characterize(
     lhs: &[RnsRlweCiphertext],
     rhs: &[RnsRlweCiphertext],
     galois_keys: &[RnsGaloisKey],
+    warmups: usize,
+    repeats: usize,
 ) -> Summary {
-    for _ in 0..WARMUPS {
+    for _ in 0..warmups {
         let (output, measurement) = rns_ccmm_quadratic_with_backend_measured(
             black_box(lhs),
             black_box(rhs),
@@ -373,9 +376,9 @@ fn characterize(
         black_box(output);
     }
 
-    let mut samples = Vec::with_capacity(REPEATS);
+    let mut samples = Vec::with_capacity(repeats);
 
-    for _ in 0..REPEATS {
+    for _ in 0..repeats {
         let (output, measurement) = rns_ccmm_quadratic_with_backend_measured(
             black_box(lhs),
             black_box(rhs),
@@ -407,8 +410,25 @@ fn main() {
     println!("MATRIX_ORDER_EQUALS_RING_DEGREE=YES");
     println!("RNS_LIMBS={}", MODULI.len());
     println!("MODULI={},{},{}", MODULI[0], MODULI[1], MODULI[2]);
-    println!("WARMUPS={WARMUPS}");
-    println!("REPEATS={REPEATS}");
+    let max_degree = std::env::var("PARK_CCMM_MAX_DEGREE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64);
+
+    let warmups = std::env::var("PARK_CCMM_WARMUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_WARMUPS);
+
+    let repeats = std::env::var("PARK_CCMM_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_REPEATS);
+
+    println!("MAX_DEGREE={max_degree}");
+    println!("WARMUPS={warmups}");
+    println!("REPEATS={repeats}");
+    println!("RAYON_THREADS={}", rayon::current_num_threads());
     println!("TIMING_STATISTIC=median");
     println!("TIMED_REGION=park-rns-quadratic-algorithm8");
     println!("SETUP_INCLUDED_IN_TIMING=NO");
@@ -438,7 +458,7 @@ reference_ks_pct,ntt_ks_pct"
 speedup_native_vs_oracle"
     );
 
-    for &degree in DEGREES {
+    for &degree in DEGREES.iter().filter(|&&degree| degree <= max_degree) {
         let moduli = moduli();
         let basis = ModulusBasis::new(moduli);
 
@@ -543,15 +563,20 @@ speedup_native_vs_oracle"
             pct(tweak_ns, cmt.total_ns),
         );
 
-        let reference = characterize(degree, ParkModPpMmBackend::Reference, &lhs, &rhs, &keys);
+        let parallel = characterize(
+            degree,
+            ParkModPpMmBackend::ParallelWide,
+            &lhs,
+            &rhs,
+            &keys,
+            warmups,
+            repeats,
+        );
 
-        let transposed = characterize(degree, ParkModPpMmBackend::TransposedRhs, &lhs, &rhs, &keys);
-
-        for (backend, summary) in [
-            (ParkModPpMmBackend::Reference, reference),
-            (ParkModPpMmBackend::TransposedRhs, transposed),
-        ] {
-            let speedup = reference.total_ns as f64 / summary.total_ns as f64;
+        {
+            let backend = ParkModPpMmBackend::ParallelWide;
+            let summary = parallel;
+            let speedup = 1.0;
 
             println!(
                 "RESULT,{},{},{},{:.3},{:.3},{:.3},{:.3},\
