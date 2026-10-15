@@ -236,10 +236,10 @@ fn encrypt_and_fft15(
     plan2: &RnsNttPlan,
     prepared2: &PreparedRnsNttPlan,
     mut rng: &mut ChaCha20Rng,
+    prepared_left: &PreparedBoundedRnsGaloisKey,
 ) -> Vec<RnsCkksCiphertext> {
     const HALF: usize = 4096;
     const TILES: usize = 15;
-    let degree = embedding.degree();
 
     // The physical FFT15 kernel has one ciphertext per pair of 4096-slot tiles.
     // Pack local FFT256 inputs in base-4 digit-reversed order so the FFT256
@@ -269,18 +269,7 @@ fn encrypt_and_fft15(
             RnsCkksCiphertext::new(rlwe, CkksChainState::top(chain, scale), chain)
         })
         .collect();
-    let left_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-        BoundedRnsKeygenConfig {
-            plaintext_modulus: 2,
-            layout: BoundedGadgetLayout::new(basis0.clone(), 8),
-            plan: plan0,
-        },
-        secret,
-        rotation_exponent_left(degree, HALF),
-        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-        &mut rng,
-    );
-    let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, plan0);
+
     let low_mask: Vec<Complex64> = (0..slots)
         .map(|s| Complex64::new(if s < HALF { 1.0 } else { 0.0 }, 0.0))
         .collect();
@@ -297,7 +286,7 @@ fn encrypt_and_fft15(
                 let shifted = rotate_left_for_extraction(
                     source,
                     HALF,
-                    &prepared_left,
+                    prepared_left,
                     chain,
                     plan0,
                     prepared0,
@@ -426,9 +415,36 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             })
             .collect()
     };
+    // R28_4B2_SHARED_EXTRACTION_KEY
+    let left_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+        BoundedRnsKeygenConfig {
+            plaintext_modulus: 2,
+            layout: BoundedGadgetLayout::new(basis0.clone(), 8),
+            plan: &plan0,
+        },
+        &secret,
+        rotation_exponent_left(degree, HALF),
+        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+        &mut rng,
+    );
+    let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &plan0);
+
     let sources = encrypt_and_fft15(
-        &natural, slots, &embedding, &chain, &basis0, scale, &secret, &plan0, &prepared0, &plan1,
-        &prepared1, &plan2, &prepared2, &mut rng,
+        &natural,
+        slots,
+        &embedding,
+        &chain,
+        &basis0,
+        scale,
+        &secret,
+        &plan0,
+        &prepared0,
+        &plan1,
+        &prepared1,
+        &plan2,
+        &prepared2,
+        &mut rng,
+        &prepared_left,
     );
 
     // Prepare fused placement and branch-specific first-stage
