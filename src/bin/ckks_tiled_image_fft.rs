@@ -2,19 +2,22 @@ use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_16384, research_profile_32768, research_profile_65536,
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, CkksChainState, PreparedRnsGaloisKey, RnsCkksCiphertext,
-    RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    BoundedRnsGaloisKey, CkksCanonicalEmbedding, CkksChainState, PreparedBoundedRnsGaloisKey,
+    PreparedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluationKeys, RnsCkksEvaluator,
+    RnsCkksLevelKeys, RnsGaloisKey,
 };
 use ccmm_rs::eblas::fft::{
-    execute_packed_fft2_dif_stage_cp_prepared, fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape,
-    FftDirection, PackedFft2Axis, PackedFft2DifStageDiagonals,
+    execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared, fft2_pp,
+    packed_fft_dif_butterfly_cp, Fft2Shape, FftDirection, PackedFft2Axis,
+    PackedFft2DifStageDiagonals, PreparedRepeatedPackedFft2DifStage,
 };
 use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
-    RnsKeygenConfig,
+    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
+    BoundedRnsKeygenConfig, RnsGadgetLayout, RnsKeygenConfig,
 };
 use ccmm_rs::ring::{
-    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, RnsNttPlan,
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusChain,
+    PreparedRnsNttPlan, RnsNttPlan,
 };
 use ccmm_rs::rlwe::ErrorDistribution;
 use image::{GrayImage, Luma};
@@ -29,6 +32,76 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const SIGMA: f64 = 3.19;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FftGaloisKeyMode {
+    Baseline,
+    Gaussian,
+    BoundedGaussian,
+    BoundedGaussianDirect,
+}
+
+impl FftGaloisKeyMode {
+    fn from_environment() -> Self {
+        match std::env::var("FFT_GALOIS_KEY_MODE")
+            .unwrap_or_else(|_| "baseline".to_string())
+            .as_str()
+        {
+            "baseline" => Self::Baseline,
+            "gaussian" => Self::Gaussian,
+            "bounded_gaussian" => Self::BoundedGaussian,
+            "bounded_gaussian_direct" => Self::BoundedGaussianDirect,
+            other => {
+                panic!("unsupported FFT_GALOIS_KEY_MODE={other}; expected baseline, gaussian, bounded_gaussian, or bounded_gaussian_direct")
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Gaussian => "gaussian",
+            Self::BoundedGaussian => "bounded_gaussian",
+            Self::BoundedGaussianDirect => "bounded_gaussian_direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FftRandomnessMode {
+    Deterministic,
+    Secure,
+}
+
+impl FftRandomnessMode {
+    fn from_environment() -> Self {
+        match std::env::var("FFT_RANDOMNESS_MODE")
+            .unwrap_or_else(|_| "deterministic".to_string())
+            .as_str()
+        {
+            "deterministic" => Self::Deterministic,
+            "secure" => Self::Secure,
+            other => {
+                panic!("unsupported FFT_RANDOMNESS_MODE={other}; expected deterministic or secure")
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::Secure => "secure",
+        }
+    }
+
+    fn rng(self, deterministic_seed: u64) -> ChaCha20Rng {
+        match self {
+            Self::Deterministic => ChaCha20Rng::seed_from_u64(deterministic_seed),
+            Self::Secure => ChaCha20Rng::from_entropy(),
+        }
+    }
+}
+
 const TOLERANCE: f64 = 5.0e-3;
 
 /*
@@ -40,6 +113,307 @@ const TOLERANCE: f64 = 5.0e-3;
 const FFT_ENCRYPTION_PARALLELISM: usize = 4;
 const FFT_LOCAL_TILE_PARALLELISM: usize = 2;
 const FFT_GLOBAL_PAIR_PARALLELISM: usize = 4;
+
+#[allow(clippy::too_many_arguments)]
+fn execute_bounded_gaussian_local_stage(
+    randomness_mode: FftRandomnessMode,
+    direct_prepared: bool,
+    values: &[RnsCkksCiphertext],
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    secret: &[i8],
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    stage_plan: &RnsNttPlan,
+) -> Vec<RnsCkksCiphertext> {
+    const BASE_LOG: u32 = 8;
+
+    assert!(
+        !values.is_empty(),
+        "bounded Gaussian FFT stage requires at least one ciphertext"
+    );
+
+    let stage_level = values[0].level();
+
+    assert!(
+        values.iter().all(|value| value.level() == stage_level),
+        "bounded Gaussian FFT stage requires uniform ciphertext levels"
+    );
+
+    let degree = stage_plan.degree();
+    let basis = chain.level(stage_level).clone();
+    let rotation = diagonals.rotation();
+
+    let layout = BoundedGadgetLayout::new(basis, BASE_LOG);
+    let digits = layout.digit_count();
+
+    println!(
+        "R15_G11_STAGE_BEGIN level={stage_level} rotation={rotation} limbs={} digits={digits}",
+        stage_plan.moduli().len()
+    );
+
+    let prepared_plan = PreparedRnsNttPlan::new(stage_plan);
+
+    let key_pipeline_start = Instant::now();
+    let profile_enabled =
+        direct_prepared && std::env::var("FHE_KEYGEN_PROFILE").as_deref() == Ok("1");
+
+    let (
+        (prepared_left, left_keygen_ms, left_preparation_ms),
+        (prepared_right, right_keygen_ms, right_preparation_ms),
+    ) = std::thread::scope(|scope| {
+        let left_layout = layout.clone();
+        let right_layout = layout;
+
+        let left_worker = scope.spawn(move || {
+            let mut rng = randomness_mode.rng(0x1531_1100 ^ ((stage_level as u64) << 8));
+
+            let keygen_start = Instant::now();
+
+            if direct_prepared {
+                let prepared = if profile_enabled {
+                    let mut profile = ccmm_rs::grafting::PreparedRlweEncryptionProfile::default();
+
+                    let prepared =
+                        PreparedBoundedRnsGaloisKey::generate_profiled_with_distribution_ntt_rng(
+                            BoundedRnsKeygenConfig {
+                                plaintext_modulus: 2,
+                                layout: left_layout,
+                                plan: stage_plan,
+                            },
+                            secret,
+                            rotation_exponent_left(degree, rotation),
+                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                            &mut rng,
+                            &mut profile,
+                        );
+
+                    println!("R15_G14_KEY_PROFILE_DIRECTION=left");
+                    println!("R15_G14_KEY_PROFILE_LEVEL={stage_level}");
+                    println!(
+                        "R15_G14_KEY_PROFILE_ERROR_SAMPLING_NS={}",
+                        profile.error_sampling_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_UNIFORM_SAMPLING_NS={}",
+                        profile.uniform_sampling_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_RANDOM_NTT_NS={}",
+                        profile.random_ntt_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_MESSAGE_NTT_NS={}",
+                        profile.message_ntt_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_RLWE_ARITHMETIC_NS={}",
+                        profile.rlwe_arithmetic_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_ENCRYPTION_TOTAL_NS={}",
+                        profile.total_ns
+                    );
+
+                    prepared
+                } else {
+                    PreparedBoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                        BoundedRnsKeygenConfig {
+                            plaintext_modulus: 2,
+                            layout: left_layout,
+                            plan: stage_plan,
+                        },
+                        secret,
+                        rotation_exponent_left(degree, rotation),
+                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                        &mut rng,
+                    )
+                };
+                let keygen_ms = keygen_start.elapsed().as_millis();
+                (prepared, keygen_ms, 0)
+            } else {
+                let key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: left_layout,
+                        plan: stage_plan,
+                    },
+                    secret,
+                    rotation_exponent_left(degree, rotation),
+                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                    &mut rng,
+                );
+                let keygen_ms = keygen_start.elapsed().as_millis();
+                let preparation_start = Instant::now();
+                let prepared = PreparedBoundedRnsGaloisKey::new(&key, stage_plan);
+                drop(key);
+                (prepared, keygen_ms, preparation_start.elapsed().as_millis())
+            }
+        });
+
+        let right_worker = scope.spawn(move || {
+            let mut rng = randomness_mode.rng(0x1531_1101 ^ ((stage_level as u64) << 8));
+
+            let keygen_start = Instant::now();
+
+            if direct_prepared {
+                let prepared = if profile_enabled {
+                    let mut profile = ccmm_rs::grafting::PreparedRlweEncryptionProfile::default();
+
+                    let prepared =
+                        PreparedBoundedRnsGaloisKey::generate_profiled_with_distribution_ntt_rng(
+                            BoundedRnsKeygenConfig {
+                                plaintext_modulus: 2,
+                                layout: right_layout,
+                                plan: stage_plan,
+                            },
+                            secret,
+                            rotation_exponent_right(degree, rotation),
+                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                            &mut rng,
+                            &mut profile,
+                        );
+
+                    println!("R15_G14_KEY_PROFILE_DIRECTION=right");
+                    println!("R15_G14_KEY_PROFILE_LEVEL={stage_level}");
+                    println!(
+                        "R15_G14_KEY_PROFILE_ERROR_SAMPLING_NS={}",
+                        profile.error_sampling_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_UNIFORM_SAMPLING_NS={}",
+                        profile.uniform_sampling_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_RANDOM_NTT_NS={}",
+                        profile.random_ntt_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_MESSAGE_NTT_NS={}",
+                        profile.message_ntt_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_RLWE_ARITHMETIC_NS={}",
+                        profile.rlwe_arithmetic_ns
+                    );
+                    println!(
+                        "R15_G14_KEY_PROFILE_ENCRYPTION_TOTAL_NS={}",
+                        profile.total_ns
+                    );
+
+                    prepared
+                } else {
+                    PreparedBoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                        BoundedRnsKeygenConfig {
+                            plaintext_modulus: 2,
+                            layout: right_layout,
+                            plan: stage_plan,
+                        },
+                        secret,
+                        rotation_exponent_right(degree, rotation),
+                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                        &mut rng,
+                    )
+                };
+                let keygen_ms = keygen_start.elapsed().as_millis();
+                (prepared, keygen_ms, 0)
+            } else {
+                let key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: right_layout,
+                        plan: stage_plan,
+                    },
+                    secret,
+                    rotation_exponent_right(degree, rotation),
+                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                    &mut rng,
+                );
+                let keygen_ms = keygen_start.elapsed().as_millis();
+                let preparation_start = Instant::now();
+                let prepared = PreparedBoundedRnsGaloisKey::new(&key, stage_plan);
+                drop(key);
+                (prepared, keygen_ms, preparation_start.elapsed().as_millis())
+            }
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("R15-G12 left key worker panicked"),
+            right_worker
+                .join()
+                .expect("R15-G12 right key worker panicked"),
+        )
+    });
+
+    let key_pipeline_wall_ms = key_pipeline_start.elapsed().as_millis();
+
+    println!("R15_G12_KEY_PIPELINE_WALL_MS={key_pipeline_wall_ms}");
+    println!("R15_G12_KEY_PIPELINE_MODE=parallel_left_right");
+    println!(
+        "R15_G13B_KEY_PIPELINE_MODE={}",
+        if direct_prepared {
+            "direct_prepared"
+        } else {
+            "reference"
+        }
+    );
+
+    let preparation_start = Instant::now();
+
+    let prepared_fft_stages: Vec<_> = values
+        .iter()
+        .map(|input| {
+            PreparedRepeatedPackedFft2DifStage::new(
+                input, diagonals, 1, embedding, chain, stage_plan,
+            )
+        })
+        .collect();
+
+    let diagonal_preparation_ms = preparation_start.elapsed().as_millis();
+
+    let execution_start = Instant::now();
+
+    let outputs: Vec<RnsCkksCiphertext> = values
+        .iter()
+        .zip(prepared_fft_stages.iter())
+        .map(|(input, prepared_fft_stage)| {
+            execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
+                input,
+                prepared_fft_stage,
+                evaluator,
+                (&prepared_left, &prepared_right),
+                chain,
+                stage_plan,
+                &prepared_plan,
+            )
+        })
+        .collect();
+
+    let execution_ms = execution_start.elapsed().as_millis();
+
+    assert!(
+        outputs
+            .iter()
+            .all(|output| output.level() == stage_level + 1),
+        "bounded Gaussian FFT stage produced an unexpected ciphertext level"
+    );
+
+    println!("R15_G11_STAGE_LEFT_KEYGEN_MS={left_keygen_ms}");
+    println!("R15_G11_STAGE_LEFT_PREPARATION_MS={left_preparation_ms}");
+    println!("R15_G11_STAGE_RIGHT_KEYGEN_MS={right_keygen_ms}");
+    println!("R15_G11_STAGE_RIGHT_PREPARATION_MS={right_preparation_ms}");
+    println!("R15_G11_STAGE_DIAGONAL_PREPARATION_MS={diagonal_preparation_ms}");
+    println!("R15_G11_STAGE_EXECUTION_MS={execution_ms}");
+    println!(
+        "R15_G11_STAGE_DONE level={stage_level} output_level={} scale={:.12e}",
+        outputs[0].level(),
+        outputs[0].scale()
+    );
+
+    outputs
+}
 
 fn ciphertext_payload_bytes(degree: usize, limbs: usize) -> usize {
     2usize
@@ -185,6 +559,115 @@ impl FactoredFft2Plan {
             .checked_mul(self.image_cols)
             .expect("factored FFT2 image element count overflow")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FftTilePacking {
+    tile_elements: usize,
+    tiles_per_ciphertext: usize,
+    slot_count: usize,
+}
+
+impl FftTilePacking {
+    fn new(tile_elements: usize, tiles_per_ciphertext: usize, slot_count: usize) -> Self {
+        assert!(
+            tile_elements > 0,
+            "FFT tile packing requires a positive tile size"
+        );
+        assert!(
+            tiles_per_ciphertext > 0,
+            "FFT tile packing requires at least one tile per ciphertext"
+        );
+
+        let active_slots = tile_elements
+            .checked_mul(tiles_per_ciphertext)
+            .expect("FFT tile packing active-slot count overflow");
+
+        assert!(
+            active_slots <= slot_count,
+            "FFT tile packing requires {active_slots} slots but ciphertext provides only {slot_count}"
+        );
+
+        Self {
+            tile_elements,
+            tiles_per_ciphertext,
+            slot_count,
+        }
+    }
+
+    fn active_slots(self) -> usize {
+        self.tile_elements
+            .checked_mul(self.tiles_per_ciphertext)
+            .expect("FFT tile packing active-slot count overflow")
+    }
+
+    fn utilization(self) -> f64 {
+        self.active_slots() as f64 / self.slot_count as f64
+    }
+
+    fn slot_range(self, packed_tile_index: usize) -> std::ops::Range<usize> {
+        assert!(
+            packed_tile_index < self.tiles_per_ciphertext,
+            "packed FFT tile index out of range"
+        );
+
+        let start = packed_tile_index
+            .checked_mul(self.tile_elements)
+            .expect("packed FFT tile slot offset overflow");
+
+        start..start + self.tile_elements
+    }
+
+    fn ciphertext_count(self, logical_tile_count: usize) -> usize {
+        logical_tile_count.div_ceil(self.tiles_per_ciphertext)
+    }
+}
+
+fn pack_fft_tiles(tiles: &[Vec<Complex64>], packing: FftTilePacking) -> Vec<Vec<Complex64>> {
+    assert!(
+        tiles.iter().all(|tile| tile.len() == packing.tile_elements),
+        "all logical FFT tiles must match the packing tile size"
+    );
+
+    let ciphertext_count = packing.ciphertext_count(tiles.len());
+
+    let mut packed = vec![vec![Complex64::new(0.0, 0.0); packing.slot_count]; ciphertext_count];
+
+    for (logical_tile_index, tile) in tiles.iter().enumerate() {
+        let ciphertext_index = logical_tile_index / packing.tiles_per_ciphertext;
+        let packed_tile_index = logical_tile_index % packing.tiles_per_ciphertext;
+        let range = packing.slot_range(packed_tile_index);
+
+        packed[ciphertext_index][range].copy_from_slice(tile);
+    }
+
+    packed
+}
+
+fn unpack_fft_tiles(
+    packed: &[Vec<Complex64>],
+    logical_tile_count: usize,
+    packing: FftTilePacking,
+) -> Vec<Vec<Complex64>> {
+    assert!(
+        packed.iter().all(|slots| slots.len() == packing.slot_count),
+        "packed FFT ciphertext slot vectors must match the configured slot count"
+    );
+    assert_eq!(
+        packed.len(),
+        packing.ciphertext_count(logical_tile_count),
+        "packed FFT ciphertext count does not match logical tile count"
+    );
+
+    (0..logical_tile_count)
+        .map(|logical_tile_index| {
+            let ciphertext_index = logical_tile_index / packing.tiles_per_ciphertext;
+            let packed_tile_index = logical_tile_index % packing.tiles_per_ciphertext;
+            let range = packing.slot_range(packed_tile_index);
+
+            packed[ciphertext_index][range].to_vec()
+        })
+        .collect()
 }
 
 fn phase_start(index: usize, total: usize, name: &str) -> Instant {
@@ -683,6 +1166,41 @@ fn save_tiled_spectrum_image(
         .unwrap_or_else(|error| panic!("failed to save {}: {error}", path.display()));
 }
 
+fn save_global_spectrum_image(
+    path: &Path,
+    values: &[Complex64],
+    shape: Fft2Shape,
+    log_maximum: f64,
+) {
+    assert_eq!(values.len(), shape.elements());
+
+    let shifted = fft_shift(values, shape);
+    let mut image = GrayImage::new(shape.cols() as u32, shape.rows() as u32);
+
+    for row in 0..shape.rows() {
+        for col in 0..shape.cols() {
+            let index = row * shape.cols() + col;
+            let magnitude = shifted[index].norm().ln_1p();
+
+            let normalized = if log_maximum > 0.0 {
+                magnitude / log_maximum
+            } else {
+                0.0
+            };
+
+            image.put_pixel(
+                col as u32,
+                row as u32,
+                Luma([(normalized.clamp(0.0, 1.0) * 255.0).round() as u8]),
+            );
+        }
+    }
+
+    image
+        .save(path)
+        .unwrap_or_else(|error| panic!("failed to save {}: {error}", path.display()));
+}
+
 fn save_spatial_image(path: &Path, values: &[Complex64], shape: Fft2Shape) {
     assert_eq!(values.len(), shape.elements());
 
@@ -723,6 +1241,51 @@ fn fft_shift(values: &[Complex64], shape: Fft2Shape) -> Vec<Complex64> {
     }
 
     shifted
+}
+
+fn execute_fft_stage_r17_4h(
+    input: &ccmm_rs::ckks::RnsCkksCiphertext,
+    prepared_fft_stage: &ccmm_rs::eblas::fft::PreparedRepeatedPackedFft2DifStage,
+    evaluator: &ccmm_rs::ckks::RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (
+        &ccmm_rs::ckks::PreparedRnsGaloisKey,
+        &ccmm_rs::ckks::PreparedRnsGaloisKey,
+    ),
+    chain: &ccmm_rs::ring::ModulusChain,
+    plan: &ccmm_rs::ring::RnsNttPlan,
+    prepared_plan: &ccmm_rs::ring::PreparedRnsNttPlan,
+) -> ccmm_rs::ckks::RnsCkksCiphertext {
+    if std::env::var("FHE_FFT_LEGACY_PREPARED").as_deref() == Ok("1") {
+        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared(
+            input,
+            prepared_fft_stage,
+            evaluator,
+            prepared_galois_keys,
+            chain,
+            plan,
+            prepared_plan,
+        )
+    } else if std::env::var("FHE_FFT_SHARED_B_NTT").as_deref() == Ok("1") {
+        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident_shared_b(
+            input,
+            prepared_fft_stage,
+            evaluator,
+            prepared_galois_keys,
+            chain,
+            plan,
+            prepared_plan,
+        )
+    } else {
+        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident(
+            input,
+            prepared_fft_stage,
+            evaluator,
+            prepared_galois_keys,
+            chain,
+            plan,
+            prepared_plan,
+        )
+    }
 }
 
 fn main() {
@@ -816,6 +1379,16 @@ fn main() {
 
     let embedding = CkksCanonicalEmbedding::new(degree);
     let slot_count = embedding.slot_count();
+
+    /*
+     * R16 packing baseline.
+     *
+     * Keep the frozen R15 execution semantics at one logical tile per
+     * ciphertext while routing the representation through the general
+     * multi-tile packing abstraction.
+     */
+    let packing = FftTilePacking::new(fft_plan.tile_elements(), 1, slot_count);
+
     let top_plan = profile.rns_ntt_plan();
 
     let local_degree = local_profile.degree();
@@ -844,11 +1417,44 @@ fn main() {
 
     assert!(!local_profile.security_bearing());
     assert!(!profile.security_bearing());
+    let galois_key_mode = FftGaloisKeyMode::from_environment();
+    let randomness_mode = FftRandomnessMode::from_environment();
+
+    if randomness_mode == FftRandomnessMode::Secure {
+        assert!(
+            galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
+            "secure randomness mode requires bounded_gaussian_direct Galois keys"
+        );
+    }
+
+    println!("FFT_RANDOMNESS_MODE={}", randomness_mode.label());
+    println!(
+        "FFT_RANDOMNESS_SOURCE={}",
+        if randomness_mode == FftRandomnessMode::Secure {
+            "os_entropy_chacha20"
+        } else {
+            "deterministic_chacha20"
+        }
+    );
+
     println!("FFT_PARAMETERIZATION_BEGIN");
     println!("FFT_PROFILE={}", profile.name());
     println!("FFT_SECURITY_BEARING={}", profile.security_bearing());
     println!("FFT_RING_DEGREE={degree}");
     println!("FFT_SLOT_COUNT={slot_count}");
+    println!(
+        "FFT_PACKING_TILES_PER_CIPHERTEXT={}",
+        packing.tiles_per_ciphertext
+    );
+    println!(
+        "FFT_PACKING_ACTIVE_SLOTS_PER_CIPHERTEXT={}",
+        packing.active_slots()
+    );
+    println!("FFT_PACKING_SLOT_UTILIZATION={:.6}", packing.utilization());
+    println!(
+        "FFT_PACKING_CIPHERTEXT_COUNT={}",
+        packing.ciphertext_count(tile_count)
+    );
     println!("FFT_ROWS={}", shape.rows());
     println!("FFT_COLS={}", shape.cols());
     println!("FFT_ELEMENTS={}", shape.elements());
@@ -857,6 +1463,24 @@ fn main() {
     println!("FFT_INITIAL_SCALE={scale:.12e}");
     println!("FFT_ENCRYPTION_SIGMA={SIGMA:.6}");
     println!("FFT_GALOIS_KEY_NOISE_BOUND=0");
+    println!("FFT_GALOIS_KEY_MODE={}", galois_key_mode.label());
+    println!(
+        "FFT_GALOIS_KEY_ERROR_DISTRIBUTION={}",
+        match galois_key_mode {
+            FftGaloisKeyMode::Baseline => "zero",
+            FftGaloisKeyMode::Gaussian
+            | FftGaloisKeyMode::BoundedGaussian
+            | FftGaloisKeyMode::BoundedGaussianDirect => "discrete_gaussian",
+        }
+    );
+    if matches!(
+        galois_key_mode,
+        FftGaloisKeyMode::Gaussian
+            | FftGaloisKeyMode::BoundedGaussian
+            | FftGaloisKeyMode::BoundedGaussianDirect
+    ) {
+        println!("FFT_GALOIS_KEY_SIGMA={SIGMA:.6}");
+    }
     println!("FFT_PLAINTEXT_MODULUS=2");
     println!("FFT_GADGET_BLOCK_POLICY=singleton");
     println!("FFT_DIRECTION=forward");
@@ -872,9 +1496,13 @@ fn main() {
         .flush()
         .expect("FFT parameterization output must flush");
 
-    let output_dir = PathBuf::from(format!(
-        "results/image_filter/encrypted_frequency_filter/tiled_fft_{dimension}x{dimension}_tile_{tile_dimension}x{tile_dimension}"
-    ));
+    let output_dir = env::var_os("FFT_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "results/image_filter/encrypted_frequency_filter/tiled_fft_{dimension}x{dimension}_tile_{tile_dimension}x{tile_dimension}"
+            ))
+        });
 
     fs::create_dir_all(&output_dir)
         .expect("failed to create tiled encrypted image FFT result directory");
@@ -967,10 +1595,7 @@ fn main() {
 
     io::stdout().flush().expect("FFT plan output must flush");
 
-    if plan_only {
-        println!("FHE_FFT_PLAN_ONLY_STATUS=PASS");
-        return;
-    }
+    // Resource accounting follows before the plan-only exit.
 
     let available_parallelism = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -1085,6 +1710,11 @@ fn main() {
     println!("FFT_RESOURCE_MEMORY_ACCOUNTING=PAYLOAD_PLUS_OS_RSS");
     println!("FFT_RESOURCE_PLAN_END");
 
+    if plan_only {
+        println!("FHE_FFT_PLAN_ONLY_STATUS=PASS");
+        return;
+    }
+
     println!("IMAGE_FFT_INPUT={}", input_path.display());
     println!("IMAGE_FFT_OUTPUT_DIR={}", output_dir.display());
 
@@ -1132,16 +1762,16 @@ fn main() {
         shape,
     );
 
-    let plaintexts: Vec<_> = logical_tiles
+    let packed_inputs = pack_fft_tiles(&logical_tiles, packing);
+
+    assert_eq!(packed_inputs.len(), packing.ciphertext_count(tile_count));
+
+    let plaintexts: Vec<_> = packed_inputs
         .iter()
-        .map(|tile| {
-            let mut physical_input = vec![Complex64::new(0.0, 0.0); slot_count];
-            physical_input[..shape.elements()].copy_from_slice(tile);
-            encode_rns(&physical_input, &embedding, &top_basis, scale)
-        })
+        .map(|physical_input| encode_rns(physical_input, &embedding, &top_basis, scale))
         .collect();
 
-    let mut secret_rng = ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4c01);
+    let mut secret_rng = randomness_mode.rng(0x4652_4551_4649_4c01);
 
     let mut secret: Vec<i8> = (0..degree)
         .map(|_| secret_rng.gen_range(-1_i8..=1_i8))
@@ -1177,7 +1807,7 @@ fn main() {
                     tile_index,
                     scope.spawn(move || {
                         let mut encryption_rng =
-                            ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4c02 ^ tile_index as u64);
+                            randomness_mode.rng(0x4652_4551_4649_4c02 ^ tile_index as u64);
 
                         let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
                             plaintext,
@@ -1294,107 +1924,154 @@ fn main() {
     let mut evaluation_keys = RnsCkksEvaluationKeys::new();
     let mut timing_galois_ms = vec![0_u128; level_rotations.len()];
 
-    for (phase_offset, &(level, rotation)) in level_rotations.iter().enumerate() {
-        let phase_index = phase_offset + 2;
-        let phase_name = format!("level-{level} Galois keygen");
-        let keygen_start = phase_start(phase_index, total_phases, &phase_name);
+    if !matches!(
+        galois_key_mode,
+        FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
+    ) {
+        for (phase_offset, &(level, rotation)) in level_rotations.iter().enumerate() {
+            let phase_index = phase_offset + 2;
+            let phase_name = format!("level-{level} Galois keygen");
+            let keygen_start = phase_start(phase_index, total_phases, &phase_name);
 
-        let level_basis = chain.level(level).clone();
-        let level_layout =
-            RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
-        let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
+            let level_basis = chain.level(level).clone();
+            let level_layout =
+                RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
+            let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
 
-        println!(
-            "FFT_GALOIS_LEVEL level={level} rotation={rotation} limbs={} degree={degree}",
-            level_layout.full_basis().len()
-        );
-        io::stdout()
-            .flush()
-            .expect("Galois-level parameterization output must flush");
+            println!(
+                "FFT_GALOIS_LEVEL level={level} rotation={rotation} limbs={} degree={degree}",
+                level_layout.full_basis().len()
+            );
+            io::stdout()
+                .flush()
+                .expect("Galois-level parameterization output must flush");
 
-        let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
+            let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
 
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
+            let left_exponent = rotation_exponent_left(degree, rotation);
+            let right_exponent = rotation_exponent_right(degree, rotation);
 
-        println!(
+            println!(
             "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... START"
         );
-        println!(
+            println!(
             "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... START"
         );
-        io::stdout()
-            .flush()
-            .expect("Galois-key progress output must flush");
+            io::stdout()
+                .flush()
+                .expect("Galois-key progress output must flush");
 
-        let ((left_key, left_ms), (right_key, right_ms)) = std::thread::scope(|scope| {
-            let left_handle = scope.spawn(|| {
-                let start = Instant::now();
-                let mut rng =
-                    ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4d00 ^ ((level as u64) << 8));
+            let ((left_key, left_ms), (right_key, right_ms)) = std::thread::scope(|scope| {
+                let left_handle = scope.spawn(|| {
+                    let start = Instant::now();
+                    let mut rng =
+                        randomness_mode.rng(0x4652_4551_4649_4d00 ^ ((level as u64) << 8));
 
-                let key = RnsGaloisKey::generate_with_ntt_rng(
-                    RnsKeygenConfig {
+                    let config = RnsKeygenConfig {
                         degree,
                         plaintext_modulus: 2,
                         noise_bound: 0,
                         layout: level_layout.clone(),
                         plan: &level_plan,
-                    },
-                    &secret,
-                    left_exponent,
-                    &mut rng,
-                );
+                    };
 
-                (key, start.elapsed().as_millis())
-            });
+                    let key = match galois_key_mode {
+                        FftGaloisKeyMode::BoundedGaussianDirect => {
+                            unreachable!(
+                                "direct prepared Gaussian keys must use the bounded FFT stage helper"
+                            )
+                        },
 
-            let right_handle = scope.spawn(|| {
-                let start = Instant::now();
-                let mut rng = ChaCha20Rng::seed_from_u64(
-                    0x4652_4551_4649_4d00 ^ ((level as u64) << 8) ^ 1_u64,
-                );
+                        FftGaloisKeyMode::Baseline => RnsGaloisKey::generate_with_ntt_rng(
+                            config,
+                            &secret,
+                            left_exponent,
+                            &mut rng,
+                        ),
+                        FftGaloisKeyMode::Gaussian => {
+                            RnsGaloisKey::generate_with_distribution_ntt_rng(
+                                config,
+                                &secret,
+                                left_exponent,
+                                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                                &mut rng,
+                            )
+                        }
+                        FftGaloisKeyMode::BoundedGaussian => {
+                            unreachable!("bounded keys are generated per stage")
+                        }
+                    };
 
-                let key = RnsGaloisKey::generate_with_ntt_rng(
-                    RnsKeygenConfig {
+                    (key, start.elapsed().as_millis())
+                });
+
+                let right_handle = scope.spawn(|| {
+                    let start = Instant::now();
+                    let mut rng = randomness_mode.rng(0x4652_4551_4649_4d00 ^ ((level as u64) << 8) ^ 1_u64);
+
+                    let config = RnsKeygenConfig {
                         degree,
                         plaintext_modulus: 2,
                         noise_bound: 0,
                         layout: level_layout.clone(),
                         plan: &level_plan,
-                    },
-                    &secret,
-                    right_exponent,
-                    &mut rng,
-                );
+                    };
 
-                (key, start.elapsed().as_millis())
+                    let key = match galois_key_mode {
+                        FftGaloisKeyMode::BoundedGaussianDirect => {
+                            unreachable!(
+                                "direct prepared Gaussian keys must use the bounded FFT stage helper"
+                            )
+                        },
+
+                        FftGaloisKeyMode::Baseline => RnsGaloisKey::generate_with_ntt_rng(
+                            config,
+                            &secret,
+                            right_exponent,
+                            &mut rng,
+                        ),
+                        FftGaloisKeyMode::Gaussian => {
+                            RnsGaloisKey::generate_with_distribution_ntt_rng(
+                                config,
+                                &secret,
+                                right_exponent,
+                                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                                &mut rng,
+                            )
+                        }
+                        FftGaloisKeyMode::BoundedGaussian => {
+                            unreachable!("bounded keys are generated per stage")
+                        }
+                    };
+
+                    (key, start.elapsed().as_millis())
+                });
+
+                (
+                    left_handle
+                        .join()
+                        .expect("left Galois-key generation worker panicked"),
+                    right_handle
+                        .join()
+                        .expect("right Galois-key generation worker panicked"),
+                )
             });
 
-            (
-                left_handle
-                    .join()
-                    .expect("left Galois-key generation worker panicked"),
-                right_handle
-                    .join()
-                    .expect("right Galois-key generation worker panicked"),
-            )
-        });
-
-        println!(
+            println!(
             "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... DONE elapsed_ms={left_ms}"
         );
-        println!(
+            println!(
             "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... DONE elapsed_ms={right_ms}"
         );
 
-        level_keys.insert_galois_key(left_key);
-        level_keys.insert_galois_key(right_key);
+            level_keys.insert_galois_key(left_key);
+            level_keys.insert_galois_key(right_key);
 
-        evaluation_keys.insert_level(level_keys);
+            evaluation_keys.insert_level(level_keys);
 
-        timing_galois_ms[phase_offset] =
-            phase_done(phase_index, total_phases, &phase_name, keygen_start);
+            timing_galois_ms[phase_offset] =
+                phase_done(phase_index, total_phases, &phase_name, keygen_start);
+        }
     }
 
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
@@ -1580,73 +2257,100 @@ fn main() {
         let left_exponent = rotation_exponent_left(degree, rotation);
         let right_exponent = rotation_exponent_right(degree, rotation);
 
-        let stage_state = values
-            .first()
-            .expect("local-row FFT stage requires at least one encrypted tile")
-            .state();
+        if matches!(
+            galois_key_mode,
+            FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
+        ) {
+            values = execute_bounded_gaussian_local_stage(
+                randomness_mode,
+                galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
+                &values,
+                &diagonals,
+                &evaluator,
+                &secret,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+        } else {
+            let stage_state = values
+                .first()
+                .expect("local-row FFT stage requires at least one encrypted tile")
+                .state();
 
-        let prepared_left = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(stage_state, left_exponent),
-            &stage_plan,
-        );
+            let prepared_left = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(stage_state, left_exponent),
+                &stage_plan,
+            );
 
-        let prepared_right = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(stage_state, right_exponent),
-            &stage_plan,
-        );
+            let prepared_right = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(stage_state, right_exponent),
+                &stage_plan,
+            );
 
-        let mut stage_results = Vec::with_capacity(tile_count);
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                values.first().expect("FFT stage requires encrypted tiles"),
+                &diagonals,
+                1,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
 
-        for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
-            let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+            let mut stage_results = Vec::with_capacity(tile_count);
 
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::with_capacity(batch_end - batch_start);
+            for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
+                let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
 
-                for (tile_index, value) in
-                    values.iter().enumerate().take(batch_end).skip(batch_start)
-                {
-                    let diagonals = &diagonals;
-                    let evaluator = &evaluator;
-                    let prepared_left = &prepared_left;
-                    let prepared_right = &prepared_right;
-                    let embedding = &embedding;
-                    let chain = &chain;
-                    let stage_plan = &stage_plan;
+                let batch = std::thread::scope(|scope| {
+                    let mut workers = Vec::with_capacity(batch_end - batch_start);
 
-                    workers.push((
-                        tile_index,
-                        scope.spawn(move || {
-                            execute_packed_fft2_dif_stage_cp_prepared(
-                                value,
-                                diagonals,
-                                evaluator,
-                                (prepared_left, prepared_right),
-                                embedding,
-                                chain,
-                                stage_plan,
-                            )
-                        }),
-                    ));
-                }
+                    for (tile_index, value) in
+                        values.iter().enumerate().take(batch_end).skip(batch_start)
+                    {
+                        let evaluator = &evaluator;
+                        let prepared_left = &prepared_left;
+                        let prepared_right = &prepared_right;
+                        let prepared_fft_stage = &prepared_fft_stage;
+                        let chain = &chain;
+                        let stage_plan = &stage_plan;
+                        let prepared_plan = &prepared_plan;
 
-                workers
-                    .into_iter()
-                    .map(|(tile_index, worker)| {
-                        (
+                        workers.push((
                             tile_index,
-                            worker.join().expect("local FFT tile worker panicked"),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
+                            scope.spawn(move || {
+                                execute_fft_stage_r17_4h(
+                                    value,
+                                    prepared_fft_stage,
+                                    evaluator,
+                                    (prepared_left, prepared_right),
+                                    chain,
+                                    stage_plan,
+                                    prepared_plan,
+                                )
+                            }),
+                        ));
+                    }
 
-            stage_results.extend(batch);
+                    workers
+                        .into_iter()
+                        .map(|(tile_index, worker)| {
+                            (
+                                tile_index,
+                                worker.join().expect("local FFT tile worker panicked"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+
+                stage_results.extend(batch);
+            }
+
+            stage_results.sort_by_key(|(tile_index, _)| *tile_index);
+
+            values = stage_results.into_iter().map(|(_, value)| value).collect();
         }
-
-        stage_results.sort_by_key(|(tile_index, _)| *tile_index);
-
-        values = stage_results.into_iter().map(|(_, value)| value).collect();
 
         execution_level += 1;
         maybe_check_stage!();
@@ -1818,73 +2522,100 @@ fn main() {
         let left_exponent = rotation_exponent_left(degree, rotation);
         let right_exponent = rotation_exponent_right(degree, rotation);
 
-        let stage_state = values
-            .first()
-            .expect("local-column FFT stage requires at least one encrypted tile")
-            .state();
+        if matches!(
+            galois_key_mode,
+            FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
+        ) {
+            values = execute_bounded_gaussian_local_stage(
+                randomness_mode,
+                galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
+                &values,
+                &diagonals,
+                &evaluator,
+                &secret,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+        } else {
+            let stage_state = values
+                .first()
+                .expect("local-column FFT stage requires at least one encrypted tile")
+                .state();
 
-        let prepared_left = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(stage_state, left_exponent),
-            &stage_plan,
-        );
+            let prepared_left = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(stage_state, left_exponent),
+                &stage_plan,
+            );
 
-        let prepared_right = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(stage_state, right_exponent),
-            &stage_plan,
-        );
+            let prepared_right = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(stage_state, right_exponent),
+                &stage_plan,
+            );
 
-        let mut stage_results = Vec::with_capacity(tile_count);
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                values.first().expect("FFT stage requires encrypted tiles"),
+                &diagonals,
+                1,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
 
-        for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
-            let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+            let mut stage_results = Vec::with_capacity(tile_count);
 
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::with_capacity(batch_end - batch_start);
+            for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
+                let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
 
-                for (tile_index, value) in
-                    values.iter().enumerate().take(batch_end).skip(batch_start)
-                {
-                    let diagonals = &diagonals;
-                    let evaluator = &evaluator;
-                    let prepared_left = &prepared_left;
-                    let prepared_right = &prepared_right;
-                    let embedding = &embedding;
-                    let chain = &chain;
-                    let stage_plan = &stage_plan;
+                let batch = std::thread::scope(|scope| {
+                    let mut workers = Vec::with_capacity(batch_end - batch_start);
 
-                    workers.push((
-                        tile_index,
-                        scope.spawn(move || {
-                            execute_packed_fft2_dif_stage_cp_prepared(
-                                value,
-                                diagonals,
-                                evaluator,
-                                (prepared_left, prepared_right),
-                                embedding,
-                                chain,
-                                stage_plan,
-                            )
-                        }),
-                    ));
-                }
+                    for (tile_index, value) in
+                        values.iter().enumerate().take(batch_end).skip(batch_start)
+                    {
+                        let evaluator = &evaluator;
+                        let prepared_left = &prepared_left;
+                        let prepared_right = &prepared_right;
+                        let prepared_fft_stage = &prepared_fft_stage;
+                        let chain = &chain;
+                        let stage_plan = &stage_plan;
+                        let prepared_plan = &prepared_plan;
 
-                workers
-                    .into_iter()
-                    .map(|(tile_index, worker)| {
-                        (
+                        workers.push((
                             tile_index,
-                            worker.join().expect("local FFT tile worker panicked"),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
+                            scope.spawn(move || {
+                                execute_fft_stage_r17_4h(
+                                    value,
+                                    prepared_fft_stage,
+                                    evaluator,
+                                    (prepared_left, prepared_right),
+                                    chain,
+                                    stage_plan,
+                                    prepared_plan,
+                                )
+                            }),
+                        ));
+                    }
 
-            stage_results.extend(batch);
+                    workers
+                        .into_iter()
+                        .map(|(tile_index, worker)| {
+                            (
+                                tile_index,
+                                worker.join().expect("local FFT tile worker panicked"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+
+                stage_results.extend(batch);
+            }
+
+            stage_results.sort_by_key(|(tile_index, _)| *tile_index);
+
+            values = stage_results.into_iter().map(|(_, value)| value).collect();
         }
-
-        stage_results.sort_by_key(|(tile_index, _)| *tile_index);
-
-        values = stage_results.into_iter().map(|(_, value)| value).collect();
 
         execution_level += 1;
         maybe_check_stage!();
@@ -1920,22 +2651,33 @@ fn main() {
     let decrypt_phase = fft_phase + 1;
     let decrypt_decode_start = phase_start(decrypt_phase, total_phases, "global decrypt/decode");
 
-    let mut global_physical = vec![Complex64::new(0.0, 0.0); fft_plan.image_elements()];
+    let decoded_packed: Vec<Vec<Complex64>> = values
+        .iter()
+        .map(|value| decrypt_slots(value, &secret, &embedding))
+        .collect();
 
     let mut inactive_max_abs = 0.0_f64;
+
+    for decoded in &decoded_packed {
+        inactive_max_abs = inactive_max_abs.max(
+            decoded[packing.active_slots()..]
+                .iter()
+                .map(|value| value.norm())
+                .fold(0.0_f64, f64::max),
+        );
+    }
+
+    let decoded_tiles = unpack_fft_tiles(&decoded_packed, tile_count, packing);
+
+    assert_eq!(decoded_tiles.len(), tile_count);
+
+    let mut global_physical = vec![Complex64::new(0.0, 0.0); fft_plan.image_elements()];
 
     for tile_row in 0..fft_plan.tiles_per_col {
         for tile_col in 0..fft_plan.tiles_per_row {
             let tile_index = tile_row * fft_plan.tiles_per_row + tile_col;
 
-            let decoded = decrypt_slots(&values[tile_index], &secret, &embedding);
-
-            inactive_max_abs = inactive_max_abs.max(
-                decoded[shape.elements()..]
-                    .iter()
-                    .map(|value| value.norm())
-                    .fold(0.0_f64, f64::max),
-            );
+            let decoded_tile = &decoded_tiles[tile_index];
 
             for local_row in 0..fft_plan.tile_rows {
                 for local_col in 0..fft_plan.tile_cols {
@@ -1946,7 +2688,7 @@ fn main() {
 
                     let global_index = global_row * fft_plan.image_cols + global_col;
 
-                    global_physical[global_index] = decoded[tile_slot];
+                    global_physical[global_index] = decoded_tile[tile_slot];
                 }
             }
         }
@@ -1973,6 +2715,50 @@ fn main() {
     let clear_global = fft2_pp(image_shape, FftDirection::Forward, &logical_image);
 
     let (rel_l2, max_abs) = error_metrics(&decoded_global, &clear_global);
+
+    // Both spectra use the same logarithmic display scale.
+    let log_maximum = clear_global
+        .iter()
+        .chain(decoded_global.iter())
+        .map(|value| value.norm().ln_1p())
+        .fold(0.0_f64, f64::max);
+
+    save_global_spectrum_image(
+        &output_dir.join("03_clear_global_fft_log_magnitude.png"),
+        &clear_global,
+        image_shape,
+        log_maximum,
+    );
+
+    save_global_spectrum_image(
+        &output_dir.join("04_encrypted_global_fft_log_magnitude.png"),
+        &decoded_global,
+        image_shape,
+        log_maximum,
+    );
+
+    let absolute_error: Vec<Complex64> = decoded_global
+        .iter()
+        .zip(clear_global.iter())
+        .map(|(encrypted, clear)| Complex64::new((encrypted - clear).norm(), 0.0))
+        .collect();
+
+    // Error visualization uses an independent scale.
+    let error_log_maximum = absolute_error
+        .iter()
+        .map(|value| value.norm().ln_1p())
+        .fold(0.0_f64, f64::max);
+
+    save_global_spectrum_image(
+        &output_dir.join("05_global_fft_absolute_error.png"),
+        &absolute_error,
+        image_shape,
+        error_log_maximum,
+    );
+
+    println!("FFT_GLOBAL_SPECTRUM_EXPORT_STATUS=PASS");
+    println!("FFT_GLOBAL_SPECTRUM_DISPLAY_LOG_MAX={log_maximum:.12e}");
+    println!("FFT_GLOBAL_ERROR_DISPLAY_LOG_MAX={error_log_maximum:.12e}");
 
     let status = if rel_l2 <= TOLERANCE && max_abs <= TOLERANCE && inactive_max_abs <= TOLERANCE {
         "PASS"
@@ -2037,4 +2823,88 @@ fn main() {
     println!("FACTORED_FFT_RESULT_END");
 
     assert_eq!(status, "PASS");
+}
+
+#[cfg(test)]
+mod packing_tests {
+    use super::{pack_fft_tiles, unpack_fft_tiles, FftTilePacking};
+    use num_complex::Complex64;
+
+    #[test]
+    fn fft_tile_packing_reports_expected_65536_utilization() {
+        let slot_count = 32_768;
+        let tile_elements = 64 * 64;
+
+        for (tiles_per_ciphertext, expected_active_slots) in
+            [(1, 4_096), (2, 8_192), (4, 16_384), (8, 32_768)]
+        {
+            let packing = FftTilePacking::new(tile_elements, tiles_per_ciphertext, slot_count);
+
+            assert_eq!(packing.active_slots(), expected_active_slots);
+            assert_eq!(
+                packing.utilization(),
+                expected_active_slots as f64 / slot_count as f64
+            );
+        }
+    }
+
+    #[test]
+    fn fft_tile_packing_ranges_are_contiguous_and_disjoint() {
+        let packing = FftTilePacking::new(4096, 4, 32768);
+
+        assert_eq!(packing.slot_range(0), 0..4096);
+        assert_eq!(packing.slot_range(1), 4096..8192);
+        assert_eq!(packing.slot_range(2), 8192..12288);
+        assert_eq!(packing.slot_range(3), 12288..16384);
+    }
+
+    #[test]
+    fn fft_tile_pack_unpack_roundtrip_preserves_logical_tiles() {
+        let tile_elements = 16;
+        let logical_tile_count = 7;
+        let packing = FftTilePacking::new(tile_elements, 4, 128);
+
+        let tiles: Vec<Vec<Complex64>> = (0..logical_tile_count)
+            .map(|tile_index| {
+                (0..tile_elements)
+                    .map(|element_index| {
+                        Complex64::new(
+                            (1000 * tile_index + element_index) as f64,
+                            -(element_index as f64),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let packed = pack_fft_tiles(&tiles, packing);
+
+        assert_eq!(packed.len(), 2);
+
+        /*
+         * Four logical tiles occupy the first packed ciphertext.
+         * The remaining unused slots must remain zero.
+         */
+        assert!(packed[0][packing.active_slots()..]
+            .iter()
+            .all(|value| *value == Complex64::new(0.0, 0.0)));
+
+        /*
+         * The second ciphertext contains only three logical tiles.
+         * Its unused fourth tile region and trailing slots remain zero.
+         */
+        assert!(packed[1][3 * tile_elements..]
+            .iter()
+            .all(|value| *value == Complex64::new(0.0, 0.0)));
+
+        let recovered = unpack_fft_tiles(&packed, logical_tile_count, packing);
+
+        assert_eq!(recovered, tiles);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires 36864 slots")]
+    fn fft_tile_packing_rejects_capacity_overflow() {
+        let _ = FftTilePacking::new(4096, 9, 32768);
+    }
 }

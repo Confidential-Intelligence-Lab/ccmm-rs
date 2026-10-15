@@ -994,6 +994,14 @@ fn main() {
 
         let start = Instant::now();
 
+        let equivalence_input = if std::env::var("R22_4_FULL_ROW_EQUIVALENCE").as_deref() == Ok("1")
+            && macro_index == 0
+        {
+            Some(input.clone())
+        } else {
+            None
+        };
+
         let output = execute_packed_1k_fft_rows_cp(
             input,
             &evaluator,
@@ -1002,6 +1010,56 @@ fn main() {
             inter_ct_parallelism,
             local_parallelism,
         );
+
+        if let Some(reference_input) = equivalence_input {
+            let primary_resident =
+                std::env::var("FHE_PACKED_1K_NTT_RESIDENT").as_deref() == Ok("1");
+
+            assert!(
+                primary_resident,
+                "R22.4 requires FHE_PACKED_1K_NTT_RESIDENT=1"
+            );
+
+            let resident_ms = start.elapsed().as_millis();
+
+            std::env::set_var("FHE_PACKED_1K_NTT_RESIDENT", "0");
+
+            let legacy_start = Instant::now();
+
+            let reference = execute_packed_1k_fft_rows_cp(
+                reference_input,
+                &evaluator,
+                &embedding,
+                &chain,
+                inter_ct_parallelism,
+                local_parallelism,
+            );
+
+            let legacy_ms = legacy_start.elapsed().as_millis();
+
+            assert_eq!(output.len(), CT_PER_MACRO);
+            assert_eq!(reference.len(), CT_PER_MACRO);
+
+            for (index, (resident, legacy)) in output.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    resident.rlwe(),
+                    legacy.rlwe(),
+                    "R22.4 RLWE mismatch ciphertext={index}"
+                );
+                assert_eq!(
+                    resident.state(),
+                    legacy.state(),
+                    "R22.4 CKKS state mismatch ciphertext={index}"
+                );
+            }
+
+            println!("R22_4_CIPHERTEXTS_VERIFIED={CT_PER_MACRO}");
+            println!("R22_4_RESIDENT_MS={resident_ms}");
+            println!("R22_4_LEGACY_MS={legacy_ms}");
+            println!("R22_4_SPEEDUP={:.6}", legacy_ms as f64 / resident_ms as f64);
+            println!("R22_4_EXACT_RLWE_STATUS=PASS");
+            return;
+        }
 
         println!(
             "R21_UHD_MACRO_ROW_PROGRESS macro={}/16 level={} elapsed_ms={}",
@@ -1012,6 +1070,16 @@ fn main() {
 
         *macrotile = Some(output);
         io::stdout().flush().unwrap();
+
+        if macro_index == 0 && std::env::var("R22_BENCH_FIRST_MACRO_ROW").as_deref() == Ok("1") {
+            println!("R22_3_ROW_MS={}", start.elapsed().as_millis());
+            println!(
+                "R22_3_RESIDENT={}",
+                std::env::var("FHE_PACKED_1K_NTT_RESIDENT").as_deref() == Ok("1")
+            );
+            println!("R22_3_STATUS=PASS");
+            return;
+        }
     }
 
     /*
@@ -1050,6 +1118,14 @@ fn main() {
 
         let start = Instant::now();
 
+        let equivalence_input = if macro_index == 0
+            && std::env::var("R22_5_FULL_COLUMN_EQUIVALENCE").as_deref() == Ok("1")
+        {
+            Some(input.clone())
+        } else {
+            None
+        };
+
         let output = execute_packed_1k_fft_columns_cp(
             input,
             &evaluator,
@@ -1058,6 +1134,55 @@ fn main() {
             inter_ct_parallelism,
             local_parallelism,
         );
+
+        if let Some(reference_input) = equivalence_input {
+            assert_eq!(
+                std::env::var("FHE_PACKED_1K_NTT_RESIDENT").as_deref(),
+                Ok("1"),
+                "R22.5 requires NTT-resident primary execution"
+            );
+
+            let resident_ms = start.elapsed().as_millis();
+
+            std::env::set_var("FHE_PACKED_1K_NTT_RESIDENT", "0");
+
+            let legacy_start = Instant::now();
+
+            let reference = execute_packed_1k_fft_columns_cp(
+                reference_input,
+                &evaluator,
+                &embedding,
+                &chain,
+                inter_ct_parallelism,
+                local_parallelism,
+            );
+
+            let legacy_ms = legacy_start.elapsed().as_millis();
+
+            assert_eq!(output.len(), CT_PER_MACRO);
+            assert_eq!(reference.len(), CT_PER_MACRO);
+
+            for (index, (resident, legacy)) in output.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    resident.rlwe(),
+                    legacy.rlwe(),
+                    "R22.5 RLWE mismatch ciphertext={index}"
+                );
+
+                assert_eq!(
+                    resident.state(),
+                    legacy.state(),
+                    "R22.5 CKKS state mismatch ciphertext={index}"
+                );
+            }
+
+            println!("R22_5_CIPHERTEXTS_VERIFIED={CT_PER_MACRO}");
+            println!("R22_5_RESIDENT_MS={resident_ms}");
+            println!("R22_5_LEGACY_MS={legacy_ms}");
+            println!("R22_5_SPEEDUP={:.6}", legacy_ms as f64 / resident_ms as f64);
+            println!("R22_5_EXACT_RLWE_STATUS=PASS");
+            return;
+        }
 
         println!(
             "R21_UHD_MACRO_COLUMN_PROGRESS macro={}/16 level={} elapsed_ms={}",
