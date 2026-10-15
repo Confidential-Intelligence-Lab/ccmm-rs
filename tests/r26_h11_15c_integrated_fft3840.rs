@@ -9,15 +9,9 @@ use ccmm_rs::eblas::prepared_radix4_fft256::StageContext as PackedStageContext;
 // Research-only parameters and deterministic test keys; no intermediate decryption.
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    rotate_left_bounded_rns_ckks_with_prepared_execution as rotate_left_for_extraction,
     rotation_exponent_left, rotation_exponent_right, BoundedRnsGaloisKey, CkksCanonicalEmbedding,
     CkksChainState, PreparedBoundedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluationKeys,
     RnsCkksEvaluator,
-};
-use ccmm_rs::eblas::level1::{multiply_complex_slots_cp_prepared, PreparedComplexSlotsCp};
-use ccmm_rs::eblas::mixed_radix_ckks::{
-    packed_fft15_twiddled_radix3_cp_prepared, packed_radix5_dft_cp_prepared,
-    PreparedFft15TwiddledRadix3Cp, PreparedRadix5Cp,
 };
 use ccmm_rs::grafting::{
     decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
@@ -74,7 +68,7 @@ fn decode(
 
 use std::collections::BTreeSet;
 
-use ccmm_rs::eblas::encrypted_fft3840::PreparedEncryptedFft3840;
+use ccmm_rs::eblas::encrypted_fft3840::{PreparedEncryptedFft15, PreparedEncryptedFft3840};
 use ccmm_rs::eblas::fused_fft256_handoff::{fuse_fft256_source_lane, PreparedFusedFft256Source};
 
 use ccmm_rs::eblas::prepared_radix4_fft256::{pack_fft256_branch_diagonals, PreparedFft256Stage};
@@ -220,6 +214,7 @@ fn r27_load_pgm_rows(path: &str) -> Vec<Vec<Complex64>> {
 
 // R28_4B1_REUSABLE_FFT15
 #[allow(clippy::too_many_arguments)]
+// R29_2B2A_IMPORT_AND_RETURN_REPAIR
 fn encrypt_and_fft15(
     natural: &[Vec<Complex64>],
     slots: usize,
@@ -236,6 +231,7 @@ fn encrypt_and_fft15(
     prepared2: &PreparedRnsNttPlan,
     mut rng: &mut ChaCha20Rng,
     prepared_left: &PreparedBoundedRnsGaloisKey,
+    fft15_cache: &mut Option<PreparedEncryptedFft15>,
 ) -> Vec<RnsCkksCiphertext> {
     const HALF: usize = 4096;
     const TILES: usize = 15;
@@ -269,68 +265,41 @@ fn encrypt_and_fft15(
         })
         .collect();
 
-    let low_mask: Vec<Complex64> = (0..slots)
-        .map(|s| Complex64::new(if s < HALF { 1.0 } else { 0.0 }, 0.0))
-        .collect();
-    let prepared_mask =
-        PreparedComplexSlotsCp::new(&physical[0], &low_mask, embedding, chain, plan0);
-    let evaluation_keys = RnsCkksEvaluationKeys::new();
-    let evaluator = RnsCkksEvaluator::new(chain, &evaluation_keys);
-    let aligned: Vec<RnsCkksCiphertext> = (0..TILES)
-        .map(|tile| {
-            let source = &physical[tile / 2];
-            if tile % 2 == 0 {
-                multiply_complex_slots_cp_prepared(source, &prepared_mask, chain, prepared0)
-            } else {
-                let shifted = rotate_left_for_extraction(
-                    source,
-                    HALF,
-                    prepared_left,
-                    chain,
-                    plan0,
-                    prepared0,
-                );
-                multiply_complex_slots_cp_prepared(&shifted, &prepared_mask, chain, prepared0)
-            }
-        })
-        .collect();
-    assert!(aligned.iter().all(|ct| ct.level() == 1));
-    let radix5 = PreparedRadix5Cp::new(&aligned[0], embedding, chain, plan1);
-    let branches: [[RnsCkksCiphertext; 5]; 3] = std::array::from_fn(|j| {
-        packed_radix5_dft_cp_prepared(
-            &evaluator,
-            [
-                &aligned[j],
-                &aligned[j + 3],
-                &aligned[j + 6],
-                &aligned[j + 9],
-                &aligned[j + 12],
-            ],
-            &radix5,
+    // R29_2B2_PRODUCTION_FFT15_EVALUATOR
+    let physical: [RnsCkksCiphertext; 8] = physical
+        .try_into()
+        .unwrap_or_else(|_| panic!("expected eight physical ciphertexts"));
+
+    let sources = if let Some(prepared) = fft15_cache.as_ref() {
+        prepared.execute(
+            &physical,
             chain,
+            plan0,
+            prepared0,
             prepared1,
-        )
-    });
-    let radix3 = PreparedFft15TwiddledRadix3Cp::new(&branches[0][0], embedding, chain, plan2);
-    let groups: [[RnsCkksCiphertext; 3]; 5] = std::array::from_fn(|k| {
-        packed_fft15_twiddled_radix3_cp_prepared(
-            &evaluator,
-            [&branches[0][k], &branches[1][k], &branches[2][k]],
-            k,
-            &radix3,
-            chain,
             prepared2,
+            prepared_left,
         )
-    });
-
-    let sources: Vec<RnsCkksCiphertext> = (0..15).map(|h| groups[h % 5][h / 5].clone()).collect();
-
-    assert_eq!(sources.len(), 15);
-    assert!(sources.iter().all(|ct| ct.level() == 3));
+    } else {
+        let (prepared, first_sources) = PreparedEncryptedFft15::prepare_and_execute_first(
+            &physical,
+            embedding,
+            chain,
+            plan0,
+            prepared0,
+            plan1,
+            prepared1,
+            plan2,
+            prepared2,
+            prepared_left,
+        );
+        *fft15_cache = Some(prepared);
+        first_sources
+    };
 
     println!("R26_H11_15C_FFT15_BRANCHES=15");
     println!("R26_H11_15C_FFT15_OUTPUT_LEVEL=3");
-    sources
+    sources.into_iter().collect()
 }
 
 // R26_H11_15C_PACKED_PRODUCTION_INTEGRATION
@@ -428,6 +397,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
     );
     let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &plan0);
 
+    let mut fft15_cache: Option<PreparedEncryptedFft15> = None;
     let sources = encrypt_and_fft15(
         &natural,
         slots,
@@ -444,6 +414,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         &prepared2,
         &mut rng,
         &prepared_left,
+        &mut fft15_cache,
     );
 
     // R28_4B3_SECOND_IMAGE
@@ -481,6 +452,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             &prepared2,
             &mut image_rng,
             &prepared_left,
+            &mut fft15_cache,
         );
 
         assert_eq!(sources_b.len(), 15);
