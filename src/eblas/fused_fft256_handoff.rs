@@ -78,7 +78,6 @@ pub fn fuse_fft256_source_lane(
 
 use crate::application_support::ckks::encode_rns;
 use crate::ckks::{
-    apply_hybrid_rns_galois_automorphism_with_prepared_ntt,
     multiply_plain_rns_ckks_with_prepared_ntt, rescale_rns_ckks_to_next, CkksCanonicalEmbedding,
     PreparedRnsPlaintextNtt, RnsCkksCiphertext,
 };
@@ -148,6 +147,20 @@ pub fn apply_fused_fft256_sources(
     let expected_level = sources[0].1.level;
     let expected_scale = sources[0].0.scale();
 
+    // R28_3A_PREPARED_QP_FUSED
+    // Prepare the QP NTT execution plan once for all source rotations.
+    let prepared_qp = crate::ring::PreparedRnsNttPlan::new(ctx.qp_plan);
+
+    // R28_FUSED_OPERATION_PROFILE: opt-in operation-level profiling.
+    let profile_enabled = std::env::var("FHE_R28_FUSED_PROFILE").is_ok_and(|value| value == "1");
+
+    let mut rotation_ms = 0.0_f64;
+    let mut multiply_ms = 0.0_f64;
+    let mut addition_ms = 0.0_f64;
+    let mut rotation_count = 0usize;
+    let mut multiply_count = 0usize;
+    let mut addition_count = 0usize;
+
     let mut accumulator: Option<RnsCkksCiphertext> = None;
 
     for &(input, prepared_source) in sources {
@@ -167,11 +180,19 @@ pub fn apply_fused_fft256_sources(
                     .get(offset)
                     .expect("missing fused FFT256 rotation key");
 
-                let rotated_rlwe = apply_hybrid_rns_galois_automorphism_with_prepared_ntt(
+                let started = profile_enabled.then(std::time::Instant::now);
+
+                let rotated_rlwe = crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_qp(
                     input.rlwe(),
                     key,
                     ctx.qp_plan,
+                    &prepared_qp,
                 );
+
+                if let Some(started) = started {
+                    rotation_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    rotation_count += 1;
+                }
 
                 Some(RnsCkksCiphertext::new(
                     rotated_rlwe,
@@ -182,6 +203,8 @@ pub fn apply_fused_fft256_sources(
 
             let operand = rotated.as_ref().unwrap_or(input);
 
+            let started = profile_enabled.then(std::time::Instant::now);
+
             let term = multiply_plain_rns_ckks_with_prepared_ntt(
                 operand,
                 prepared_plaintext,
@@ -190,17 +213,44 @@ pub fn apply_fused_fft256_sources(
                 ctx.prepared,
             );
 
+            if let Some(started) = started {
+                multiply_ms += started.elapsed().as_secs_f64() * 1000.0;
+                multiply_count += 1;
+            }
+
+            let started = profile_enabled.then(std::time::Instant::now);
+            let had_accumulator = accumulator.is_some();
+
             accumulator = Some(match accumulator {
                 Some(previous) => ctx.evaluator.add(&previous, &term),
                 None => term,
             });
+
+            if let Some(started) = started {
+                addition_ms += started.elapsed().as_secs_f64() * 1000.0;
+                if had_accumulator {
+                    addition_count += 1;
+                }
+            }
         }
     }
 
-    rescale_rns_ckks_to_next(
+    let started = profile_enabled.then(std::time::Instant::now);
+
+    let result = rescale_rns_ckks_to_next(
         &accumulator.expect("nonempty fused FFT256 accumulator"),
         ctx.chain,
-    )
+    );
+
+    if let Some(started) = started {
+        let rescale_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "R28_FUSED_PROFILE rotation_ms={rotation_ms:.3} multiply_ms={multiply_ms:.3} addition_ms={addition_ms:.3} rescale_ms={rescale_ms:.3} rotations={rotation_count} multiplications={multiply_count} additions={addition_count}"
+        );
+    }
+
+    result
 }
 
 /// Apply a full-slot diagonal operator to plaintext values.
@@ -259,25 +309,62 @@ pub fn apply_fft3840_packed_fft256_from_fft15(
         "packed FFT3840 requires level-3 FFT15 branches"
     );
 
-    std::array::from_fn(|group| {
+    // R28_FFT_STAGE_TIMING: opt-in, non-invasive stage instrumentation.
+    let timing_enabled = std::env::var("FHE_R28_FFT_STAGE_TIMING").is_ok_and(|value| value == "1");
+    let mut stage_totals_ms = [0.0_f64; 4];
+
+    let outputs = std::array::from_fn(|group| {
         let range = if group == 0 { 0..8 } else { 8..15 };
 
         let inputs: Vec<(&RnsCkksCiphertext, &PreparedFusedFft256Source)> = range
             .map(|branch| (&branches[branch], &prepared_sources[branch]))
             .collect();
 
+        let started = timing_enabled.then(std::time::Instant::now);
         let mut output = apply_fused_fft256_sources(&inputs, contexts[0]);
+
+        if let Some(started) = started {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            stage_totals_ms[0] += elapsed_ms;
+            println!(
+                "R28_STAGE_TIMING group={group} stage=0 elapsed_ms={elapsed_ms:.3} output_level={}",
+                output.level()
+            );
+        }
 
         assert_eq!(output.level(), 4);
 
         for stage in 0..3 {
+            let started = timing_enabled.then(std::time::Instant::now);
             output = apply_stage(&output, &later_stages[stage], contexts[stage + 1]);
+
+            if let Some(started) = started {
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                stage_totals_ms[stage + 1] += elapsed_ms;
+                println!(
+                    "R28_STAGE_TIMING group={group} stage={} elapsed_ms={elapsed_ms:.3} output_level={}",
+                    stage + 1,
+                    output.level()
+                );
+            }
 
             assert_eq!(output.level(), stage + 5);
         }
 
         output
-    })
+    });
+
+    if timing_enabled {
+        for (stage, elapsed_ms) in stage_totals_ms.iter().enumerate() {
+            println!("R28_STAGE_TOTAL stage={stage} elapsed_ms={elapsed_ms:.3}");
+        }
+        println!(
+            "R28_STAGE_TOTAL_SUM_MS={:.3}",
+            stage_totals_ms.iter().sum::<f64>()
+        );
+    }
+
+    outputs
 }
 
 #[cfg(test)]
