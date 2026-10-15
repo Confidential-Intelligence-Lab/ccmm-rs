@@ -2125,6 +2125,34 @@ pub fn rns_key_switch_with_prepared_dynamic_ntt_resident(
     prepared_key: &PreparedRnsKeySwitchKey,
     plan: &PreparedRnsNttPlan,
 ) -> RnsNttRlweCiphertext {
+    rns_key_switch_with_prepared_dynamic_ntt_resident_impl(ciphertext, prepared_key, plan, None)
+}
+
+/// Experimental R17.5: prepared NTT representation of the transformed
+/// ciphertext b component, indexed by RNS limb.
+///
+/// Each supplied limb must equal the forward negacyclic NTT of the
+/// corresponding coefficient-domain b polynomial.
+pub fn rns_key_switch_with_prepared_dynamic_ntt_resident_prepared_b(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &PreparedRnsNttPlan,
+    prepared_b: &[Vec<u64>],
+) -> RnsNttRlweCiphertext {
+    rns_key_switch_with_prepared_dynamic_ntt_resident_impl(
+        ciphertext,
+        prepared_key,
+        plan,
+        Some(prepared_b),
+    )
+}
+
+fn rns_key_switch_with_prepared_dynamic_ntt_resident_impl(
+    ciphertext: &RnsRlweCiphertext,
+    prepared_key: &PreparedRnsKeySwitchKey,
+    plan: &PreparedRnsNttPlan,
+    prepared_b: Option<&[Vec<u64>]>,
+) -> RnsNttRlweCiphertext {
     let layout = prepared_key.layout();
 
     assert_eq!(
@@ -2145,6 +2173,21 @@ pub fn rns_key_switch_with_prepared_dynamic_ntt_resident(
         "RNS key-switch ciphertext basis must match prepared key basis"
     );
 
+    if let Some(prepared_b) = prepared_b {
+        assert_eq!(
+            prepared_b.len(),
+            layout.full_basis().len(),
+            "prepared b limb count must match key-switch basis"
+        );
+        for (limb_index, values) in prepared_b.iter().enumerate() {
+            assert_eq!(
+                values.len(),
+                ciphertext.degree(),
+                "prepared b NTT degree mismatch at limb {limb_index}"
+            );
+        }
+    }
+
     let a = RnsPolynomial::from_residues(
         ciphertext
             .limbs()
@@ -2162,10 +2205,12 @@ pub fn rns_key_switch_with_prepared_dynamic_ntt_resident(
         let modulus = layout.full_basis().modulus(limb_index);
         let limb_plan = plan.plan(limb_index);
 
-        let mut b_ntt = NttPolynomial::from_prepared_values(
-            limb_plan,
-            limb_plan.forward(ciphertext.limb(limb_index).b()),
-        );
+        let b_values = match prepared_b {
+            Some(prepared_b) => prepared_b[limb_index].clone(),
+            None => limb_plan.forward(ciphertext.limb(limb_index).b()),
+        };
+
+        let mut b_ntt = NttPolynomial::from_prepared_values(limb_plan, b_values);
 
         // Zero has the same representation in coefficient and NTT domains.
         let mut a_ntt =

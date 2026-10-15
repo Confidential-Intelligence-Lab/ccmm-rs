@@ -91,3 +91,5 @@ pub use ntt_parameter_sets::{
     CANONICAL_NTT_DEGREE, CANONICAL_NTT_PARAMETERS, NTT128_MODULUS, NTT128_PSI, NTT32_MODULUS,
     NTT32_PSI, NTT64_MODULUS, NTT64_PSI,
 };
+
+pub mod ntt_galois_permutation;

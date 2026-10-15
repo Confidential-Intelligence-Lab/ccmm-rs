@@ -110,6 +110,46 @@ impl PreparedRnsPlaintextNtt {
     }
 }
 
+/// Multiplies an NTT-resident RLWE ciphertext by an NTT-prepared plaintext.
+///
+/// The result is returned in coefficient representation, matching the
+/// existing prepared ciphertext-plaintext multiplication arithmetic.
+///
+/// This primitive does not rescale or modify CKKS chain metadata.
+pub fn multiply_ntt_resident_rlwe_with_prepared_plaintext(
+    ciphertext: &crate::grafting::RnsNttRlweCiphertext,
+    plaintext: &PreparedRnsPlaintextNtt,
+    plan: &PreparedRnsNttPlan,
+) -> crate::grafting::RnsRlweCiphertext {
+    assert_eq!(
+        ciphertext.degree(),
+        plan.degree(),
+        "resident CP ciphertext degree must match prepared NTT plan"
+    );
+    assert_eq!(
+        ciphertext.moduli(),
+        plan.moduli(),
+        "resident CP ciphertext basis must match prepared NTT plan"
+    );
+    assert_eq!(
+        plaintext.degree(),
+        ciphertext.degree(),
+        "resident CP plaintext degree mismatch"
+    );
+    assert_eq!(
+        plaintext.moduli(),
+        ciphertext.moduli(),
+        "resident CP plaintext basis mismatch"
+    );
+
+    let b_product = ciphertext.b().pointwise_mul(plaintext.polynomial());
+    let a_product = ciphertext.a().pointwise_mul(plaintext.polynomial());
+
+    let product = crate::grafting::RnsNttRlweCiphertext::new(b_product, a_product);
+
+    product.to_coefficient(plan)
+}
+
 /// Multiplies an RNS CKKS ciphertext by a reusable NTT-prepared plaintext.
 ///
 /// This is mathematically equivalent to `multiply_plain_rns_ckks_with_ntt`,
@@ -222,13 +262,13 @@ mod tests {
                 let b = Polynomial::new(
                     modulus,
                     (0..degree)
-                        .map(|index| ((17 * index as u64 + 11 * limb_index as u64 + 3) % q) as u64)
+                        .map(|index| (17 * index as u64 + 11 * limb_index as u64 + 3) % q)
                         .collect(),
                 );
                 let a = Polynomial::new(
                     modulus,
                     (0..degree)
-                        .map(|index| ((29 * index as u64 + 7 * limb_index as u64 + 5) % q) as u64)
+                        .map(|index| (29 * index as u64 + 7 * limb_index as u64 + 5) % q)
                         .collect(),
                 );
 
@@ -254,9 +294,7 @@ mod tests {
                     Polynomial::new(
                         modulus,
                         (0..degree)
-                            .map(|index| {
-                                ((13 * index as u64 + 19 * limb_index as u64 + 1) % q) as u64
-                            })
+                            .map(|index| (13 * index as u64 + 19 * limb_index as u64 + 1) % q)
                             .collect(),
                     )
                 })

@@ -340,9 +340,59 @@ pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident(
         plan,
     )
 }
+/// Experimental R17.5d shared-input-NTT Galois execution.
+/// The caller supplies the original ciphertext b-component NTT values.
+pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_shared_b(
+    ciphertext: &RnsRlweCiphertext,
+    galois_key: &PreparedRnsGaloisKey,
+    plan: &crate::ring::PreparedRnsNttPlan,
+    original_b_ntt: &[Vec<u64>],
+) -> crate::grafting::RnsNttRlweCiphertext {
+    use crate::ring::ntt_galois_permutation::permute_negacyclic_ntt_galois;
 
-/// Profiling variant of the NTT-resident prepared-dynamic Galois path.
-///
+    assert_eq!(
+        ciphertext.basis(),
+        galois_key.layout().full_basis(),
+        "R17.5d Galois key basis mismatch"
+    );
+    assert_eq!(
+        plan.moduli(),
+        ciphertext.basis().moduli(),
+        "R17.5d Galois plan basis mismatch"
+    );
+    assert_eq!(
+        plan.degree(),
+        ciphertext.degree(),
+        "R17.5d Galois plan degree mismatch"
+    );
+    assert_eq!(
+        original_b_ntt.len(),
+        ciphertext.basis().len(),
+        "R17.5d shared b limb count mismatch"
+    );
+
+    let transformed = apply_rns_automorphism(ciphertext, galois_key.exponent());
+
+    let prepared_b: Vec<Vec<u64>> = original_b_ntt
+        .iter()
+        .map(|values| {
+            assert_eq!(
+                values.len(),
+                ciphertext.degree(),
+                "R17.5d shared b degree mismatch"
+            );
+            permute_negacyclic_ntt_galois(values, galois_key.exponent())
+        })
+        .collect();
+
+    crate::grafting::rns_key_switch::rns_key_switch_with_prepared_dynamic_ntt_resident_prepared_b(
+        &transformed,
+        galois_key.key_switch_key(),
+        plan,
+        &prepared_b,
+    )
+}
+/// Profiles the prepared NTT-resident Galois operation.
 /// Returns `(ciphertext, automorphism_seconds, key_switch_seconds)`.
 pub fn apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_profiled(
     ciphertext: &RnsRlweCiphertext,
@@ -748,6 +798,114 @@ pub fn conjugate_rns_ckks(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r17_5d3_shared_b_ntt_matches_resident_galois() {
+        use crate::ring::ntt_galois_permutation::permute_negacyclic_ntt_galois;
+
+        let degree = 1024usize;
+        let basis = crate::ring::ModulusBasis::new(vec![
+            crate::ring::Modulus::new(12289),
+            crate::ring::Modulus::new(40961),
+            crate::ring::Modulus::new(65537),
+        ]);
+        let plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = crate::ring::PreparedRnsNttPlan::new(&plan);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|i| match i % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
+
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0x175D_0003);
+
+        let plaintext = crate::ring::RnsPolynomial::from_residues(
+            basis
+                .moduli()
+                .iter()
+                .map(|&modulus| {
+                    crate::ring::Polynomial::new(
+                        modulus,
+                        (0..degree)
+                            .map(|i| ((i * 17 + 3) as u64) % modulus.value())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+
+        let ciphertext = crate::grafting::encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            crate::rlwe::ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &plan,
+            &mut rng,
+        );
+
+        let original_b_ntt: Vec<Vec<u64>> = (0..basis.len())
+            .map(|i| prepared_plan.plan(i).forward(ciphertext.limb(i).b()))
+            .collect();
+
+        for exponent in [3usize, 5, 7, 11] {
+            let key = RnsGaloisKey::generate_with_ntt_rng(
+                crate::grafting::RnsKeygenConfig {
+                    degree,
+                    plaintext_modulus: 2,
+                    noise_bound: 0,
+                    layout: crate::grafting::RnsGadgetLayout::new(
+                        basis.clone(),
+                        vec![1; basis.len()],
+                    ),
+                    plan: &plan,
+                },
+                &secret,
+                exponent,
+                &mut rng,
+            );
+
+            let prepared_key = PreparedRnsGaloisKey::new(&key, &plan);
+
+            let baseline = apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident(
+                &ciphertext,
+                &prepared_key,
+                &prepared_plan,
+            );
+
+            let transformed = crate::ckks::apply_rns_automorphism(&ciphertext, exponent);
+
+            let prepared_b: Vec<Vec<u64>> = original_b_ntt
+                .iter()
+                .map(|values| permute_negacyclic_ntt_galois(values, exponent))
+                .collect();
+
+            for (i, values) in prepared_b.iter().enumerate() {
+                assert_eq!(
+                    values,
+                    &prepared_plan.plan(i).forward(transformed.limb(i).b()),
+                    "prepared b mismatch limb={i} exponent={exponent}"
+                );
+            }
+
+            let optimized =
+                crate::grafting::rns_key_switch::rns_key_switch_with_prepared_dynamic_ntt_resident_prepared_b(
+                    &transformed,
+                    prepared_key.key_switch_key(),
+                    &prepared_plan,
+                    &prepared_b,
+                );
+
+            assert_eq!(
+                baseline, optimized,
+                "resident key-switch mismatch exponent={exponent}"
+            );
+
+            println!("R17_5D3_EXACT_RLWE exponent={exponent} status=PASS");
+        }
+    }
+
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
