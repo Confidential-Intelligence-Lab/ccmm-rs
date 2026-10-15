@@ -447,6 +447,62 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         &prepared_left,
     );
 
+    // R28_4B3_SECOND_IMAGE
+    // Opt-in two-image mode; preserve the existing single-image baseline.
+    let second_image = if std::env::var("FHE_R28_TWO_IMAGES").as_deref() == Ok("1") {
+        let natural_b: Vec<Vec<Complex64>> = natural
+            .iter()
+            .enumerate()
+            .map(|(tile, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(slot, value)| {
+                        let phase = 0.17 * (tile as f64) + 0.003 * (slot as f64);
+                        *value * Complex64::new(phase.cos(), phase.sin())
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut image_rng = ChaCha20Rng::seed_from_u64(0x284B_3002);
+
+        let sources_b = encrypt_and_fft15(
+            &natural_b,
+            slots,
+            &embedding,
+            &chain,
+            &basis0,
+            scale,
+            &secret,
+            &plan0,
+            &prepared0,
+            &plan1,
+            &prepared1,
+            &plan2,
+            &prepared2,
+            &mut image_rng,
+            &prepared_left,
+        );
+
+        assert_eq!(sources_b.len(), 15);
+        assert!(sources_b.iter().all(|ct| ct.level() == 3));
+
+        println!("R28_4B3_SECOND_IMAGE_FFT15_STATUS=PASS");
+
+        Some((natural_b, sources_b))
+    } else {
+        None
+    };
+
+    // R28_4B3_SECOND_IMAGE_CONSUMPTION
+    // Temporary structural check until the second FFT256 call is integrated.
+    if let Some((natural_b, sources_b)) = second_image.as_ref() {
+        assert_eq!(natural_b.len(), 15);
+        assert!(natural_b.iter().all(|tile| tile.len() == 4096));
+        assert_eq!(sources_b.len(), 15);
+        assert!(sources_b.iter().all(|ct| ct.level() == 3));
+    }
+
     // Prepare fused placement and branch-specific first-stage
     // butterflies for both groups.
     let preparation_started = Instant::now();
@@ -641,6 +697,37 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         &prepared_fft_context,
     );
 
+    // R28_4B3_TWO_IMAGE_FFT256
+    // Reuse all FFT256 public operands, rotation keys, and QP context.
+    let second_results = if let Some((_, sources_b)) = second_image.as_ref() {
+        let started = Instant::now();
+
+        let source_array_b: [RnsCkksCiphertext; 15] = sources_b
+            .clone()
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected 15 image-B FFT256 sources"));
+
+        let results_b = apply_fft3840_packed_fft256_with_context(
+            &source_array_b,
+            &prepared_array,
+            &later_array,
+            [&contexts[0], &contexts[1], &contexts[2], &contexts[3]],
+            &prepared_fft_context,
+        );
+
+        assert_eq!(results_b.len(), 2);
+        assert!(results_b.iter().all(|ct| ct.level() == 7));
+
+        println!(
+            "R28_4B3_IMAGE_1_FFT256_MS={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+
+        Some(results_b)
+    } else {
+        None
+    };
+
     println!(
         "R26_H11_14F_TOTAL_EVALUATION_MS={:.3}",
         evaluation_started.elapsed().as_secs_f64() * 1000.0
@@ -782,6 +869,131 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         relative_l2 < 1.0e-5,
         "encrypted FFT3840 numerical validation failed"
     );
+
+    if let Some(results_b) = second_results.as_ref() {
+        assert_eq!(results_b.len(), 2);
+        assert!(results_b.iter().all(|ct| ct.level() == 7));
+        println!("R28_4B3_SECOND_IMAGE_FFT256_STATUS=PASS");
+    }
+
+    // R28_4B4_INDEPENDENT_IMAGE_B_ORACLE
+    if let (Some((natural_b, _)), Some(results_b)) =
+        (second_image.as_ref(), second_results.as_ref())
+    {
+        let validation_started_b = Instant::now();
+
+        let mut reference_b = vec![Complex64::new(0.0, 0.0); 16 * 3840];
+
+        for row in 0..16 {
+            for k_cross in 0..TILES {
+                let mut local = vec![Complex64::new(0.0, 0.0); 256];
+
+                for (s, value) in local.iter_mut().enumerate() {
+                    let cross: Complex64 = (0..TILES)
+                        .map(|tile| natural_b[tile][row * 256 + s] * root(TILES, k_cross * tile))
+                        .sum();
+
+                    *value = cross * root(3840, k_cross * s);
+                }
+
+                for i in 0usize..256 {
+                    let j = i.reverse_bits() >> (usize::BITS - 8);
+                    if i < j {
+                        local.swap(i, j);
+                    }
+                }
+
+                let mut len = 2;
+                while len <= 256 {
+                    for base in (0..256).step_by(len) {
+                        for j in 0..len / 2 {
+                            let a = local[base + j];
+                            let b = local[base + j + len / 2] * root(len, j);
+
+                            local[base + j] = a + b;
+                            local[base + j + len / 2] = a - b;
+                        }
+                    }
+                    len *= 2;
+                }
+
+                for (k_local, &value) in local.iter().enumerate() {
+                    reference_b[row * 3840 + k_cross + TILES * k_local] = value;
+                }
+            }
+        }
+
+        for &row in &[0usize, 7, 15] {
+            for &frequency in &[0usize, 7, 255, 1024, 3839] {
+                let direct: Complex64 = (0..3840)
+                    .map(|n| {
+                        let tile = n / 256;
+                        let slot = n % 256;
+                        natural_b[tile][row * 256 + slot] * root(3840, frequency * n)
+                    })
+                    .sum();
+
+                let staged = reference_b[row * 3840 + frequency];
+
+                assert!(
+                    (direct - staged).norm() < 1e-8,
+                    "image B oracle disagreement: row={row} frequency={frequency}"
+                );
+            }
+        }
+
+        let mut error_sq_b = 0.0_f64;
+        let mut reference_sq_b = 0.0_f64;
+        let mut max_abs_b = 0.0_f64;
+        let mut count_b = 0usize;
+
+        for (group, ciphertext) in results_b.iter().enumerate() {
+            let actual = decode(ciphertext, &secret, &embedding);
+
+            assert_eq!(ciphertext.level(), 7);
+
+            let branches = if group == 0 { 0..8 } else { 8..15 };
+
+            for (lane, branch) in branches.enumerate() {
+                for row in 0..16 {
+                    for k in 0..256 {
+                        let slot = lane * HALF + row * 256 + k;
+                        let frequency = row * 3840 + branch + 15 * k;
+
+                        let expected = reference_b[frequency];
+                        let error = (actual[slot] - expected).norm();
+
+                        error_sq_b += error * error;
+                        reference_sq_b += expected.norm_sqr();
+                        max_abs_b = max_abs_b.max(error);
+                        count_b += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(count_b, 61_440);
+        assert!(reference_sq_b > 0.0);
+
+        let relative_l2_b = (error_sq_b / reference_sq_b).sqrt();
+
+        println!("R28_4B3_IMAGES=2");
+        println!("R28_4B3_IMAGE_0_RELATIVE_L2={relative_l2:.12e}");
+        println!("R28_4B3_IMAGE_1_RELATIVE_L2={relative_l2_b:.12e}");
+        println!("R28_4B3_IMAGE_1_MAX_ABS={max_abs_b:.12e}");
+        println!("R28_4B3_IMAGE_1_SPECTRAL_VALUES={count_b}");
+        println!(
+            "R28_4B3_IMAGE_1_VALIDATION_MS={:.3}",
+            validation_started_b.elapsed().as_secs_f64() * 1000.0
+        );
+
+        assert!(
+            relative_l2_b < 1.0e-5,
+            "image B encrypted FFT3840 numerical validation failed"
+        );
+
+        println!("R28_4B3_TWO_IMAGE_STATUS=PASS");
+    }
 
     println!("R26_H11_15C_ENCRYPTED_STATUS=PASS");
 }
