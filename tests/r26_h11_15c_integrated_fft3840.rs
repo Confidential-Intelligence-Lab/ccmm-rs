@@ -75,7 +75,7 @@ fn decode(
 use std::collections::BTreeSet;
 
 use ccmm_rs::eblas::fused_fft256_handoff::{
-    apply_fft3840_packed_fft256_from_fft15, fuse_fft256_source_lane, PreparedFusedFft256Source,
+    apply_fft3840_packed_fft256_with_context, fuse_fft256_source_lane, PreparedFusedFft256Source,
 };
 
 use ccmm_rs::eblas::prepared_radix4_fft256::{pack_fft256_branch_diagonals, PreparedFft256Stage};
@@ -578,11 +578,21 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         .try_into()
         .unwrap_or_else(|_| panic!("expected three prepared FFT256 stages"));
 
-    let results = apply_fft3840_packed_fft256_from_fft15(
+    // R28_4A_INTEGRATION
+    let prepared_fft_context =
+        ccmm_rs::eblas::prepared_radix4_fft256::PreparedFft256ExecutionContext::new([
+            &contexts[0],
+            &contexts[1],
+            &contexts[2],
+            &contexts[3],
+        ]);
+
+    let results = apply_fft3840_packed_fft256_with_context(
         &source_array,
         &prepared_array,
         &later_array,
         [&contexts[0], &contexts[1], &contexts[2], &contexts[3]],
+        &prepared_fft_context,
     );
 
     println!(

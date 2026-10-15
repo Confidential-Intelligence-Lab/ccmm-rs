@@ -142,14 +142,19 @@ pub fn apply_fused_fft256_sources(
     sources: &[(&RnsCkksCiphertext, &PreparedFusedFft256Source)],
     ctx: &StageContext<'_>,
 ) -> RnsCkksCiphertext {
+    let prepared_qp = crate::ring::PreparedRnsNttPlan::new(ctx.qp_plan);
+    apply_fused_fft256_sources_with_qp(sources, ctx, &prepared_qp)
+}
+
+fn apply_fused_fft256_sources_with_qp(
+    sources: &[(&RnsCkksCiphertext, &PreparedFusedFft256Source)],
+    ctx: &StageContext<'_>,
+    prepared_qp: &crate::ring::PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
     assert!(!sources.is_empty(), "at least one fused source required");
 
     let expected_level = sources[0].1.level;
     let expected_scale = sources[0].0.scale();
-
-    // R28_3A_PREPARED_QP_FUSED
-    // Prepare the QP NTT execution plan once for all source rotations.
-    let prepared_qp = crate::ring::PreparedRnsNttPlan::new(ctx.qp_plan);
 
     // R28_FUSED_OPERATION_PROFILE: opt-in operation-level profiling.
     let profile_enabled = std::env::var("FHE_R28_FUSED_PROFILE").is_ok_and(|value| value == "1");
@@ -186,7 +191,7 @@ pub fn apply_fused_fft256_sources(
                     input.rlwe(),
                     key,
                     ctx.qp_plan,
-                    &prepared_qp,
+                    prepared_qp,
                 );
 
                 if let Some(started) = started {
@@ -302,6 +307,27 @@ pub fn apply_fft3840_packed_fft256_from_fft15(
     later_stages: &[crate::eblas::prepared_radix4_fft256::PreparedFft256Stage; 3],
     contexts: [&crate::eblas::prepared_radix4_fft256::StageContext<'_>; 4],
 ) -> [RnsCkksCiphertext; 2] {
+    let prepared_context =
+        crate::eblas::prepared_radix4_fft256::PreparedFft256ExecutionContext::new(contexts);
+
+    apply_fft3840_packed_fft256_with_context(
+        branches,
+        prepared_sources,
+        later_stages,
+        contexts,
+        &prepared_context,
+    )
+}
+
+pub fn apply_fft3840_packed_fft256_with_context(
+    branches: &[RnsCkksCiphertext; 15],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    later_stages: &[crate::eblas::prepared_radix4_fft256::PreparedFft256Stage; 3],
+    contexts: [&crate::eblas::prepared_radix4_fft256::StageContext<'_>; 4],
+    prepared_context: &crate::eblas::prepared_radix4_fft256::PreparedFft256ExecutionContext,
+) -> [RnsCkksCiphertext; 2] {
+    // R28_4A_REUSABLE_FUSED_QP
+    let shared_qp = prepared_context.qp_plans();
     use crate::eblas::prepared_radix4_fft256::apply_stage;
 
     assert!(
@@ -321,7 +347,7 @@ pub fn apply_fft3840_packed_fft256_from_fft15(
             .collect();
 
         let started = timing_enabled.then(std::time::Instant::now);
-        let mut output = apply_fused_fft256_sources(&inputs, contexts[0]);
+        let mut output = apply_fused_fft256_sources_with_qp(&inputs, contexts[0], &shared_qp[0]);
 
         if let Some(started) = started {
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;

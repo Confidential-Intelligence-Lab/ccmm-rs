@@ -508,6 +508,10 @@ impl PreparedFft256ExecutionContext {
             qp: std::array::from_fn(|stage| PreparedRnsNttPlan::new(contexts[stage].qp_plan)),
         }
     }
+
+    pub(crate) fn qp_plans(&self) -> &[PreparedRnsNttPlan; 4] {
+        &self.qp
+    }
 }
 
 /// Execute FFT256 branches using a persistent, bounded Rayon pool.
