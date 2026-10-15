@@ -68,7 +68,10 @@ fn decode(
 
 use std::collections::BTreeSet;
 
-use ccmm_rs::eblas::encrypted_fft3840::{PreparedEncryptedFft15, PreparedEncryptedFft3840};
+use ccmm_rs::eblas::encrypted_fft3840::{
+    EncryptedFft15ExecutionResources, EncryptedFft3840Pipeline, PreparedEncryptedFft15,
+    PreparedEncryptedFft3840,
+};
 use ccmm_rs::eblas::fused_fft256_handoff::{fuse_fft256_source_lane, PreparedFusedFft256Source};
 
 use ccmm_rs::eblas::prepared_radix4_fft256::{pack_fft256_branch_diagonals, PreparedFft256Stage};
@@ -212,10 +215,9 @@ fn r27_load_pgm_rows(path: &str) -> Vec<Vec<Complex64>> {
     natural
 }
 
-// R28_4B1_REUSABLE_FFT15
+// R29_3C_COMPLETE_PIPELINE_EXECUTION
 #[allow(clippy::too_many_arguments)]
-// R29_2B2A_IMPORT_AND_RETURN_REPAIR
-fn encrypt_and_fft15(
+fn encrypt_fft15_physical(
     natural: &[Vec<Complex64>],
     slots: usize,
     embedding: &CkksCanonicalEmbedding,
@@ -224,15 +226,8 @@ fn encrypt_and_fft15(
     scale: f64,
     secret: &[i8],
     plan0: &RnsNttPlan,
-    prepared0: &PreparedRnsNttPlan,
-    plan1: &RnsNttPlan,
-    prepared1: &PreparedRnsNttPlan,
-    plan2: &RnsNttPlan,
-    prepared2: &PreparedRnsNttPlan,
-    mut rng: &mut ChaCha20Rng,
-    prepared_left: &PreparedBoundedRnsGaloisKey,
-    fft15_cache: &mut Option<PreparedEncryptedFft15>,
-) -> Vec<RnsCkksCiphertext> {
+    rng: &mut ChaCha20Rng,
+) -> [RnsCkksCiphertext; 8] {
     const HALF: usize = 4096;
     const TILES: usize = 15;
 
@@ -259,16 +254,43 @@ fn encrypt_and_fft15(
                 ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
                 secret,
                 plan0,
-                &mut rng,
+                rng,
             );
             RnsCkksCiphertext::new(rlwe, CkksChainState::top(chain, scale), chain)
         })
         .collect();
 
-    // R29_2B2_PRODUCTION_FFT15_EVALUATOR
     let physical: [RnsCkksCiphertext; 8] = physical
         .try_into()
         .unwrap_or_else(|_| panic!("expected eight physical ciphertexts"));
+
+    physical
+}
+
+// R28_4B1_REUSABLE_FFT15
+#[allow(clippy::too_many_arguments)]
+// R29_2B2A_IMPORT_AND_RETURN_REPAIR
+fn encrypt_and_fft15(
+    natural: &[Vec<Complex64>],
+    slots: usize,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    basis0: &ModulusBasis,
+    scale: f64,
+    secret: &[i8],
+    plan0: &RnsNttPlan,
+    prepared0: &PreparedRnsNttPlan,
+    plan1: &RnsNttPlan,
+    prepared1: &PreparedRnsNttPlan,
+    plan2: &RnsNttPlan,
+    prepared2: &PreparedRnsNttPlan,
+    rng: &mut ChaCha20Rng,
+    prepared_left: &PreparedBoundedRnsGaloisKey,
+    fft15_cache: &mut Option<PreparedEncryptedFft15>,
+) -> Vec<RnsCkksCiphertext> {
+    let physical = encrypt_fft15_physical(
+        natural, slots, embedding, chain, basis0, scale, secret, plan0, rng,
+    );
 
     let sources = if let Some(prepared) = fft15_cache.as_ref() {
         prepared.execute(
@@ -436,7 +458,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
 
         let mut image_rng = ChaCha20Rng::seed_from_u64(0x284B_3002);
 
-        let sources_b = encrypt_and_fft15(
+        let physical_b = encrypt_fft15_physical(
             &natural_b,
             slots,
             &embedding,
@@ -445,33 +467,24 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             scale,
             &secret,
             &plan0,
-            &prepared0,
-            &plan1,
-            &prepared1,
-            &plan2,
-            &prepared2,
             &mut image_rng,
-            &prepared_left,
-            &mut fft15_cache,
         );
 
-        assert_eq!(sources_b.len(), 15);
-        assert!(sources_b.iter().all(|ct| ct.level() == 3));
+        assert!(physical_b.iter().all(|ct| ct.level() == 0));
+        println!("R29_3C_SECOND_IMAGE_ENCRYPTION_STATUS=PASS");
 
-        println!("R28_4B3_SECOND_IMAGE_FFT15_STATUS=PASS");
-
-        Some((natural_b, sources_b))
+        Some((natural_b, physical_b))
     } else {
         None
     };
 
     // R28_4B3_SECOND_IMAGE_CONSUMPTION
     // Temporary structural check until the second FFT256 call is integrated.
-    if let Some((natural_b, sources_b)) = second_image.as_ref() {
+    if let Some((natural_b, physical_b)) = second_image.as_ref() {
         assert_eq!(natural_b.len(), 15);
         assert!(natural_b.iter().all(|tile| tile.len() == 4096));
-        assert_eq!(sources_b.len(), 15);
-        assert!(sources_b.iter().all(|ct| ct.level() == 3));
+        assert_eq!(physical_b.len(), 8);
+        assert!(physical_b.iter().all(|ct| ct.level() == 0));
     }
 
     // Prepare fused placement and branch-specific first-stage
@@ -667,19 +680,31 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         [&contexts[0], &contexts[1], &contexts[2], &contexts[3]],
         &prepared_fft_context,
     );
-    let results = service.execute(&source_array);
+    // R29_3B2A_UNIFIED_PIPELINE_MIGRATION
+    let fft15_prepared = fft15_cache.take().expect("FFT15 preparation must exist");
+
+    let pipeline = EncryptedFft3840Pipeline::from_prepared(
+        fft15_prepared,
+        service,
+        EncryptedFft15ExecutionResources {
+            chain: &chain,
+            plan0: &plan0,
+            prepared0: &prepared0,
+            prepared1: &prepared1,
+            prepared2: &prepared2,
+            prepared_left: &prepared_left,
+        },
+    );
+
+    let results = pipeline.execute_prepared_branches(&source_array);
 
     // R28_4B3_TWO_IMAGE_FFT256
     // Reuse all FFT256 public operands, rotation keys, and QP context.
-    let second_results = if let Some((_, sources_b)) = second_image.as_ref() {
+    let second_results = if let Some((_, physical_b)) = second_image.as_ref() {
         let started = Instant::now();
 
-        let source_array_b: [RnsCkksCiphertext; 15] = sources_b
-            .clone()
-            .try_into()
-            .unwrap_or_else(|_| panic!("expected 15 image-B FFT256 sources"));
-
-        let results_b = service.execute(&source_array_b);
+        let results_b = pipeline.execute(physical_b);
+        println!("R29_3C_SECOND_IMAGE_COMPLETE_PIPELINE_STATUS=PASS");
 
         assert_eq!(results_b.len(), 2);
         assert!(results_b.iter().all(|ct| ct.level() == 7));

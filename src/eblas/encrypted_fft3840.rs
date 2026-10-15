@@ -360,3 +360,112 @@ impl PreparedEncryptedFft15 {
         sources
     }
 }
+
+// R29_3A_UNIFIED_ENCRYPTED_FFT3840_PIPELINE
+
+/// Borrowed resources required to evaluate the FFT15 front end.
+///
+/// Cryptographic plans and evaluation keys remain caller-owned.
+pub struct EncryptedFft15ExecutionResources<'a> {
+    pub chain: &'a ModulusChain,
+    pub plan0: &'a RnsNttPlan,
+    pub prepared0: &'a PreparedRnsNttPlan,
+    pub prepared1: &'a PreparedRnsNttPlan,
+    pub prepared2: &'a PreparedRnsNttPlan,
+    pub prepared_left: &'a PreparedBoundedRnsGaloisKey,
+}
+
+/// A reusable encrypted FFT3840 pipeline.
+///
+/// The first execution prepares FFT15 public operands. Subsequent
+/// executions reuse them together with the borrowed FFT256 service.
+///
+/// This pipeline neither encrypts nor decrypts ciphertexts.
+pub struct EncryptedFft3840Pipeline<'a, 'ctx> {
+    fft15: PreparedEncryptedFft15,
+    fft256: PreparedEncryptedFft3840<'a, 'ctx>,
+    resources: EncryptedFft15ExecutionResources<'a>,
+}
+
+impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+    // R29_3B1_FROM_PREPARED_COMPONENTS
+    /// Compose already-prepared FFT15 and FFT256 services.
+    ///
+    /// No ciphertext evaluation or preparation is performed here.
+    pub fn from_prepared(
+        fft15: PreparedEncryptedFft15,
+        fft256: PreparedEncryptedFft3840<'a, 'ctx>,
+        resources: EncryptedFft15ExecutionResources<'a>,
+    ) -> Self {
+        Self {
+            fft15,
+            fft256,
+            resources,
+        }
+    }
+}
+
+impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+    /// Prepare the FFT15 front end and execute the first encrypted input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_and_execute_first(
+        physical: &[RnsCkksCiphertext; 8],
+        embedding: &CkksCanonicalEmbedding,
+        plan1: &RnsNttPlan,
+        plan2: &RnsNttPlan,
+        resources: EncryptedFft15ExecutionResources<'a>,
+        fft256: PreparedEncryptedFft3840<'a, 'ctx>,
+    ) -> (Self, [RnsCkksCiphertext; 2]) {
+        let (fft15, branches) = PreparedEncryptedFft15::prepare_and_execute_first(
+            physical,
+            embedding,
+            resources.chain,
+            resources.plan0,
+            resources.prepared0,
+            plan1,
+            resources.prepared1,
+            plan2,
+            resources.prepared2,
+            resources.prepared_left,
+        );
+
+        let spectrum = fft256.execute(&branches);
+
+        (
+            Self {
+                fft15,
+                fft256,
+                resources,
+            },
+            spectrum,
+        )
+    }
+
+    /// Execute another compatible encrypted input using prepared operands.
+    pub fn execute(&self, physical: &[RnsCkksCiphertext; 8]) -> [RnsCkksCiphertext; 2] {
+        let branches = self.fft15.execute(
+            physical,
+            self.resources.chain,
+            self.resources.plan0,
+            self.resources.prepared0,
+            self.resources.prepared1,
+            self.resources.prepared2,
+            self.resources.prepared_left,
+        );
+
+        self.fft256.execute(&branches)
+    }
+}
+
+// R29_3B2A_UNIFIED_PIPELINE_MIGRATION
+impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+    /// Execute already-computed FFT15 branches through FFT256.
+    ///
+    /// No FFT15 computation or preparation is repeated.
+    pub fn execute_prepared_branches(
+        &self,
+        branches: &[RnsCkksCiphertext; 15],
+    ) -> [RnsCkksCiphertext; 2] {
+        self.fft256.execute(branches)
+    }
+}
