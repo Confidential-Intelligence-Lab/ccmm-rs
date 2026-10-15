@@ -219,6 +219,132 @@ fn r27_load_pgm_rows(path: &str) -> Vec<Vec<Complex64>> {
     natural
 }
 
+// R28_4B1_REUSABLE_FFT15
+#[allow(clippy::too_many_arguments)]
+fn encrypt_and_fft15(
+    natural: &[Vec<Complex64>],
+    slots: usize,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    basis0: &ModulusBasis,
+    scale: f64,
+    secret: &[i8],
+    plan0: &RnsNttPlan,
+    prepared0: &PreparedRnsNttPlan,
+    plan1: &RnsNttPlan,
+    prepared1: &PreparedRnsNttPlan,
+    plan2: &RnsNttPlan,
+    prepared2: &PreparedRnsNttPlan,
+    mut rng: &mut ChaCha20Rng,
+) -> Vec<RnsCkksCiphertext> {
+    const HALF: usize = 4096;
+    const TILES: usize = 15;
+    let degree = embedding.degree();
+
+    // The physical FFT15 kernel has one ciphertext per pair of 4096-slot tiles.
+    // Pack local FFT256 inputs in base-4 digit-reversed order so the FFT256
+    // diagonal kernel can consume the actual FFT15 ciphertext directly.
+    let physical: Vec<RnsCkksCiphertext> = (0..8)
+        .map(|index| {
+            let mut values = vec![Complex64::new(0.0, 0.0); slots];
+            for half in 0..2 {
+                let tile = 2 * index + half;
+                if tile < TILES {
+                    for slot in 0..HALF {
+                        let block = (slot / 256) * 256;
+                        let reordered = block + reverse_base4_4(slot % 256);
+                        values[half * HALF + slot] = natural[tile][reordered];
+                    }
+                }
+            }
+            let plaintext = encode_rns(&values, embedding, basis0, scale);
+            let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+                &plaintext,
+                2,
+                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                secret,
+                plan0,
+                &mut rng,
+            );
+            RnsCkksCiphertext::new(rlwe, CkksChainState::top(chain, scale), chain)
+        })
+        .collect();
+    let left_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+        BoundedRnsKeygenConfig {
+            plaintext_modulus: 2,
+            layout: BoundedGadgetLayout::new(basis0.clone(), 8),
+            plan: plan0,
+        },
+        secret,
+        rotation_exponent_left(degree, HALF),
+        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+        &mut rng,
+    );
+    let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, plan0);
+    let low_mask: Vec<Complex64> = (0..slots)
+        .map(|s| Complex64::new(if s < HALF { 1.0 } else { 0.0 }, 0.0))
+        .collect();
+    let prepared_mask =
+        PreparedComplexSlotsCp::new(&physical[0], &low_mask, embedding, chain, plan0);
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
+    let evaluator = RnsCkksEvaluator::new(chain, &evaluation_keys);
+    let aligned: Vec<RnsCkksCiphertext> = (0..TILES)
+        .map(|tile| {
+            let source = &physical[tile / 2];
+            if tile % 2 == 0 {
+                multiply_complex_slots_cp_prepared(source, &prepared_mask, chain, prepared0)
+            } else {
+                let shifted = rotate_left_for_extraction(
+                    source,
+                    HALF,
+                    &prepared_left,
+                    chain,
+                    plan0,
+                    prepared0,
+                );
+                multiply_complex_slots_cp_prepared(&shifted, &prepared_mask, chain, prepared0)
+            }
+        })
+        .collect();
+    assert!(aligned.iter().all(|ct| ct.level() == 1));
+    let radix5 = PreparedRadix5Cp::new(&aligned[0], embedding, chain, plan1);
+    let branches: [[RnsCkksCiphertext; 5]; 3] = std::array::from_fn(|j| {
+        packed_radix5_dft_cp_prepared(
+            &evaluator,
+            [
+                &aligned[j],
+                &aligned[j + 3],
+                &aligned[j + 6],
+                &aligned[j + 9],
+                &aligned[j + 12],
+            ],
+            &radix5,
+            chain,
+            prepared1,
+        )
+    });
+    let radix3 = PreparedFft15TwiddledRadix3Cp::new(&branches[0][0], embedding, chain, plan2);
+    let groups: [[RnsCkksCiphertext; 3]; 5] = std::array::from_fn(|k| {
+        packed_fft15_twiddled_radix3_cp_prepared(
+            &evaluator,
+            [&branches[0][k], &branches[1][k], &branches[2][k]],
+            k,
+            &radix3,
+            chain,
+            prepared2,
+        )
+    });
+
+    let sources: Vec<RnsCkksCiphertext> = (0..15).map(|h| groups[h % 5][h / 5].clone()).collect();
+
+    assert_eq!(sources.len(), 15);
+    assert!(sources.iter().all(|ct| ct.level() == 3));
+
+    println!("R26_H11_15C_FFT15_BRANCHES=15");
+    println!("R26_H11_15C_FFT15_OUTPUT_LEVEL=3");
+    sources
+}
+
 // R26_H11_15C_PACKED_PRODUCTION_INTEGRATION
 
 type PackedRotationKeys = std::collections::BTreeMap<isize, PreparedHybridRnsGaloisKey>;
@@ -300,107 +426,11 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             })
             .collect()
     };
-    // The physical FFT15 kernel has one ciphertext per pair of 4096-slot tiles.
-    // Pack local FFT256 inputs in base-4 digit-reversed order so the FFT256
-    // diagonal kernel can consume the actual FFT15 ciphertext directly.
-    let physical: Vec<RnsCkksCiphertext> = (0..8)
-        .map(|index| {
-            let mut values = vec![Complex64::new(0.0, 0.0); slots];
-            for half in 0..2 {
-                let tile = 2 * index + half;
-                if tile < TILES {
-                    for slot in 0..HALF {
-                        let block = (slot / 256) * 256;
-                        let reordered = block + reverse_base4_4(slot % 256);
-                        values[half * HALF + slot] = natural[tile][reordered];
-                    }
-                }
-            }
-            let plaintext = encode_rns(&values, &embedding, &basis0, scale);
-            let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
-                &plaintext,
-                2,
-                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                &secret,
-                &plan0,
-                &mut rng,
-            );
-            RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain)
-        })
-        .collect();
-    let left_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-        BoundedRnsKeygenConfig {
-            plaintext_modulus: 2,
-            layout: BoundedGadgetLayout::new(basis0.clone(), 8),
-            plan: &plan0,
-        },
-        &secret,
-        rotation_exponent_left(degree, HALF),
-        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-        &mut rng,
+    let sources = encrypt_and_fft15(
+        &natural, slots, &embedding, &chain, &basis0, scale, &secret, &plan0, &prepared0, &plan1,
+        &prepared1, &plan2, &prepared2, &mut rng,
     );
-    let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &plan0);
-    let low_mask: Vec<Complex64> = (0..slots)
-        .map(|s| Complex64::new(if s < HALF { 1.0 } else { 0.0 }, 0.0))
-        .collect();
-    let prepared_mask =
-        PreparedComplexSlotsCp::new(&physical[0], &low_mask, &embedding, &chain, &plan0);
-    let evaluation_keys = RnsCkksEvaluationKeys::new();
-    let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
-    let aligned: Vec<RnsCkksCiphertext> = (0..TILES)
-        .map(|tile| {
-            let source = &physical[tile / 2];
-            if tile % 2 == 0 {
-                multiply_complex_slots_cp_prepared(source, &prepared_mask, &chain, &prepared0)
-            } else {
-                let shifted = rotate_left_for_extraction(
-                    source,
-                    HALF,
-                    &prepared_left,
-                    &chain,
-                    &plan0,
-                    &prepared0,
-                );
-                multiply_complex_slots_cp_prepared(&shifted, &prepared_mask, &chain, &prepared0)
-            }
-        })
-        .collect();
-    assert!(aligned.iter().all(|ct| ct.level() == 1));
-    let radix5 = PreparedRadix5Cp::new(&aligned[0], &embedding, &chain, &plan1);
-    let branches: [[RnsCkksCiphertext; 5]; 3] = std::array::from_fn(|j| {
-        packed_radix5_dft_cp_prepared(
-            &evaluator,
-            [
-                &aligned[j],
-                &aligned[j + 3],
-                &aligned[j + 6],
-                &aligned[j + 9],
-                &aligned[j + 12],
-            ],
-            &radix5,
-            &chain,
-            &prepared1,
-        )
-    });
-    let radix3 = PreparedFft15TwiddledRadix3Cp::new(&branches[0][0], &embedding, &chain, &plan2);
-    let groups: [[RnsCkksCiphertext; 3]; 5] = std::array::from_fn(|k| {
-        packed_fft15_twiddled_radix3_cp_prepared(
-            &evaluator,
-            [&branches[0][k], &branches[1][k], &branches[2][k]],
-            k,
-            &radix3,
-            &chain,
-            &prepared2,
-        )
-    });
 
-    let sources: Vec<RnsCkksCiphertext> = (0..15).map(|h| groups[h % 5][h / 5].clone()).collect();
-
-    assert_eq!(sources.len(), 15);
-    assert!(sources.iter().all(|ct| ct.level() == 3));
-
-    println!("R26_H11_15C_FFT15_BRANCHES=15");
-    println!("R26_H11_15C_FFT15_OUTPUT_LEVEL=3");
     // Prepare fused placement and branch-specific first-stage
     // butterflies for both groups.
     let preparation_started = Instant::now();
