@@ -232,6 +232,54 @@ pub fn apply_fused_source_diagonals_plain(
     output
 }
 
+// R26_H11_15_PACKED_FFT3840_HANDOFF
+
+/// Execute the prepared, packed FFT256 continuation of all 15
+/// horizontal FFT15 frequency branches.
+///
+/// Inputs are natural-order FFT15 branches at CKKS level 3.
+/// The first stage fuses branch-dependent FFT3840 twiddles,
+/// radix-4 butterflies, and placement into two packed outputs.
+///
+/// Group A contains branches 0..8; group B contains 8..15.
+/// Each output contains eight 4096-slot lanes.
+///
+/// All prepared operands and rotation keys are caller-owned.
+/// This function performs no encryption or key generation.
+pub fn apply_fft3840_packed_fft256_from_fft15(
+    branches: &[RnsCkksCiphertext; 15],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    later_stages: &[crate::eblas::prepared_radix4_fft256::PreparedFft256Stage; 3],
+    contexts: [&crate::eblas::prepared_radix4_fft256::StageContext<'_>; 4],
+) -> [RnsCkksCiphertext; 2] {
+    use crate::eblas::prepared_radix4_fft256::apply_stage;
+
+    assert!(
+        branches.iter().all(|ciphertext| ciphertext.level() == 3),
+        "packed FFT3840 requires level-3 FFT15 branches"
+    );
+
+    std::array::from_fn(|group| {
+        let range = if group == 0 { 0..8 } else { 8..15 };
+
+        let inputs: Vec<(&RnsCkksCiphertext, &PreparedFusedFft256Source)> = range
+            .map(|branch| (&branches[branch], &prepared_sources[branch]))
+            .collect();
+
+        let mut output = apply_fused_fft256_sources(&inputs, contexts[0]);
+
+        assert_eq!(output.level(), 4);
+
+        for stage in 0..3 {
+            output = apply_stage(&output, &later_stages[stage], contexts[stage + 1]);
+
+            assert_eq!(output.level(), stage + 5);
+        }
+
+        output
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,52 +339,4 @@ mod tests {
             }
         }
     }
-}
-
-// R26_H11_15_PACKED_FFT3840_HANDOFF
-
-/// Execute the prepared, packed FFT256 continuation of all 15
-/// horizontal FFT15 frequency branches.
-///
-/// Inputs are natural-order FFT15 branches at CKKS level 3.
-/// The first stage fuses branch-dependent FFT3840 twiddles,
-/// radix-4 butterflies, and placement into two packed outputs.
-///
-/// Group A contains branches 0..8; group B contains 8..15.
-/// Each output contains eight 4096-slot lanes.
-///
-/// All prepared operands and rotation keys are caller-owned.
-/// This function performs no encryption or key generation.
-pub fn apply_fft3840_packed_fft256_from_fft15(
-    branches: &[RnsCkksCiphertext; 15],
-    prepared_sources: &[PreparedFusedFft256Source; 15],
-    later_stages: &[crate::eblas::prepared_radix4_fft256::PreparedFft256Stage; 3],
-    contexts: [&crate::eblas::prepared_radix4_fft256::StageContext<'_>; 4],
-) -> [RnsCkksCiphertext; 2] {
-    use crate::eblas::prepared_radix4_fft256::apply_stage;
-
-    assert!(
-        branches.iter().all(|ciphertext| ciphertext.level() == 3),
-        "packed FFT3840 requires level-3 FFT15 branches"
-    );
-
-    std::array::from_fn(|group| {
-        let range = if group == 0 { 0..8 } else { 8..15 };
-
-        let inputs: Vec<(&RnsCkksCiphertext, &PreparedFusedFft256Source)> = range
-            .map(|branch| (&branches[branch], &prepared_sources[branch]))
-            .collect();
-
-        let mut output = apply_fused_fft256_sources(&inputs, contexts[0]);
-
-        assert_eq!(output.level(), 4);
-
-        for stage in 0..3 {
-            output = apply_stage(&output, &later_stages[stage], contexts[stage + 1]);
-
-            assert_eq!(output.level(), stage + 5);
-        }
-
-        output
-    })
 }
