@@ -74,9 +74,8 @@ fn decode(
 
 use std::collections::BTreeSet;
 
-use ccmm_rs::eblas::fused_fft256_handoff::{
-    apply_fft3840_packed_fft256_with_context, fuse_fft256_source_lane, PreparedFusedFft256Source,
-};
+use ccmm_rs::eblas::encrypted_fft3840::PreparedEncryptedFft3840;
+use ccmm_rs::eblas::fused_fft256_handoff::{fuse_fft256_source_lane, PreparedFusedFft256Source};
 
 use ccmm_rs::eblas::prepared_radix4_fft256::{pack_fft256_branch_diagonals, PreparedFft256Stage};
 
@@ -689,13 +688,14 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             &contexts[3],
         ]);
 
-    let results = apply_fft3840_packed_fft256_with_context(
-        &source_array,
+    // R29_2A_REUSABLE_EFFT_SERVICE
+    let service = PreparedEncryptedFft3840::new(
         &prepared_array,
         &later_array,
         [&contexts[0], &contexts[1], &contexts[2], &contexts[3]],
         &prepared_fft_context,
     );
+    let results = service.execute(&source_array);
 
     // R28_4B3_TWO_IMAGE_FFT256
     // Reuse all FFT256 public operands, rotation keys, and QP context.
@@ -707,13 +707,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             .try_into()
             .unwrap_or_else(|_| panic!("expected 15 image-B FFT256 sources"));
 
-        let results_b = apply_fft3840_packed_fft256_with_context(
-            &source_array_b,
-            &prepared_array,
-            &later_array,
-            [&contexts[0], &contexts[1], &contexts[2], &contexts[3]],
-            &prepared_fft_context,
-        );
+        let results_b = service.execute(&source_array_b);
 
         assert_eq!(results_b.len(), 2);
         assert!(results_b.iter().all(|ct| ct.level() == 7));

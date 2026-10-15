@@ -12,6 +12,7 @@
 
 pub mod backend_policy;
 pub mod correlation;
+pub mod encrypted_fft3840;
 pub mod fft;
 pub mod fused_fft256_handoff;
 pub mod mixed_radix_ckks;
