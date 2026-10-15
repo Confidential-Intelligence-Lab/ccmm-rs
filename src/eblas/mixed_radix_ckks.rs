@@ -309,6 +309,43 @@ pub fn packed_fft15_twiddled_radix3_cp_prepared(
     })
 }
 
+/// Computes all 15 FFT15 frequency branches from three prepared radix-5 groups.
+///
+/// Each input group contains the five radix-5 outputs for one of the
+/// three twiddled radix-3 inputs. Output index h is natural frequency
+/// order: h = k + 5*q, where k in 0..5 and q in 0..3.
+///
+/// This consumes one CKKS level, reuses prepared public coefficients,
+/// and performs no ciphertext rotations.
+pub fn packed_fft15_all_branches_cp_prepared(
+    evaluator: &RnsCkksEvaluator<'_>,
+    branches: &[[RnsCkksCiphertext; 5]; 3],
+    coefficients: &PreparedFft15TwiddledRadix3Cp,
+    chain: &ModulusChain,
+    plan_level1: &PreparedRnsNttPlan,
+) -> [RnsCkksCiphertext; 15] {
+    let mut outputs: [Option<RnsCkksCiphertext>; 15] = std::array::from_fn(|_| None);
+
+    for k in 0..5 {
+        let group = packed_fft15_twiddled_radix3_cp_prepared(
+            evaluator,
+            [&branches[0][k], &branches[1][k], &branches[2][k]],
+            k,
+            coefficients,
+            chain,
+            plan_level1,
+        );
+
+        for (q, ciphertext) in group.into_iter().enumerate() {
+            let h = k + 5 * q;
+            assert!(outputs[h].is_none(), "duplicate FFT15 branch");
+            outputs[h] = Some(ciphertext);
+        }
+    }
+
+    outputs.map(|output| output.expect("missing FFT15 branch"))
+}
+
 /// Prepared public twiddles for a six-point forward DFT.
 ///
 /// The first stage consists of two radix-3 transforms.
@@ -774,6 +811,33 @@ mod tests {
                 &prepared1,
             )
         });
+
+        // R23.3C: all-branch wrapper versus the established
+        // individually computed prepared radix-3 outputs.
+        let all = packed_fft15_all_branches_cp_prepared(
+            &evaluator,
+            &branches,
+            &fused_coefficients,
+            &chain,
+            &prepared1,
+        );
+
+        for (frequency, actual) in all.iter().enumerate() {
+            let k = frequency % 5;
+            let q = frequency / 5;
+            let expected = &groups[k][q];
+
+            assert_eq!(actual.level(), expected.level());
+            assert_eq!(actual.scale(), expected.scale());
+            assert_eq!(actual.basis(), expected.basis());
+            assert_eq!(
+                format!("{:?}", actual.rlwe()),
+                format!("{:?}", expected.rlwe()),
+                "R23.3C RLWE mismatch at FFT15 branch {frequency}"
+            );
+        }
+
+        println!("R23_3C_ALL_BRANCHES_EXACT_STATUS=PASS");
 
         let stage2_ms = stage2_start.elapsed().as_secs_f64() * 1000.0;
 

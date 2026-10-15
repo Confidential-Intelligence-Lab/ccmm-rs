@@ -13,7 +13,12 @@
 pub mod backend_policy;
 pub mod correlation;
 pub mod fft;
+pub mod fused_fft256_handoff;
 pub mod mixed_radix_ckks;
+pub mod mixed_radix_fft;
+pub mod physical_tiled_fft;
+pub mod prepared_radix4_fft256;
+pub mod tiled_mixed_radix_fft;
 
 pub mod batched_gemm;
 
@@ -978,3 +983,5 @@ mod tests {
         assert!((cc.packing_utilization() - (1.0 / 2048.0)).abs() < 1.0e-15);
     }
 }
+
+pub mod uhd_fft_plan;

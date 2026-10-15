@@ -11,18 +11,21 @@ use num_complex::Complex64;
 use std::f64::consts::PI;
 
 use crate::ckks::{
-    mod_switch_rns_ckks_to_next, rotate_left_bounded_rns_ckks_with_prepared_execution,
-    rotate_left_rns_ckks_with_prepared_ntt, rotate_right_bounded_rns_ckks_with_prepared_execution,
-    rotate_right_rns_ckks_with_prepared_ntt, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, PreparedBoundedRnsGaloisKey, PreparedRnsGaloisKey, RnsCkksCiphertext,
-    RnsCkksEvaluator,
+    mod_switch_rns_ckks_to_next, rescale_rns_ckks_to_next,
+    rotate_left_bounded_rns_ckks_with_prepared_execution,
+    rotate_left_hybrid_rns_ckks_with_prepared_ntt, rotate_left_rns_ckks_with_prepared_ntt,
+    rotate_right_bounded_rns_ckks_with_prepared_execution,
+    rotate_right_hybrid_rns_ckks_with_prepared_ntt, rotate_right_rns_ckks_with_prepared_ntt,
+    rotation_exponent_left, rotation_exponent_right, CkksCanonicalEmbedding,
+    PreparedBoundedRnsGaloisKey, PreparedHybridRnsGaloisKey, PreparedRnsGaloisKey,
+    RnsCkksCiphertext, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
 
 use super::level1::{
-    multiply_complex_slots_cp, multiply_complex_slots_cp_prepared, scale_complex_cp,
-    PreparedComplexSlotsCp,
+    multiply_complex_slots_cp, multiply_complex_slots_cp_prepared,
+    multiply_complex_slots_cp_prepared_unrescaled, scale_complex_cp, PreparedComplexSlotsCp,
 };
 
 /// Direction of a complex Fourier transform.
@@ -1289,6 +1292,9 @@ pub fn execute_packed_1k_fft_rows_cp(
     assert!(inter_ct_parallelism > 0);
     assert!(local_outer_parallelism > 0);
 
+    let use_ntt_resident =
+        std::env::var("FHE_PACKED_1K_NTT_RESIDENT").is_ok_and(|value| value == "1");
+
     let degree = embedding.degree();
     let slot_count = embedding.slot_count();
 
@@ -1491,7 +1497,12 @@ pub fn execute_packed_1k_fft_rows_cp(
 
                 for input in stage_input.iter().take(batch_end).skip(batch_start) {
                     workers.push(scope.spawn(|| {
-                        execute_repeated_packed_fft2_dif_stage_cp_prepared(
+                        let execute_stage = if use_ntt_resident {
+                            execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident
+                        } else {
+                            execute_repeated_packed_fft2_dif_stage_cp_prepared
+                        };
+                        execute_stage(
                             input,
                             &prepared_fft_stage,
                             evaluator,
@@ -1558,6 +1569,9 @@ pub fn execute_packed_1k_fft_columns_cp(
     );
     assert!(inter_ct_parallelism > 0);
     assert!(local_outer_parallelism > 0);
+
+    let use_ntt_resident =
+        std::env::var("FHE_PACKED_1K_NTT_RESIDENT").is_ok_and(|value| value == "1");
 
     let degree = embedding.degree();
     let slot_count = embedding.slot_count();
@@ -1814,7 +1828,12 @@ pub fn execute_packed_1k_fft_columns_cp(
 
                 for input in stage_input.iter().take(batch_end).skip(batch_start) {
                     workers.push(scope.spawn(|| {
-                        execute_repeated_packed_fft2_dif_stage_cp_prepared(
+                        let execute_stage = if use_ntt_resident {
+                            execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident
+                        } else {
+                            execute_repeated_packed_fft2_dif_stage_cp_prepared
+                        };
+                        execute_stage(
                             input,
                             &prepared_fft_stage,
                             evaluator,
@@ -3071,6 +3090,105 @@ pub fn execute_packed_fft2_dif_stage_pp(
 ///
 /// The public diagonal operands and butterfly semantics match
 /// the existing prepared FFT2 executor.
+/// Executes a repeated packed FFT2 DIF stage with prepared QP hybrid
+/// Galois switching and reusable prepared public diagonal operands.
+///
+/// The caller owns the level-specific hybrid keys and QP NTT plan.
+/// Hybrid rotations preserve the input CKKS level and scale.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    hybrid_keys: (&PreparedHybridRnsGaloisKey, &PreparedHybridRnsGaloisKey),
+    chain: &ModulusChain,
+    qp_plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "hybrid FFT2 stage level must match ciphertext level"
+    );
+
+    assert_eq!(
+        prepared_plan.degree(),
+        input.rlwe().degree(),
+        "hybrid FFT2 prepared plan degree mismatch"
+    );
+
+    assert_eq!(
+        prepared_plan.moduli(),
+        input.basis().moduli(),
+        "hybrid FFT2 prepared plan basis mismatch"
+    );
+
+    let rotation = prepared_fft_stage.rotation();
+    let (left_key, right_key) = hybrid_keys;
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_hybrid_rns_ckks_with_prepared_ntt(input, rotation, left_key, chain, qp_plan)
+        });
+        let right_worker = scope.spawn(|| {
+            rotate_right_hybrid_rns_ckks_with_prepared_ntt(
+                input, rotation, right_key, chain, qp_plan,
+            )
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("hybrid FFT2 left rotation failed"),
+            right_worker
+                .join()
+                .expect("hybrid FFT2 right rotation failed"),
+        )
+    });
+
+    assert_eq!(rotated_left.state(), input.state());
+    assert_eq!(rotated_right.state(), input.state());
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_left,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                &rotated_right,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        (
+            direct_worker.join().expect("hybrid FFT2 direct CP failed"),
+            left_worker.join().expect("hybrid FFT2 left CP failed"),
+            right_worker.join().expect("hybrid FFT2 right CP failed"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 pub fn execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
     input: &RnsCkksCiphertext,
     prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
@@ -3273,6 +3391,332 @@ pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared(
 
     let partial = evaluator.add(&direct_term, &left_term);
     evaluator.add(&partial, &right_term)
+}
+
+/// Experimental R17.4d: NTT-resident Galois rotation and prepared CP.
+///
+/// The production executor remains unchanged. Each rotated branch retains
+/// the key-switch result in the NTT domain until prepared CP multiplication.
+/// Rescaling is performed independently on all three branches.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_key, right_key) = prepared_galois_keys;
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "R17.4 prepared FFT stage level mismatch"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "R17.4 FFT NTT degree mismatch"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "R17.4 FFT NTT basis mismatch"
+    );
+    assert_eq!(
+        prepared_plan.degree(),
+        input.rlwe().degree(),
+        "R17.4 prepared NTT degree mismatch"
+    );
+    assert_eq!(
+        prepared_plan.moduli(),
+        input.basis().moduli(),
+        "R17.4 prepared NTT basis mismatch"
+    );
+
+    let rotation = prepared_fft_stage.rotation();
+
+    assert_eq!(
+        left_key.exponent(),
+        rotation_exponent_left(input.rlwe().degree(), rotation),
+        "R17.4 left Galois exponent mismatch"
+    );
+    assert_eq!(
+        right_key.exponent(),
+        rotation_exponent_right(input.rlwe().degree(), rotation),
+        "R17.4 right Galois exponent mismatch"
+    );
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let left_worker = scope.spawn(|| {
+            let rotated =
+                crate::ckks::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident(
+                    input.rlwe(),
+                    left_key,
+                    prepared_plan,
+                );
+
+            super::level1::multiply_complex_slots_cp_prepared_ntt_resident(
+                input,
+                &rotated,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            let rotated =
+                crate::ckks::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident(
+                    input.rlwe(),
+                    right_key,
+                    prepared_plan,
+                );
+
+            super::level1::multiply_complex_slots_cp_prepared_ntt_resident(
+                input,
+                &rotated,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        (
+            direct_worker.join().expect("R17.4 direct worker panicked"),
+            left_worker.join().expect("R17.4 left worker panicked"),
+            right_worker.join().expect("R17.4 right worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
+pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident_shared_b(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_key, right_key) = prepared_galois_keys;
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "R17.4 prepared FFT stage level mismatch"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "R17.4 FFT NTT degree mismatch"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "R17.4 FFT NTT basis mismatch"
+    );
+    assert_eq!(
+        prepared_plan.degree(),
+        input.rlwe().degree(),
+        "R17.4 prepared NTT degree mismatch"
+    );
+    assert_eq!(
+        prepared_plan.moduli(),
+        input.basis().moduli(),
+        "R17.4 prepared NTT basis mismatch"
+    );
+
+    let rotation = prepared_fft_stage.rotation();
+
+    assert_eq!(
+        left_key.exponent(),
+        rotation_exponent_left(input.rlwe().degree(), rotation),
+        "R17.4 left Galois exponent mismatch"
+    );
+    assert_eq!(
+        right_key.exponent(),
+        rotation_exponent_right(input.rlwe().degree(), rotation),
+        "R17.4 right Galois exponent mismatch"
+    );
+
+    // R17.5d: prepare b once and share immutable values across
+    // the left and right Galois workers.
+    let original_b_ntt: Vec<Vec<u64>> = (0..input.basis().len())
+        .map(|i| prepared_plan.plan(i).forward(input.rlwe().limb(i).b()))
+        .collect();
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let left_worker = scope.spawn(|| {
+            let rotated =
+                crate::ckks::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_shared_b(
+                    input.rlwe(),
+                    left_key,
+                    prepared_plan,
+                    &original_b_ntt,
+                );
+
+            super::level1::multiply_complex_slots_cp_prepared_ntt_resident(
+                input,
+                &rotated,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            let rotated =
+                crate::ckks::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_shared_b(
+                    input.rlwe(),
+                    right_key,
+                    prepared_plan,
+                    &original_b_ntt,
+                );
+
+            super::level1::multiply_complex_slots_cp_prepared_ntt_resident(
+                input,
+                &rotated,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        (
+            direct_worker.join().expect("R17.4 direct worker panicked"),
+            left_worker.join().expect("R17.4 left worker panicked"),
+            right_worker.join().expect("R17.4 right worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
+/// Experimental R17.3c prepared FFT stage with one rescale
+/// after accumulating three unrescaled products.
+///
+/// Numerically equivalent CKKS semantics are expected, but
+/// bitwise ciphertext equality is not guaranteed.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_prepared_fused_rescale(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    prepared_galois_keys: (&PreparedRnsGaloisKey, &PreparedRnsGaloisKey),
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    let (left_galois_key, right_galois_key) = prepared_galois_keys;
+
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "prepared repeated packed FFT2 stage level must match ciphertext level"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "repeated packed FFT2 NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "repeated packed FFT2 NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = prepared_fft_stage.rotation();
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| {
+            rotate_left_rns_ckks_with_prepared_ntt(input, rotation, left_galois_key, chain, plan)
+        });
+
+        let right_worker = scope.spawn(|| {
+            rotate_right_rns_ckks_with_prepared_ntt(input, rotation, right_galois_key, chain, plan)
+        });
+
+        (
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared_unrescaled(
+                input,
+                &prepared_fft_stage.direct,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared_unrescaled(
+                &rotated_left,
+                &prepared_fft_stage.rotate_left,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp_prepared_unrescaled(
+                &rotated_right,
+                &prepared_fft_stage.rotate_right,
+                chain,
+                prepared_plan,
+            )
+        });
+
+        (
+            direct_worker
+                .join()
+                .expect("repeated packed FFT2 direct prepared CP worker panicked"),
+            left_worker
+                .join()
+                .expect("repeated packed FFT2 left prepared CP worker panicked"),
+            right_worker
+                .join()
+                .expect("repeated packed FFT2 right prepared CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    let accumulated = evaluator.add(&partial, &right_term);
+    rescale_rns_ckks_to_next(&accumulated, chain)
 }
 
 pub fn execute_packed_fft2_dif_stage_cp_prepared(
@@ -4933,6 +5377,338 @@ mod tests {
     }
 
     #[test]
+    fn r16_4e3_bounded_encrypted_fft2_16x16() {
+        use crate::application_support::ckks::encode_rns;
+        use crate::ckks::{
+            rotation_exponent_left, rotation_exponent_right, BoundedRnsGaloisKey, CkksChainState,
+            RnsCkksEvaluationKeys,
+        };
+        use crate::grafting::{
+            decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+        };
+        use crate::ring::{
+            centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+        };
+        use crate::rlwe::ErrorDistribution;
+        use num_traits::ToPrimitive;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        // Four approximately 35-bit rescaling operations retain
+        // the approximately 50-bit terminal modulus.
+        // Research-only configuration; no security claim.
+        // Nine-prime research profile: eight CKKS transitions.
+        // This test does not establish cryptographic security.
+        let profile = crate::ckks::research_profile_16384();
+
+        let degree = profile.degree();
+        let scale = profile.initial_scale();
+        let chain = profile.modulus_chain();
+        let basis = chain.top().clone();
+
+        let embedding = CkksCanonicalEmbedding::new(degree);
+        let slot_count = embedding.slot_count();
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let shape = Fft2Shape::new(16, 16);
+        let input_tile: Vec<Complex64> = (0..256)
+            .map(|index| {
+                let value = (index + 1) as f64 / 128.0;
+                Complex64::new(value, (index % 7) as f64 / 256.0) * 0.01
+            })
+            .collect();
+
+        let input: Vec<Complex64> = (0..slot_count)
+            .map(|index| input_tile[index % input_tile.len()])
+            .collect();
+
+        let plaintext = encode_rns(&input, &embedding, &basis, scale);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 0,
+            })
+            .collect();
+
+        let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x232B_0201);
+
+        let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &plan,
+            &mut encryption_rng,
+        );
+
+        let ciphertext = RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain);
+
+        let evaluation_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+        assert!(
+            chain.len() >= 9,
+            "two FFT stages require at least three CKKS chain levels"
+        );
+
+        use std::time::Instant;
+
+        let mut current = ciphertext;
+        let mut total_keygen = std::time::Duration::ZERO;
+        let mut total_preparation = std::time::Duration::ZERO;
+        let mut total_execution = std::time::Duration::ZERO;
+
+        for (stage_index, stage) in packed_fft2_dif_stage_schedule(shape)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(current.level(), stage_index);
+
+            let stage_basis = current.basis().clone();
+            let stage_plan = RnsNttPlan::new(stage_basis.moduli().to_vec(), degree);
+            let stage_prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+            let diagonals = PackedFft2DifStageDiagonals::new(
+                shape,
+                stage.axis,
+                stage.span,
+                FftDirection::Forward,
+            );
+
+            let rotation = diagonals.rotation();
+
+            let keygen_start = Instant::now();
+            let mut key_rng = ChaCha20Rng::seed_from_u64(0x233A_0001 + stage_index as u64);
+
+            use crate::grafting::{BoundedGadgetLayout, BoundedRnsKeygenConfig};
+
+            let make_key = |exponent, rng: &mut ChaCha20Rng| {
+                BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedRnsKeygenConfig {
+                        plaintext_modulus: 2,
+                        layout: BoundedGadgetLayout::new(stage_basis.clone(), 8),
+                        plan: &stage_plan,
+                    },
+                    &secret,
+                    exponent,
+                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                    rng,
+                )
+            };
+
+            let left_key = make_key(rotation_exponent_left(degree, rotation), &mut key_rng);
+            let right_key = make_key(rotation_exponent_right(degree, rotation), &mut key_rng);
+
+            let keygen_elapsed = keygen_start.elapsed();
+            total_keygen += keygen_elapsed;
+
+            let preparation_start = Instant::now();
+            let prepared_left = PreparedBoundedRnsGaloisKey::new(&left_key, &stage_plan);
+            let prepared_right = PreparedBoundedRnsGaloisKey::new(&right_key, &stage_plan);
+
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &current,
+                &diagonals,
+                slot_count / shape.elements(),
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
+            let preparation_elapsed = preparation_start.elapsed();
+            total_preparation += preparation_elapsed;
+
+            let execution_start = Instant::now();
+            let next = execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
+                &current,
+                &prepared_fft_stage,
+                &evaluator,
+                (&prepared_left, &prepared_right),
+                &chain,
+                &stage_plan,
+                &stage_prepared_plan,
+            );
+
+            let execution_elapsed = execution_start.elapsed();
+            total_execution += execution_elapsed;
+
+            println!(
+                "R16_4E3_TIMING stage={} keygen_ms={:.3} preparation_ms={:.3} execution_ms={:.3}",
+                stage_index + 1,
+                keygen_elapsed.as_secs_f64() * 1000.0,
+                preparation_elapsed.as_secs_f64() * 1000.0,
+                execution_elapsed.as_secs_f64() * 1000.0,
+            );
+
+            assert_eq!(
+                next.level(),
+                current.level() + 1,
+                "each FFT2 stage must consume exactly one CKKS level"
+            );
+            assert!(next.scale().is_finite());
+            assert!(next.scale() > 0.0);
+
+            println!(
+                "R16_4E3_STAGE={} axis={:?} rotation={} \
+                 input_level={} output_level={} scale={:.9e} PASS",
+                stage_index + 1,
+                stage.axis,
+                rotation,
+                current.level(),
+                next.level(),
+                next.scale(),
+            );
+
+            // Diagnostic decryption only; the next stage still
+            // consumes the encrypted ciphertext directly.
+            let diagnostic_plan = RnsNttPlan::new(next.basis().moduli().to_vec(), degree);
+
+            let diagnostic_plaintext =
+                decrypt_rns_raw_with_ntt(next.rlwe(), &secret, &diagnostic_plan);
+
+            let diagnostic_modulus = composite_modulus_big(diagnostic_plaintext.basis());
+
+            let diagnostic_coefficients: Vec<f64> =
+                reconstruct_coefficients_big(&diagnostic_plaintext)
+                    .into_iter()
+                    .map(|value| {
+                        centered_representative_big(&value, &diagnostic_modulus)
+                            .to_f64()
+                            .expect("diagnostic coefficient must fit f64")
+                            / next.scale()
+                    })
+                    .collect();
+
+            let diagnostic_slots = embedding.coefficients_to_slots(&diagnostic_coefficients);
+
+            let diagnostic_reference = {
+                let mut reference: Vec<Complex64> = (0..slot_count)
+                    .map(|index| input_tile[index % shape.elements()])
+                    .collect();
+
+                for reference_stage in packed_fft2_dif_stage_schedule(shape)
+                    .iter()
+                    .take(stage_index + 1)
+                {
+                    let reference_diagonals = PackedFft2DifStageDiagonals::new(
+                        shape,
+                        reference_stage.axis,
+                        reference_stage.span,
+                        FftDirection::Forward,
+                    );
+
+                    reference = execute_repeated_packed_fft2_dif_stage_pp(
+                        &reference,
+                        &reference_diagonals,
+                        slot_count / shape.elements(),
+                    );
+                }
+
+                reference
+            };
+
+            let mut diagnostic_max_abs = 0.0_f64;
+            let mut diagnostic_error_sq = 0.0_f64;
+            let mut diagnostic_ref_sq = 0.0_f64;
+
+            for (actual, expected) in diagnostic_slots.iter().zip(&diagnostic_reference) {
+                let error = (*actual - *expected).norm();
+                diagnostic_max_abs = diagnostic_max_abs.max(error);
+                diagnostic_error_sq += error * error;
+                diagnostic_ref_sq += expected.norm_sqr();
+            }
+
+            let diagnostic_rel_l2 = (diagnostic_error_sq / diagnostic_ref_sq).sqrt();
+
+            println!(
+                "R16_4E3_STAGE_NUMERICS stage={} axis={:?}                  level={} max_abs={diagnostic_max_abs:.9e}                  rel_l2={diagnostic_rel_l2:.9e}",
+                stage_index + 1,
+                stage.axis,
+                next.level(),
+            );
+
+            current = next;
+        }
+
+        let result_plan = RnsNttPlan::new(current.basis().moduli().to_vec(), degree);
+
+        let decrypted = decrypt_rns_raw_with_ntt(current.rlwe(), &secret, &result_plan);
+
+        let modulus = composite_modulus_big(decrypted.basis());
+
+        let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+            .into_iter()
+            .map(|value| {
+                centered_representative_big(&value, &modulus)
+                    .to_f64()
+                    .expect("CKKS coefficient must fit f64")
+                    / current.scale()
+            })
+            .collect();
+
+        let actual = embedding.coefficients_to_slots(&coefficients);
+
+        let reference = fft2_pp(shape, FftDirection::Forward, &input_tile);
+        let bit_reverse: Vec<usize> = (0..16)
+            .map(|value: usize| value.reverse_bits() >> (usize::BITS - 4))
+            .collect();
+
+        let expected: Vec<Complex64> = (0..slot_count)
+            .map(|index| {
+                let tile_index = index % shape.elements();
+                let row = tile_index / 16;
+                let col = tile_index % 16;
+
+                reference[bit_reverse[row] * 16 + bit_reverse[col]]
+            })
+            .collect();
+
+        let mut max_abs = 0.0_f64;
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+
+        for (a, e) in actual.iter().zip(&expected) {
+            let error = (*a - *e).norm();
+            max_abs = max_abs.max(error);
+            squared_error += error * error;
+            squared_reference += e.norm_sqr();
+        }
+
+        let rel_l2 = (squared_error / squared_reference).sqrt();
+
+        println!(
+            "R16_4E3_FFT2_METRICS max_abs={max_abs:.9e} \
+             rel_l2={rel_l2:.9e} final_level={} scale={:.9e}",
+            current.level(),
+            current.scale(),
+        );
+
+        println!(
+            "R16_4E3_TIMING_TOTAL keygen_ms={:.3} preparation_ms={:.3} execution_ms={:.3}",
+            total_keygen.as_secs_f64() * 1000.0,
+            total_preparation.as_secs_f64() * 1000.0,
+            total_execution.as_secs_f64() * 1000.0,
+        );
+
+        assert_eq!(current.level(), 8);
+        assert!(max_abs.is_finite());
+        assert!(rel_l2.is_finite());
+
+        // Initial engineering tolerance; report measured error before
+        // changing it if the composed computation exceeds this bound.
+        assert!(
+            max_abs < 5.0e-3 && rel_l2 < 5.0e-3,
+            "composed bounded encrypted FFT2 numerical error exceeds tolerance"
+        );
+
+        println!("R16_4E3_BOUNDED_ENCRYPTED_FFT2=PASS");
+    }
+
+    #[test]
     fn r23_4e_bounded_encrypted_fft2_4x4() {
         use crate::application_support::ckks::encode_rns;
         use crate::ckks::{
@@ -6451,3 +7227,7 @@ mod packed_tile_dif_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "r15_g10_bounded_stage.rs"]
+mod r15_g10_bounded_stage;

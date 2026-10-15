@@ -266,10 +266,82 @@ impl PreparedComplexSlotsCp {
     }
 }
 
+/// Multiplies by a prepared public operand without consuming a CKKS level.
+///
+/// Intended for fused multiply-accumulate-rescale execution.
+pub(crate) fn multiply_complex_slots_cp_prepared_unrescaled(
+    input: &crate::ckks::RnsCkksCiphertext,
+    prepared: &PreparedComplexSlotsCp,
+    chain: &ModulusChain,
+    plan: &PreparedRnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+    assert_eq!(
+        input.level(),
+        prepared.level(),
+        "unrescaled prepared CP level mismatch"
+    );
+
+    multiply_plain_rns_ckks_with_prepared_ntt(
+        input,
+        &prepared.plaintext,
+        prepared.plaintext_scale,
+        chain,
+        plan,
+    )
+}
+
 /// Multiplies an encrypted packed CKKS value by a prepared public complex-slot
 /// operand and consumes exactly one CKKS level.
 ///
 /// Preparation is amortized across repeated ciphertexts at the same level.
+/// Experimental R17.4: consume an NTT-resident rotated ciphertext.
+///
+/// This avoids converting the rotation result to coefficient form and
+/// transforming it back before prepared ciphertext-plaintext multiplication.
+/// The result uses the existing CKKS rescale operation.
+pub fn multiply_complex_slots_cp_prepared_ntt_resident(
+    input: &crate::ckks::RnsCkksCiphertext,
+    rotated: &crate::grafting::RnsNttRlweCiphertext,
+    prepared: &PreparedComplexSlotsCp,
+    chain: &ModulusChain,
+    plan: &PreparedRnsNttPlan,
+) -> crate::ckks::RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert_eq!(
+        input.level(),
+        prepared.level(),
+        "resident prepared CP ciphertext level mismatch"
+    );
+    assert_eq!(
+        rotated.degree(),
+        input.rlwe().degree(),
+        "resident prepared CP ciphertext degree mismatch"
+    );
+    assert_eq!(
+        rotated.moduli(),
+        input.basis().moduli(),
+        "resident prepared CP ciphertext basis mismatch"
+    );
+
+    let product = crate::ckks::multiply_ntt_resident_rlwe_with_prepared_plaintext(
+        rotated,
+        &prepared.plaintext,
+        plan,
+    );
+
+    let state = crate::ckks::CkksChainState::new(
+        chain,
+        input.level(),
+        input.scale() * prepared.plaintext_scale,
+    );
+
+    let ciphertext = crate::ckks::RnsCkksCiphertext::new(product, state, chain);
+
+    rescale_rns_ckks_to_next(&ciphertext, chain)
+}
+
 pub fn multiply_complex_slots_cp_prepared(
     input: &crate::ckks::RnsCkksCiphertext,
     prepared: &PreparedComplexSlotsCp,
