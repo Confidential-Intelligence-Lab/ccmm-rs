@@ -1,0 +1,5 @@
+IMAGE=results/image_filter/source/benchmarks/fhe_fft_architecture_gray_4096x4096.png
+LOCAL_WORKERS=8
+INTER_CT_WORKERS=4
+NTT_RESIDENT=1
+Fri Oct 23 21:22:39 PDT 2026

@@ -1,0 +1,5262 @@
+diff --git a/src/bin/ckks_packed_uhd_fft_validation.rs b/src/bin/ckks_packed_uhd_fft_validation.rs
+index ed76239..f59b75a 100644
+--- a/src/bin/ckks_packed_uhd_fft_validation.rs
++++ b/src/bin/ckks_packed_uhd_fft_validation.rs
+@@ -83,13 +83,18 @@ fn load_normalized_uhd_image(path: &Path) -> Vec<Complex64> {
+         .expect("failed to load UHD image")
+         .to_luma8();
+ 
+-    assert_eq!(image.width() as usize, UHD_WIDTH);
+-    assert_eq!(image.height() as usize, UHD_HEIGHT);
++    let width = image.width() as usize;
++    let height = image.height() as usize;
++
++    assert!(
++        (width == UHD_WIDTH && height == UHD_HEIGHT) || (width == IMAGE_DIM && height == IMAGE_DIM),
++        "expected 3840x2160 or 4096x4096 grayscale image"
++    );
+ 
+     let mut values = vec![Complex64::new(0.0, 0.0); IMAGE_DIM * IMAGE_DIM];
+ 
+-    for row in 0..UHD_HEIGHT {
+-        for col in 0..UHD_WIDTH {
++    for row in 0..height {
++        for col in 0..width {
+             let pixel = image.get_pixel(col as u32, row as u32)[0];
+             values[row * IMAGE_DIM + col] = Complex64::new(f64::from(pixel) / 255.0, 0.0);
+         }
+@@ -334,7 +339,7 @@ fn fill_uhd_slots(
+     slots
+ }
+ 
+-fn validate_uhd_packing(image: &[Complex64]) {
++fn validate_uhd_packing(image: &[Complex64], input_width: usize, input_height: usize) {
+     assert_eq!(image.len(), IMAGE_DIM * IMAGE_DIM);
+ 
+     let mut reconstructed = vec![Complex64::new(0.0, 0.0); IMAGE_DIM * IMAGE_DIM];
+@@ -378,7 +383,7 @@ fn validate_uhd_packing(image: &[Complex64]) {
+                             let error = (slots[slot] - image[index]).norm();
+                             max_abs_error = max_abs_error.max(error);
+ 
+-                            if (global_row >= UHD_HEIGHT || global_col >= UHD_WIDTH)
++                            if (global_row >= input_height || global_col >= input_width)
+                                 && slots[slot].norm() != 0.0
+                             {
+                                 padding_nonzero += 1;
+@@ -749,6 +754,10 @@ fn main() {
+         .nth(1)
+         .expect("usage: ckks_packed_uhd_fft_validation <uhd-image>");
+ 
++    let input_image = image::open(&input_path).expect("failed to inspect input image");
++    let input_width = input_image.width() as usize;
++    let input_height = input_image.height() as usize;
++
+     let oracle_input = load_normalized_uhd_image(Path::new(&input_path));
+ 
+     assert!(
+@@ -760,7 +769,7 @@ fn main() {
+ 
+     println!("R21_UHD_INPUT_RANGE_STATUS=PASS");
+ 
+-    validate_uhd_packing(&oracle_input);
++    validate_uhd_packing(&oracle_input, input_width, input_height);
+ 
+     if std::env::var("R21_UHD_PREFLIGHT_ONLY").as_deref() == Ok("1") {
+         println!("R21_UHD_PREFLIGHT_ONLY=PASS");
+@@ -768,10 +777,17 @@ fn main() {
+     }
+ 
+     println!("R21_UHD_INPUT={input_path}");
+-    println!("R21_UHD_INPUT_DIMENSION=3840x2160");
++    println!("R21_UHD_INPUT_DIMENSION={input_width}x{input_height}");
+     println!("R21_UHD_FFT_DIMENSION=4096x4096");
+     println!("R21_UHD_INPUT_SCALE=NORMALIZED_0_TO_1");
+-    println!("R21_UHD_PADDING=ZERO");
++    println!(
++        "R21_UHD_PADDING={}",
++        if input_width == IMAGE_DIM && input_height == IMAGE_DIM {
++            "NONE"
++        } else {
++            "ZERO"
++        }
++    );
+     println!("R21_UHD_SECURITY_BEARING=false");
+ 
+     let oracle = fft2_pp(
+diff --git a/src/ckks/hybrid_rns_galois_key.rs b/src/ckks/hybrid_rns_galois_key.rs
+index 841cc66..823bfd8 100644
+--- a/src/ckks/hybrid_rns_galois_key.rs
++++ b/src/ckks/hybrid_rns_galois_key.rs
+@@ -6,7 +6,8 @@
+ use rand::{CryptoRng, RngCore};
+ 
+ use crate::grafting::{
+-    encrypt_rns_raw_prepared_with_distribution_ntt_rng, BoundedGadgetLayout, RnsRlweCiphertext,
++    encrypt_rns_raw_prepared_with_cached_secret_ntt_rng, BoundedGadgetLayout,
++    PreparedCanonicalGaloisSource, RnsRlweCiphertext,
+ };
+ use crate::ring::{
+     auxiliary_mod_down_rns_candidate, ModulusBasis, NttPolynomial, Polynomial, RnsNttPlan,
+@@ -99,6 +100,24 @@ impl PreparedHybridRnsGaloisKey {
+             }
+         }
+ 
++        // R35_9E_1_CACHED_SECRET_NTT
++        // The secret and QP basis are invariant across gadget digits.
++        let secret_ntt: Vec<NttPolynomial> = moduli
++            .iter()
++            .copied()
++            .enumerate()
++            .map(|(index, modulus)| {
++                let projected = Polynomial::new(
++                    modulus,
++                    secret
++                        .iter()
++                        .map(|&coefficient| signed_mod(i128::from(coefficient), modulus.value()))
++                        .collect(),
++                );
++                NttPolynomial::from_polynomial(qp_plan.plan(index), &projected)
++            })
++            .collect();
++
+         let mut gadget_factors = vec![1_u64; moduli.len()];
+         let mut entries = Vec::with_capacity(layout.digit_count());
+ 
+@@ -126,11 +145,11 @@ impl PreparedHybridRnsGaloisKey {
+ 
+             let target = RnsPolynomial::from_residues(residues);
+ 
+-            entries.push(encrypt_rns_raw_prepared_with_distribution_ntt_rng(
++            entries.push(encrypt_rns_raw_prepared_with_cached_secret_ntt_rng(
+                 &target,
+                 plaintext_modulus,
+                 distribution,
+-                secret,
++                &secret_ntt,
+                 qp_plan,
+                 rng,
+             ));
+@@ -154,6 +173,19 @@ impl PreparedHybridRnsGaloisKey {
+         self.exponent
+     }
+ 
++    // R36_8G_2C_1_KEY_PAYLOAD_ACCOUNTING
++    /// Logical NTT coefficient payload retained by this prepared key.
++    ///
++    /// Excludes Vec capacity, allocation metadata, and other structures.
++    /// Does not allocate or modify cryptographic state.
++    pub fn coefficient_payload_bytes(&self) -> usize {
++        self.entries
++            .iter()
++            .flat_map(|digit| digit.iter())
++            .map(|(a, b)| (a.values().len() + b.values().len()) * std::mem::size_of::<u64>())
++            .sum()
++    }
++
+     pub fn digit_count(&self) -> usize {
+         self.layout.digit_count()
+     }
+@@ -317,6 +349,34 @@ pub fn profile_hybrid_rns_galois_rotation(
+         false,
+         Some(&mut timing),
+         None,
++        None,
++    );
++
++    (result, timing)
++}
++
++// R36_5D1_PREPARED_ROTATION_PROFILE
++/// Profiles a hybrid-QP rotation using a prepared QP NTT plan.
++///
++/// `canonical_source = None` selects legacy gadget decomposition.
++/// `Some(source)` selects prepared-canonical decomposition.
++pub fn profile_hybrid_rns_galois_rotation_prepared_qp(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++    canonical_source: Option<&PreparedCanonicalGaloisSource>,
++) -> (RnsRlweCiphertext, HybridRotationTiming) {
++    let mut timing = HybridRotationTiming::default();
++
++    let result = apply_hybrid_rns_galois_automorphism_internal_profiled(
++        ciphertext,
++        key,
++        qp_plan,
++        false,
++        Some(&mut timing),
++        Some(prepared_qp),
++        canonical_source,
+     );
+ 
+     (result, timing)
+@@ -335,6 +395,7 @@ fn apply_hybrid_rns_galois_automorphism_internal(
+         use_crt_reference,
+         None,
+         None,
++        None,
+     )
+ }
+ 
+@@ -355,16 +416,148 @@ pub fn apply_hybrid_rns_galois_automorphism_prepared_qp(
+         false,
+         None,
+         Some(prepared_qp),
++        None,
++    )
++}
++
++// R36_4C_PREPARED_CANONICAL_ROTATION
++/// Hybrid-QP rotation using a previously reconstructed canonical source.
++pub fn apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++    canonical_source: &PreparedCanonicalGaloisSource,
++) -> RnsRlweCiphertext {
++    apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
++        ciphertext,
++        key,
++        qp_plan,
++        false,
++        None,
++        Some(prepared_qp),
++        Some(canonical_source),
++        // R36_5F6_PRODUCTION_CANONICAL_FORWARD
++        true,
++        false,
++        // R36_5G4_PRODUCTION_PREPARED_INVERSE
++        true,
+     )
+ }
+ 
++// R36_5F4_PREPARED_BUTTERFLY_ROTATION
++/// Profiles canonical hybrid-QP rotation using prepared butterfly multiplication.
++pub fn profile_hybrid_rns_galois_rotation_prepared_butterfly_qp(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++    canonical_source: &PreparedCanonicalGaloisSource,
++) -> (RnsRlweCiphertext, HybridRotationTiming) {
++    let mut timing = HybridRotationTiming::default();
++    let result = apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
++        ciphertext,
++        key,
++        qp_plan,
++        false,
++        Some(&mut timing),
++        Some(prepared_qp),
++        Some(canonical_source),
++        true,
++        true,
++        false,
++    );
++    (result, timing)
++}
++
++/// Profiles a canonical hybrid-QP rotation using owned-vector forward NTT.
++pub fn profile_hybrid_rns_galois_rotation_owned_forward_qp(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++    canonical_source: &PreparedCanonicalGaloisSource,
++) -> (RnsRlweCiphertext, HybridRotationTiming) {
++    let mut timing = HybridRotationTiming::default();
++    let result = apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
++        ciphertext,
++        key,
++        qp_plan,
++        false,
++        Some(&mut timing),
++        Some(prepared_qp),
++        Some(canonical_source),
++        true,
++        false,
++        false,
++    );
++    (result, timing)
++}
++
++// R36_5G3_PREPARED_INVERSE_PROFILE
++/// Experimental canonical hybrid-QP rotation with prepared forward
++/// and inverse NTT arithmetic. Production dispatch is unchanged.
++pub fn profile_hybrid_rns_galois_rotation_prepared_inverse_qp(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++    canonical_source: &PreparedCanonicalGaloisSource,
++) -> (RnsRlweCiphertext, HybridRotationTiming) {
++    let mut timing = HybridRotationTiming::default();
++
++    let result = apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
++        ciphertext,
++        key,
++        qp_plan,
++        false,
++        Some(&mut timing),
++        Some(prepared_qp),
++        Some(canonical_source),
++        true,
++        false,
++        true,
++    );
++
++    (result, timing)
++}
++
+ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
++    ciphertext: &RnsRlweCiphertext,
++    key: &PreparedHybridRnsGaloisKey,
++    qp_plan: &RnsNttPlan,
++    use_crt_reference: bool,
++    timing: Option<&mut HybridRotationTiming>,
++    prepared_qp: Option<&crate::ring::PreparedRnsNttPlan>,
++    canonical_source: Option<&PreparedCanonicalGaloisSource>,
++) -> RnsRlweCiphertext {
++    apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
++        ciphertext,
++        key,
++        qp_plan,
++        use_crt_reference,
++        timing,
++        prepared_qp,
++        canonical_source,
++        false,
++        false,
++        false,
++    )
++}
++
++// R36_5E3_OWNED_NTT_ROTATION
++#[allow(clippy::too_many_arguments)]
++fn apply_hybrid_rns_galois_automorphism_internal_profiled_owned(
+     ciphertext: &RnsRlweCiphertext,
+     key: &PreparedHybridRnsGaloisKey,
+     qp_plan: &RnsNttPlan,
+     use_crt_reference: bool,
+     mut timing: Option<&mut HybridRotationTiming>,
+     prepared_qp: Option<&crate::ring::PreparedRnsNttPlan>,
++    canonical_source: Option<&PreparedCanonicalGaloisSource>,
++    owned_forward_ntt: bool,
++    prepared_butterfly: bool,
++    prepared_inverse: bool,
+ ) -> RnsRlweCiphertext {
+     let q_basis = key.layout.full_basis();
+ 
+@@ -397,7 +590,17 @@ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
+     );
+ 
+     let started = std::time::Instant::now();
+-    let decomposition = key.layout.decompose(&transformed_a);
++    let decomposition = if let Some(source) = canonical_source {
++        assert_eq!(source.basis(), q_basis, "prepared source basis mismatch");
++        assert_eq!(
++            source.degree(),
++            key.degree,
++            "prepared source degree mismatch"
++        );
++        source.decompose_automorphism(&key.layout, key.exponent)
++    } else {
++        key.layout.decompose(&transformed_a)
++    };
+     if let Some(t) = timing.as_deref_mut() {
+         t.decomposition_ms = started.elapsed().as_secs_f64() * 1000.0;
+     }
+@@ -480,14 +683,12 @@ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
+ 
+         for digit_index in 0..key.layout.digit_count() {
+             let sub_started = std::time::Instant::now();
+-            let digit = Polynomial::new(
+-                modulus,
+-                decomposition
+-                    .digit(digit_index)
+-                    .iter()
+-                    .map(|&value| signed_mod(value, modulus.value()))
+-                    .collect(),
+-            );
++            // R36_5E4_DIRECT_OWNED_DIGIT
++            let digit_values: Vec<u64> = decomposition
++                .digit(digit_index)
++                .iter()
++                .map(|&value| signed_mod(value, modulus.value()))
++                .collect();
+ 
+             if let Some(t) = timing.as_deref_mut() {
+                 t.digit_construction_ms += sub_started.elapsed().as_secs_f64() * 1000.0;
+@@ -496,8 +697,25 @@ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
+             let sub_started = std::time::Instant::now();
+             let digit_ntt = if let Some(prepared) = prepared_qp {
+                 let prepared_plan = prepared.plan(limb_index);
+-                NttPolynomial::from_prepared_values(prepared_plan, prepared_plan.forward(&digit))
++                if prepared_butterfly {
++                    NttPolynomial::from_prepared_values(
++                        prepared_plan,
++                        prepared_plan.forward_owned_prepared_mul(digit_values),
++                    )
++                } else if owned_forward_ntt {
++                    NttPolynomial::from_prepared_values(
++                        prepared_plan,
++                        prepared_plan.forward_owned(digit_values),
++                    )
++                } else {
++                    let digit = Polynomial::new(modulus, digit_values);
++                    NttPolynomial::from_prepared_values(
++                        prepared_plan,
++                        prepared_plan.forward(&digit),
++                    )
++                }
+             } else {
++                let digit = Polynomial::new(modulus, digit_values);
+                 NttPolynomial::from_polynomial(plan, &digit)
+             };
+             if let Some(t) = timing.as_deref_mut() {
+@@ -514,8 +732,18 @@ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
+         }
+ 
+         let sub_started = std::time::Instant::now();
+-        qp_b_limbs.push(b_ntt.to_polynomial(plan));
+-        qp_a_limbs.push(a_ntt.to_polynomial(plan));
++        // R36_5G3_PREPARED_INVERSE_DISPATCH
++        if prepared_inverse {
++            let prepared = prepared_qp
++                .expect("prepared inverse requires a prepared QP plan")
++                .plan(limb_index);
++
++            qp_b_limbs.push(prepared.inverse_prepared_mul(b_ntt.values()));
++            qp_a_limbs.push(prepared.inverse_prepared_mul(a_ntt.values()));
++        } else {
++            qp_b_limbs.push(b_ntt.to_polynomial(plan));
++            qp_a_limbs.push(a_ntt.to_polynomial(plan));
++        }
+         if let Some(t) = timing.as_deref_mut() {
+             t.inverse_ntt_ms += sub_started.elapsed().as_secs_f64() * 1000.0;
+         }
+@@ -550,3 +778,952 @@ fn apply_hybrid_rns_galois_automorphism_internal_profiled(
+     }
+     result
+ }
++
++#[cfg(test)]
++mod r35_9e_exact_key_equivalence {
++    // R35_9E_2_EXACT_KEY_EQUIVALENCE
++    use super::*;
++    use crate::grafting::encrypt_rns_raw_prepared_with_distribution_ntt_rng;
++    use rand::SeedableRng;
++    use rand_chacha::ChaCha20Rng;
++
++    // R35_9E_3_FULL_KEY_EQUIVALENCE
++    #[allow(clippy::too_many_arguments)]
++    fn reference_key<R: RngCore + CryptoRng>(
++        layout: BoundedGadgetLayout,
++        auxiliary_basis: ModulusBasis,
++        secret: &[i8],
++        exponent: usize,
++        distribution: ErrorDistribution,
++        plaintext_modulus: u64,
++        qp_plan: &RnsNttPlan,
++        rng: &mut R,
++    ) -> PreparedHybridRnsGaloisKey {
++        let degree = qp_plan.degree();
++        let exponent = exponent % (2 * degree);
++        let q_basis = layout.full_basis();
++
++        let mut moduli = q_basis.moduli().to_vec();
++        moduli.extend_from_slice(auxiliary_basis.moduli());
++
++        assert_eq!(qp_plan.moduli(), moduli.as_slice());
++
++        let transformed = transformed_ternary_secret(secret, exponent);
++
++        let mut p_factors = vec![1_u64; moduli.len()];
++        for (index, modulus) in moduli.iter().enumerate() {
++            for auxiliary in auxiliary_basis.moduli() {
++                p_factors[index] =
++                    modulus.mul(p_factors[index], auxiliary.value() % modulus.value());
++            }
++        }
++
++        let mut gadget_factors = vec![1_u64; moduli.len()];
++        let mut entries = Vec::with_capacity(layout.digit_count());
++
++        for _ in 0..layout.digit_count() {
++            let residues = moduli
++                .iter()
++                .enumerate()
++                .map(|(index, &modulus)| {
++                    let multiplier = modulus.mul(p_factors[index], gadget_factors[index]);
++
++                    Polynomial::new(
++                        modulus,
++                        transformed
++                            .iter()
++                            .map(|&coefficient| {
++                                modulus.mul(
++                                    signed_mod(i128::from(coefficient), modulus.value()),
++                                    multiplier,
++                                )
++                            })
++                            .collect(),
++                    )
++                })
++                .collect();
++
++            let target = RnsPolynomial::from_residues(residues);
++
++            entries.push(encrypt_rns_raw_prepared_with_distribution_ntt_rng(
++                &target,
++                plaintext_modulus,
++                distribution,
++                secret,
++                qp_plan,
++                rng,
++            ));
++
++            for (index, modulus) in moduli.iter().enumerate() {
++                let base = (layout.base() % u128::from(modulus.value())) as u64;
++                gadget_factors[index] = modulus.mul(gadget_factors[index], base);
++            }
++        }
++
++        PreparedHybridRnsGaloisKey {
++            exponent,
++            layout,
++            auxiliary_basis,
++            degree,
++            entries,
++        }
++    }
++
++    // R36_4C_EXACT_RLWE_EQUIVALENCE
++    #[test]
++    fn r36_4c_prepared_canonical_rotation_matches_legacy_rlwe_exactly() {
++        use crate::ring::{Modulus, ModulusBasis, PreparedRnsNttPlan};
++
++        const N: usize = 16;
++
++        let secret: [i8; N] = [1, 0, -1, 1, 0, -1, 1, 0, -1, 0, 1, 0, 1, -1, 0, 1];
++
++        let distribution = ErrorDistribution::BoundedUniform { bound: 0 };
++
++        for q_count in [2_usize, 3] {
++            let q = ModulusBasis::new(
++                [12_289_u64, 40_961, 65_537]
++                    .into_iter()
++                    .take(q_count)
++                    .map(Modulus::new)
++                    .collect(),
++            );
++
++            let p = ModulusBasis::new(vec![Modulus::new(114_689), Modulus::new(786_433)]);
++
++            let mut qp_moduli = q.moduli().to_vec();
++            qp_moduli.extend_from_slice(p.moduli());
++
++            let qp_plan = RnsNttPlan::new(qp_moduli, N);
++            let prepared_qp = PreparedRnsNttPlan::new(&qp_plan);
++
++            let message = RnsPolynomial::from_residues(
++                q.moduli()
++                    .iter()
++                    .map(|&modulus| {
++                        Polynomial::new(
++                            modulus,
++                            (0..N)
++                                .map(|i| (i as u64 * 37 + 11) % modulus.value())
++                                .collect(),
++                        )
++                    })
++                    .collect(),
++            );
++
++            let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
++
++            let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x364c_1000 + q_count as u64);
++
++            let encrypted_ntt = encrypt_rns_raw_prepared_with_distribution_ntt_rng(
++                &message,
++                2,
++                distribution,
++                &secret,
++                &q_plan,
++                &mut encryption_rng,
++            );
++
++            let ciphertext = RnsRlweCiphertext::from_limbs(
++                encrypted_ntt
++                    .into_iter()
++                    .enumerate()
++                    .map(|(index, (b_ntt, a_ntt))| {
++                        RlweCiphertext::new(
++                            b_ntt.to_polynomial(q_plan.plan(index)),
++                            a_ntt.to_polynomial(q_plan.plan(index)),
++                        )
++                    })
++                    .collect(),
++            );
++
++            let original_a = RnsPolynomial::from_residues(
++                ciphertext
++                    .limbs()
++                    .iter()
++                    .map(|limb| limb.a().clone())
++                    .collect(),
++            );
++
++            let canonical_source = PreparedCanonicalGaloisSource::new(&original_a);
++
++            for exponent in [3_usize, 5, 7, 11, 15] {
++                let mut key_rng = ChaCha20Rng::seed_from_u64(
++                    0x364c_2000 + q_count as u64 * 100 + exponent as u64,
++                );
++
++                let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++                    BoundedGadgetLayout::new(q.clone(), 8),
++                    p.clone(),
++                    &secret,
++                    exponent,
++                    distribution,
++                    2,
++                    &qp_plan,
++                    &mut key_rng,
++                );
++
++                let legacy = apply_hybrid_rns_galois_automorphism_prepared_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                );
++
++                let optimized = apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    &canonical_source,
++                );
++
++                assert_eq!(
++                    legacy, optimized,
++                    "R36.4C RLWE mismatch: q_count={q_count}, exponent={exponent}"
++                );
++
++                println!(
++                    "R36_4C_CASE=PASS q_count={} exponent={} degree={}",
++                    q_count, exponent, N,
++                );
++            }
++        }
++
++        println!("R36_4C_EXACT_RLWE_EQUIVALENCE_STATUS=PASS");
++    }
++
++    // R36_5D2_PRODUCTION_ROTATION_AB_BENCHMARK
++    #[test]
++    #[ignore = "opt-in UHD-scale single-key rotation benchmark"]
++    fn r36_5d2_production_rotation_ab_benchmark() {
++        use crate::ckks::research_profile_65536_for_levels;
++        use crate::ring::{ModulusBasis, ModulusChain, PreparedRnsNttPlan};
++        use std::time::Instant;
++
++        const N: usize = 65_536;
++        const EXPONENT: usize = 3;
++        const BASE_LOG: u32 = 32;
++
++        let profile = research_profile_65536_for_levels(13, 3);
++        assert_eq!(profile.degree(), N);
++
++        let extended = research_profile_65536_for_levels(15, 3);
++
++        let top = profile.modulus_chain().top().clone();
++        let extended_chain = extended.modulus_chain();
++        let extended_moduli = extended_chain.top().moduli();
++
++        assert_eq!(top.moduli().len(), 16);
++        assert_eq!(extended_moduli.len(), 18);
++        assert_eq!(&extended_moduli[..16], top.moduli());
++
++        let p = ModulusBasis::new(extended_moduli[16..18].to_vec());
++        let chain = ModulusChain::from_top_basis(top);
++        let q = chain.level(3).clone();
++
++        assert_eq!(q.moduli().len(), 13);
++        assert_eq!(p.moduli().len(), 2);
++
++        let layout = BoundedGadgetLayout::new(q.clone(), BASE_LOG);
++        assert_eq!(layout.digit_count(), 23);
++
++        let mut qp_moduli = q.moduli().to_vec();
++        qp_moduli.extend_from_slice(p.moduli());
++
++        let qp_plan = RnsNttPlan::new(qp_moduli, N);
++        let prepared_qp = PreparedRnsNttPlan::new(&qp_plan);
++        let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
++
++        let secret: Vec<i8> = (0..N)
++            .map(|i| match i % 3 {
++                0 => 1,
++                1 => 0,
++                _ => -1,
++            })
++            .collect();
++
++        let distribution = ErrorDistribution::BoundedUniform { bound: 0 };
++
++        let message = RnsPolynomial::from_residues(
++            q.moduli()
++                .iter()
++                .map(|&modulus| {
++                    Polynomial::new(
++                        modulus,
++                        (0..N)
++                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
++                            .collect(),
++                    )
++                })
++                .collect(),
++        );
++
++        let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x365d_2001);
++
++        let encrypted_ntt = encrypt_rns_raw_prepared_with_distribution_ntt_rng(
++            &message,
++            2,
++            distribution,
++            &secret,
++            &q_plan,
++            &mut encryption_rng,
++        );
++
++        let ciphertext = RnsRlweCiphertext::from_limbs(
++            encrypted_ntt
++                .into_iter()
++                .enumerate()
++                .map(|(index, (b_ntt, a_ntt))| {
++                    RlweCiphertext::new(
++                        b_ntt.to_polynomial(q_plan.plan(index)),
++                        a_ntt.to_polynomial(q_plan.plan(index)),
++                    )
++                })
++                .collect(),
++        );
++
++        let original_a = RnsPolynomial::from_residues(
++            ciphertext
++                .limbs()
++                .iter()
++                .map(|limb| limb.a().clone())
++                .collect(),
++        );
++
++        let started = Instant::now();
++        let canonical_source = PreparedCanonicalGaloisSource::new(&original_a);
++        let preparation_seconds = started.elapsed().as_secs_f64();
++
++        let mut key_rng = ChaCha20Rng::seed_from_u64(0x365d_2002);
++
++        let started = Instant::now();
++        let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++            layout,
++            p,
++            &secret,
++            EXPONENT,
++            distribution,
++            2,
++            &qp_plan,
++            &mut key_rng,
++        );
++        let keygen_seconds = started.elapsed().as_secs_f64();
++
++        println!("R36_5D_KEYGEN_SECONDS={:.6}", keygen_seconds);
++        println!(
++            "R36_5D_CANONICAL_PREPARATION_SECONDS={:.6}",
++            preparation_seconds
++        );
++
++        let warmups = 1usize;
++        let repeats = 3usize;
++
++        let mut legacy_seconds = Vec::with_capacity(repeats);
++        let mut canonical_seconds = Vec::with_capacity(repeats);
++        let mut legacy_decomposition_ms = Vec::with_capacity(repeats);
++        let mut canonical_decomposition_ms = Vec::with_capacity(repeats);
++
++        for iteration in 0..(warmups + repeats) {
++            let canonical_first = iteration % 2 == 1;
++
++            let run = |canonical: bool| {
++                let started = Instant::now();
++
++                let (result, timing) = profile_hybrid_rns_galois_rotation_prepared_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    if canonical {
++                        Some(&canonical_source)
++                    } else {
++                        None
++                    },
++                );
++
++                let elapsed = started.elapsed().as_secs_f64();
++
++                (result, timing, elapsed)
++            };
++
++            let (legacy, canonical) = if canonical_first {
++                let canonical = run(true);
++                let legacy = run(false);
++                (legacy, canonical)
++            } else {
++                let legacy = run(false);
++                let canonical = run(true);
++                (legacy, canonical)
++            };
++
++            assert_eq!(
++                legacy.0, canonical.0,
++                "R36.5D.2 exact RLWE mismatch iteration={iteration}"
++            );
++
++            // R36_5E1_KEYSWITCH_SUBKERNEL_PROFILE
++            for (mode, timing) in [("legacy", &legacy.1), ("canonical", &canonical.1)] {
++                let measured_sum_ms = timing.ntt_initialization_ms
++                    + timing.digit_construction_ms
++                    + timing.digit_forward_ntt_ms
++                    + timing.pointwise_mac_ms
++                    + timing.inverse_ntt_ms;
++
++                println!(
++                    "R36_5E1_SUBKERNEL iteration={} warmup={} mode={} ntt_initialization_ms={:.6} digit_construction_ms={:.6} forward_ntt_ms={:.6} pointwise_mac_ms={:.6} inverse_ntt_ms={:.6} measured_sum_ms={:.6} key_switch_ntt_ms={:.6}",
++                    iteration,
++                    iteration < warmups,
++                    mode,
++                    timing.ntt_initialization_ms,
++                    timing.digit_construction_ms,
++                    timing.digit_forward_ntt_ms,
++                    timing.pointwise_mac_ms,
++                    timing.inverse_ntt_ms,
++                    measured_sum_ms,
++                    timing.key_switch_ntt_ms,
++                );
++            }
++
++            if iteration >= warmups {
++                legacy_seconds.push(legacy.2);
++                canonical_seconds.push(canonical.2);
++                legacy_decomposition_ms.push(legacy.1.decomposition_ms);
++                canonical_decomposition_ms.push(canonical.1.decomposition_ms);
++            }
++
++            println!(
++                "R36_5D_ITERATION={} warmup={} legacy_seconds={:.6} canonical_seconds={:.6} legacy_decomposition_ms={:.6} canonical_decomposition_ms={:.6} legacy_key_switch_ntt_ms={:.6} canonical_key_switch_ntt_ms={:.6} legacy_modulus_down_ms={:.6} canonical_modulus_down_ms={:.6}",
++                iteration,
++                iteration < warmups,
++                legacy.2,
++                canonical.2,
++                legacy.1.decomposition_ms,
++                canonical.1.decomposition_ms,
++                legacy.1.key_switch_ntt_ms,
++                canonical.1.key_switch_ntt_ms,
++                legacy.1.modulus_down_ms,
++                canonical.1.modulus_down_ms,
++            );
++        }
++
++        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
++
++        let legacy_mean = mean(&legacy_seconds);
++        let canonical_mean = mean(&canonical_seconds);
++        let legacy_decomposition_mean = mean(&legacy_decomposition_ms);
++        let canonical_decomposition_mean = mean(&canonical_decomposition_ms);
++
++        println!(
++            "R36_5D_ROTATION_SPEEDUP={:.6}",
++            legacy_mean / canonical_mean
++        );
++        println!(
++            "R36_5D_DECOMPOSITION_SPEEDUP={:.6}",
++            legacy_decomposition_mean / canonical_decomposition_mean
++        );
++        println!(
++            "R36_5D_AMORTIZED_ROTATION_SPEEDUP={:.6}",
++            legacy_mean * repeats as f64 / (preparation_seconds + canonical_mean * repeats as f64)
++        );
++
++        // R36_5E5_OWNED_FORWARD_AB
++        let mut baseline_samples = Vec::new();
++        let mut optimized_samples = Vec::new();
++        let mut baseline_forward_samples = Vec::new();
++        let mut optimized_forward_samples = Vec::new();
++        let mut baseline_keyswitch_samples = Vec::new();
++        let mut optimized_keyswitch_samples = Vec::new();
++
++        for iteration in 0..4 {
++            let warmup = iteration == 0;
++
++            let baseline_started = std::time::Instant::now();
++            let (baseline, baseline_timing) = profile_hybrid_rns_galois_rotation_prepared_qp(
++                &ciphertext,
++                &key,
++                &qp_plan,
++                &prepared_qp,
++                Some(&canonical_source),
++            );
++            let baseline_seconds = baseline_started.elapsed().as_secs_f64();
++
++            let optimized_started = std::time::Instant::now();
++            let (optimized, optimized_timing) = profile_hybrid_rns_galois_rotation_owned_forward_qp(
++                &ciphertext,
++                &key,
++                &qp_plan,
++                &prepared_qp,
++                &canonical_source,
++            );
++            let optimized_seconds = optimized_started.elapsed().as_secs_f64();
++
++            assert_eq!(
++                baseline, optimized,
++                "R36.5E.5 exact RLWE mismatch iteration={iteration}"
++            );
++
++            println!(
++                "R36_5E5_ITERATION={} warmup={} baseline_seconds={:.6} optimized_seconds={:.6} baseline_forward_ms={:.6} optimized_forward_ms={:.6} baseline_keyswitch_ms={:.6} optimized_keyswitch_ms={:.6}",
++                iteration,
++                warmup,
++                baseline_seconds,
++                optimized_seconds,
++                baseline_timing.digit_forward_ntt_ms,
++                optimized_timing.digit_forward_ntt_ms,
++                baseline_timing.key_switch_ntt_ms,
++                optimized_timing.key_switch_ntt_ms,
++            );
++
++            if !warmup {
++                baseline_samples.push(baseline_seconds);
++                optimized_samples.push(optimized_seconds);
++                baseline_forward_samples.push(baseline_timing.digit_forward_ntt_ms);
++                optimized_forward_samples.push(optimized_timing.digit_forward_ntt_ms);
++                baseline_keyswitch_samples.push(baseline_timing.key_switch_ntt_ms);
++                optimized_keyswitch_samples.push(optimized_timing.key_switch_ntt_ms);
++            }
++        }
++
++        let mean = |samples: &[f64]| -> f64 { samples.iter().sum::<f64>() / samples.len() as f64 };
++
++        println!(
++            "R36_5E5_ROTATION_SPEEDUP={:.6}",
++            mean(&baseline_samples) / mean(&optimized_samples)
++        );
++        println!(
++            "R36_5E5_FORWARD_NTT_SPEEDUP={:.6}",
++            mean(&baseline_forward_samples) / mean(&optimized_forward_samples)
++        );
++        println!(
++            "R36_5E5_KEYSWITCH_SPEEDUP={:.6}",
++            mean(&baseline_keyswitch_samples) / mean(&optimized_keyswitch_samples)
++        );
++        println!("R36_5E5_EXACT_RLWE_STATUS=PASS");
++
++        // R36_5F4_PREPARED_BUTTERFLY_AB
++        let mut owned_rotation_samples = Vec::new();
++        let mut prepared_rotation_samples = Vec::new();
++        let mut owned_forward_samples = Vec::new();
++        let mut prepared_forward_samples = Vec::new();
++        let mut owned_keyswitch_samples = Vec::new();
++        let mut prepared_keyswitch_samples = Vec::new();
++
++        for iteration in 0..5 {
++            let warmup = iteration == 0;
++
++            let run_owned = || {
++                let started = Instant::now();
++                let (result, timing) = profile_hybrid_rns_galois_rotation_owned_forward_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    &canonical_source,
++                );
++                (result, timing, started.elapsed().as_secs_f64())
++            };
++
++            let run_prepared = || {
++                let started = Instant::now();
++                let (result, timing) = profile_hybrid_rns_galois_rotation_prepared_butterfly_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    &canonical_source,
++                );
++                (result, timing, started.elapsed().as_secs_f64())
++            };
++
++            // Alternate execution order to reduce systematic order bias.
++            let (owned, prepared) = if iteration % 2 == 0 {
++                (run_owned(), run_prepared())
++            } else {
++                let prepared = run_prepared();
++                let owned = run_owned();
++                (owned, prepared)
++            };
++
++            assert_eq!(
++                owned.0, prepared.0,
++                "R36.5F.4 exact RLWE mismatch iteration={iteration}"
++            );
++
++            println!(
++                "R36_5F4_ITERATION={} warmup={} owned_seconds={:.6} prepared_seconds={:.6} owned_forward_ms={:.6} prepared_forward_ms={:.6} owned_keyswitch_ms={:.6} prepared_keyswitch_ms={:.6}",
++                iteration,
++                warmup,
++                owned.2,
++                prepared.2,
++                owned.1.digit_forward_ntt_ms,
++                prepared.1.digit_forward_ntt_ms,
++                owned.1.key_switch_ntt_ms,
++                prepared.1.key_switch_ntt_ms,
++            );
++
++            if !warmup {
++                owned_rotation_samples.push(owned.2);
++                prepared_rotation_samples.push(prepared.2);
++                owned_forward_samples.push(owned.1.digit_forward_ntt_ms);
++                prepared_forward_samples.push(prepared.1.digit_forward_ntt_ms);
++                owned_keyswitch_samples.push(owned.1.key_switch_ntt_ms);
++                prepared_keyswitch_samples.push(prepared.1.key_switch_ntt_ms);
++            }
++        }
++
++        let mean = |samples: &[f64]| -> f64 { samples.iter().sum::<f64>() / samples.len() as f64 };
++
++        println!(
++            "R36_5F4_ROTATION_SPEEDUP={:.6}",
++            mean(&owned_rotation_samples) / mean(&prepared_rotation_samples)
++        );
++        println!(
++            "R36_5F4_FORWARD_NTT_SPEEDUP={:.6}",
++            mean(&owned_forward_samples) / mean(&prepared_forward_samples)
++        );
++        println!(
++            "R36_5F4_KEYSWITCH_SPEEDUP={:.6}",
++            mean(&owned_keyswitch_samples) / mean(&prepared_keyswitch_samples)
++        );
++        println!("R36_5F4_EXACT_RLWE_STATUS=PASS");
++
++        // R36_5G3_INVERSE_AB
++        let mut g3_baseline_rotation = Vec::new();
++        let mut g3_candidate_rotation = Vec::new();
++        let mut g3_baseline_inverse = Vec::new();
++        let mut g3_candidate_inverse = Vec::new();
++        let mut g3_baseline_keyswitch = Vec::new();
++        let mut g3_candidate_keyswitch = Vec::new();
++
++        for iteration in 0..5 {
++            let warmup = iteration == 0;
++
++            let run_baseline = || {
++                let started = Instant::now();
++                let (result, timing) = profile_hybrid_rns_galois_rotation_owned_forward_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    &canonical_source,
++                );
++                (result, timing, started.elapsed().as_secs_f64())
++            };
++
++            let run_candidate = || {
++                let started = Instant::now();
++                let (result, timing) = profile_hybrid_rns_galois_rotation_prepared_inverse_qp(
++                    &ciphertext,
++                    &key,
++                    &qp_plan,
++                    &prepared_qp,
++                    &canonical_source,
++                );
++                (result, timing, started.elapsed().as_secs_f64())
++            };
++
++            let (baseline, candidate) = if iteration % 2 == 0 {
++                (run_baseline(), run_candidate())
++            } else {
++                let candidate = run_candidate();
++                let baseline = run_baseline();
++                (baseline, candidate)
++            };
++
++            assert_eq!(
++                baseline.0, candidate.0,
++                "R36.5G.3 exact RLWE mismatch iteration={iteration}"
++            );
++
++            println!(
++                "R36_5G3_ITERATION={} warmup={} baseline_seconds={:.6} candidate_seconds={:.6} baseline_inverse_ms={:.6} candidate_inverse_ms={:.6} baseline_keyswitch_ms={:.6} candidate_keyswitch_ms={:.6}",
++                iteration,
++                warmup,
++                baseline.2,
++                candidate.2,
++                baseline.1.inverse_ntt_ms,
++                candidate.1.inverse_ntt_ms,
++                baseline.1.key_switch_ntt_ms,
++                candidate.1.key_switch_ntt_ms,
++            );
++
++            if !warmup {
++                g3_baseline_rotation.push(baseline.2);
++                g3_candidate_rotation.push(candidate.2);
++                g3_baseline_inverse.push(baseline.1.inverse_ntt_ms);
++                g3_candidate_inverse.push(candidate.1.inverse_ntt_ms);
++                g3_baseline_keyswitch.push(baseline.1.key_switch_ntt_ms);
++                g3_candidate_keyswitch.push(candidate.1.key_switch_ntt_ms);
++            }
++        }
++
++        let g3_mean = |values: &[f64]| -> f64 { values.iter().sum::<f64>() / values.len() as f64 };
++
++        println!(
++            "R36_5G3_INVERSE_SPEEDUP={:.6}",
++            g3_mean(&g3_baseline_inverse) / g3_mean(&g3_candidate_inverse)
++        );
++        println!(
++            "R36_5G3_KEYSWITCH_SPEEDUP={:.6}",
++            g3_mean(&g3_baseline_keyswitch) / g3_mean(&g3_candidate_keyswitch)
++        );
++        println!(
++            "R36_5G3_ROTATION_SPEEDUP={:.6}",
++            g3_mean(&g3_baseline_rotation) / g3_mean(&g3_candidate_rotation)
++        );
++        println!("R36_5G3_EXACT_RLWE_STATUS=PASS");
++
++        // R36_5F6_PRODUCTION_ENTRY_EQUIVALENCE
++        let production_result = apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
++            &ciphertext,
++            &key,
++            &qp_plan,
++            &prepared_qp,
++            &canonical_source,
++        );
++
++        let (reference_result, _) = profile_hybrid_rns_galois_rotation_prepared_qp(
++            &ciphertext,
++            &key,
++            &qp_plan,
++            &prepared_qp,
++            Some(&canonical_source),
++        );
++
++        assert_eq!(
++            production_result, reference_result,
++            "R36.5F.6 production/reference RLWE mismatch"
++        );
++
++        println!("R36_5F6_PRODUCTION_EXACT_RLWE_STATUS=PASS");
++
++        println!("R36_5D_EXACT_RLWE_STATUS=PASS");
++    }
++
++    // R35_9E_4_KEYGEN_BENCHMARK
++    #[test]
++    #[ignore = "Run explicitly for key-generation performance characterization"]
++    fn r35_9e_keygen_benchmark() {
++        use crate::ring::{Modulus, ModulusBasis};
++        use std::time::Instant;
++
++        const N: usize = 16;
++
++        let q = ModulusBasis::new(vec![
++            Modulus::new(12_289),
++            Modulus::new(40_961),
++            Modulus::new(65_537),
++        ]);
++
++        let p = ModulusBasis::new(vec![Modulus::new(114_689), Modulus::new(786_433)]);
++
++        let mut qp_moduli = q.moduli().to_vec();
++        qp_moduli.extend_from_slice(p.moduli());
++        let qp_plan = RnsNttPlan::new(qp_moduli, N);
++
++        let secret: [i8; N] = [1, 0, -1, 1, 0, -1, 1, 0, -1, 0, 1, 0, 1, -1, 0, 1];
++
++        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
++
++        for repetition in 0..5_u64 {
++            let seed = 0x359e_4000 + repetition;
++            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed);
++            let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed);
++
++            let start = Instant::now();
++            let reference = reference_key(
++                BoundedGadgetLayout::new(q.clone(), 8),
++                p.clone(),
++                &secret,
++                3,
++                distribution,
++                2,
++                &qp_plan,
++                &mut reference_rng,
++            );
++            let reference_seconds = start.elapsed().as_secs_f64();
++
++            let start = Instant::now();
++            let optimized = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++                BoundedGadgetLayout::new(q.clone(), 8),
++                p.clone(),
++                &secret,
++                3,
++                distribution,
++                2,
++                &qp_plan,
++                &mut optimized_rng,
++            );
++            let optimized_seconds = start.elapsed().as_secs_f64();
++
++            assert_eq!(reference, optimized);
++
++            println!(
++                "R35_9E_4_SAMPLE={} REFERENCE_SECONDS={:.9} OPTIMIZED_SECONDS={:.9} SPEEDUP={:.4}",
++                repetition,
++                reference_seconds,
++                optimized_seconds,
++                reference_seconds / optimized_seconds
++            );
++        }
++
++        println!("R35_9E_4_BENCHMARK_STATUS=PASS");
++    }
++
++    #[test]
++    fn r35_9e_full_prepared_galois_key_exact_equivalence() {
++        use crate::ring::{Modulus, ModulusBasis};
++
++        const N: usize = 16;
++
++        let q = ModulusBasis::new(vec![
++            Modulus::new(12_289),
++            Modulus::new(40_961),
++            Modulus::new(65_537),
++        ]);
++
++        let p = ModulusBasis::new(vec![Modulus::new(114_689), Modulus::new(786_433)]);
++
++        let mut qp_moduli = q.moduli().to_vec();
++        qp_moduli.extend_from_slice(p.moduli());
++
++        let qp_plan = RnsNttPlan::new(qp_moduli, N);
++
++        let secret: [i8; N] = [1, 0, -1, 1, 0, -1, 1, 0, -1, 0, 1, 0, 1, -1, 0, 1];
++
++        for exponent in [3_usize, 5] {
++            for (mode, distribution) in [
++                ("ZERO_NOISE", ErrorDistribution::BoundedUniform { bound: 0 }),
++                (
++                    "GAUSSIAN",
++                    ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
++                ),
++            ] {
++                let seed =
++                    0x359e_3000_u64 + exponent as u64 + if mode == "GAUSSIAN" { 100 } else { 0 };
++
++                let mut reference_rng = ChaCha20Rng::seed_from_u64(seed);
++                let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed);
++
++                let reference = reference_key(
++                    BoundedGadgetLayout::new(q.clone(), 8),
++                    p.clone(),
++                    &secret,
++                    exponent,
++                    distribution,
++                    2,
++                    &qp_plan,
++                    &mut reference_rng,
++                );
++
++                let optimized = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++                    BoundedGadgetLayout::new(q.clone(), 8),
++                    p.clone(),
++                    &secret,
++                    exponent,
++                    distribution,
++                    2,
++                    &qp_plan,
++                    &mut optimized_rng,
++                );
++
++                assert_eq!(
++                    reference, optimized,
++                    "R35.9E full-key mismatch: exponent={exponent}, mode={mode}"
++                );
++
++                println!(
++                    "R35_9E_FULL_KEY_CASE=PASS exponent={} mode={} digits={}",
++                    exponent,
++                    mode,
++                    optimized.digit_count()
++                );
++            }
++        }
++
++        println!("R35_9E_FULL_KEY_EQUIVALENCE_STATUS=PASS");
++    }
++
++    #[test]
++    fn r35_9e_cached_secret_ntt_matches_original_encryption_exactly() {
++        let degree = 16usize;
++        let moduli = [97_u64, 193_u64];
++        let secret: Vec<i8> = (0..degree)
++            .map(|i| match i % 3 {
++                0 => -1,
++                1 => 0,
++                _ => 1,
++            })
++            .collect();
++
++        let message = RnsPolynomial::from_residues(
++            moduli
++                .iter()
++                .map(|&q| {
++                    let modulus = crate::ring::Modulus::new(q);
++                    Polynomial::new(
++                        modulus,
++                        (0..degree).map(|i| (i as u64 * 7 + 3) % q).collect(),
++                    )
++                })
++                .collect(),
++        );
++
++        let plan = RnsNttPlan::new(
++            moduli
++                .iter()
++                .copied()
++                .map(crate::ring::Modulus::new)
++                .collect(),
++            degree,
++        );
++        let secret_ntt: Vec<NttPolynomial> = moduli
++            .iter()
++            .enumerate()
++            .map(|(index, &q)| {
++                let modulus = crate::ring::Modulus::new(q);
++                let projected = Polynomial::new(
++                    modulus,
++                    secret
++                        .iter()
++                        .map(|&x| signed_mod(i128::from(x), q))
++                        .collect(),
++                );
++                NttPolynomial::from_polynomial(plan.plan(index), &projected)
++            })
++            .collect();
++
++        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
++
++        for seed_byte in [7_u8, 19_u8, 83_u8] {
++            let mut reference_rng = ChaCha20Rng::from_seed([seed_byte; 32]);
++            let mut optimized_rng = ChaCha20Rng::from_seed([seed_byte; 32]);
++
++            let reference = encrypt_rns_raw_prepared_with_distribution_ntt_rng(
++                &message,
++                2,
++                distribution,
++                &secret,
++                &plan,
++                &mut reference_rng,
++            );
++
++            let optimized = crate::grafting::encrypt_rns_raw_prepared_with_cached_secret_ntt_rng(
++                &message,
++                2,
++                distribution,
++                &secret_ntt,
++                &plan,
++                &mut optimized_rng,
++            );
++
++            assert_eq!(
++                reference, optimized,
++                "R35.9E exact encryption mismatch for seed {seed_byte}"
++            );
++        }
++
++        println!("R35_9E_EXACT_KEY_EQUIVALENCE_STATUS=PASS");
++    }
++}
+diff --git a/src/ckks/mod.rs b/src/ckks/mod.rs
+index 7d53a8e..7035704 100644
+--- a/src/ckks/mod.rs
++++ b/src/ckks/mod.rs
+@@ -46,7 +46,10 @@ pub use galois_key::{
+ pub use hybrid_ciphertext::HybridCkksCiphertext;
+ pub use hybrid_multiply::{multiply_transition_relinearize_hybrid_ckks, HybridCkksMultiplyConfig};
+ // R16_7C2B1_PROFILE_EXPORT
+-pub use hybrid_rns_galois_key::apply_hybrid_rns_galois_automorphism_prepared_qp;
++pub use hybrid_rns_galois_key::{
++    apply_hybrid_rns_galois_automorphism_prepared_canonical_qp,
++    apply_hybrid_rns_galois_automorphism_prepared_qp,
++};
+ pub use hybrid_rns_galois_key::{profile_hybrid_rns_galois_rotation, HybridRotationTiming};
+ 
+ pub use hybrid_rns_galois_key::{
+diff --git a/src/eblas/encrypted_fft3840.rs b/src/eblas/encrypted_fft3840.rs
+index 2765b7d..40196f6 100644
+--- a/src/eblas/encrypted_fft3840.rs
++++ b/src/eblas/encrypted_fft3840.rs
+@@ -73,6 +73,37 @@ use crate::eblas::mixed_radix_ckks::{
+ use crate::ring::{ModulusBasis, ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
+ use num_complex::Complex64;
+ 
++// R29_5_PARALLEL_FFT3840
++use rayon::prelude::*;
++use rayon::{ThreadPool, ThreadPoolBuilder};
++use std::sync::OnceLock;
++
++pub(crate) fn fft3840_workers() -> usize {
++    let available = std::thread::available_parallelism()
++        .map(|n| n.get())
++        .unwrap_or(1);
++
++    let requested = std::env::var("FHE_R29_FFT_WORKERS")
++        .or_else(|_| std::env::var("FHE_RS_WORKERS"))
++        .ok()
++        .map(|value| value.parse::<usize>().expect("invalid FFT worker count"))
++        .unwrap_or(available);
++
++    assert!(requested > 0, "FFT worker count must be positive");
++    requested.min(available)
++}
++
++pub(crate) fn fft3840_pool() -> &'static ThreadPool {
++    static POOL: OnceLock<ThreadPool> = OnceLock::new();
++
++    POOL.get_or_init(|| {
++        ThreadPoolBuilder::new()
++            .num_threads(fft3840_workers())
++            .build()
++            .expect("FFT3840 pool initialization failed")
++    })
++}
++
+ /// Evaluate the encrypted FFT15 front end on eight packed ciphertexts.
+ ///
+ /// The caller performs encoding and encryption. Each ciphertext contains
+@@ -278,23 +309,30 @@ impl PreparedEncryptedFft15 {
+     ) -> [RnsCkksCiphertext; 15] {
+         const HALF: usize = 4096;
+ 
+-        let aligned = std::array::from_fn(|tile| {
+-            let source = &physical[tile / 2];
+-
+-            if tile % 2 == 0 {
+-                multiply_complex_slots_cp_prepared(source, mask, chain, prepared0)
+-            } else {
+-                let shifted = rotate_left_bounded_rns_ckks_with_prepared_execution(
+-                    source,
+-                    HALF,
+-                    prepared_left,
+-                    chain,
+-                    plan0,
+-                    prepared0,
+-                );
+-
+-                multiply_complex_slots_cp_prepared(&shifted, mask, chain, prepared0)
+-            }
++        let aligned: [RnsCkksCiphertext; 15] = fft3840_pool().install(|| {
++            (0..15)
++                .into_par_iter()
++                .map(|tile| {
++                    let source = &physical[tile / 2];
++
++                    if tile % 2 == 0 {
++                        multiply_complex_slots_cp_prepared(source, mask, chain, prepared0)
++                    } else {
++                        let shifted = rotate_left_bounded_rns_ckks_with_prepared_execution(
++                            source,
++                            HALF,
++                            prepared_left,
++                            chain,
++                            plan0,
++                            prepared0,
++                        );
++
++                        multiply_complex_slots_cp_prepared(&shifted, mask, chain, prepared0)
++                    }
++                })
++                .collect::<Vec<_>>()
++                .try_into()
++                .unwrap_or_else(|_| panic!("FFT15 extraction length mismatch"))
+         });
+ 
+         assert!(aligned.iter().all(|ct: &RnsCkksCiphertext| ct.level() == 1));
+@@ -310,20 +348,27 @@ impl PreparedEncryptedFft15 {
+         let keys = RnsCkksEvaluationKeys::new();
+         let evaluator = RnsCkksEvaluator::new(chain, &keys);
+ 
+-        let branches = std::array::from_fn(|j| {
+-            packed_radix5_dft_cp_prepared(
+-                &evaluator,
+-                [
+-                    &aligned[j],
+-                    &aligned[j + 3],
+-                    &aligned[j + 6],
+-                    &aligned[j + 9],
+-                    &aligned[j + 12],
+-                ],
+-                radix5,
+-                chain,
+-                prepared1,
+-            )
++        let branches: [[RnsCkksCiphertext; 5]; 3] = fft3840_pool().install(|| {
++            (0..3)
++                .into_par_iter()
++                .map(|j| {
++                    packed_radix5_dft_cp_prepared(
++                        &evaluator,
++                        [
++                            &aligned[j],
++                            &aligned[j + 3],
++                            &aligned[j + 6],
++                            &aligned[j + 9],
++                            &aligned[j + 12],
++                        ],
++                        radix5,
++                        chain,
++                        prepared1,
++                    )
++                })
++                .collect::<Vec<_>>()
++                .try_into()
++                .unwrap_or_else(|_| panic!("FFT15 radix5 group count mismatch"))
+         });
+ 
+         assert!(branches
+@@ -342,15 +387,22 @@ impl PreparedEncryptedFft15 {
+         let keys = RnsCkksEvaluationKeys::new();
+         let evaluator = RnsCkksEvaluator::new(chain, &keys);
+ 
+-        let groups: [[RnsCkksCiphertext; 3]; 5] = std::array::from_fn(|k| {
+-            packed_fft15_twiddled_radix3_cp_prepared(
+-                &evaluator,
+-                [&branches[0][k], &branches[1][k], &branches[2][k]],
+-                k,
+-                radix3,
+-                chain,
+-                prepared2,
+-            )
++        let groups: [[RnsCkksCiphertext; 3]; 5] = fft3840_pool().install(|| {
++            (0..5)
++                .into_par_iter()
++                .map(|k| {
++                    packed_fft15_twiddled_radix3_cp_prepared(
++                        &evaluator,
++                        [&branches[0][k], &branches[1][k], &branches[2][k]],
++                        k,
++                        radix3,
++                        chain,
++                        prepared2,
++                    )
++                })
++                .collect::<Vec<_>>()
++                .try_into()
++                .unwrap_or_else(|_| panic!("FFT15 radix3 group count mismatch"))
+         });
+ 
+         let sources: [RnsCkksCiphertext; 15] =
+@@ -457,6 +509,181 @@ impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+     }
+ }
+ 
++// R29_4A_MEMORY_BOUNDED_STREAMING
++
++/// Progress information for one completed encrypted FFT3840 batch.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct EncryptedFft3840BatchProgress {
++    /// Zero-based index of the completed batch.
++    pub batch_index: usize,
++
++    /// Number of batches completed, including this batch.
++    pub completed_batches: usize,
++
++    /// Time spent executing the encrypted FFT3840 pipeline.
++    pub execution_duration: std::time::Duration,
++}
++
++/// Failure reported by an encrypted FFT3840 streaming source or sink.
++#[derive(Debug)]
++pub enum EncryptedFft3840StreamError<E> {
++    Source(E),
++    Sink(E),
++}
++
++impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
++    /// Execute successive encrypted FFT3840 batches.
++    ///
++    /// Each source invocation returns one batch of eight level-0
++    /// ciphertexts, or None when the stream is exhausted.
++    ///
++    /// Each completed transform produces two level-7 ciphertexts,
++    /// which are transferred immediately to the output sink.
++    ///
++    /// The controller does not retain ciphertexts from previous
++    /// batches, and reuses the pipeline's prepared operands.
++    ///
++    /// The caller is responsible for compatible ciphertext
++    /// parameters and for enforcing any expected image geometry.
++    pub fn execute_stream<E, Source, Sink>(
++        &self,
++        mut source: Source,
++        mut sink: Sink,
++    ) -> Result<usize, EncryptedFft3840StreamError<E>>
++    where
++        Source: FnMut() -> Result<Option<[RnsCkksCiphertext; 8]>, E>,
++        Sink: FnMut([RnsCkksCiphertext; 2], EncryptedFft3840BatchProgress) -> Result<(), E>,
++    {
++        let mut completed_batches = 0usize;
++
++        loop {
++            let Some(physical) = source().map_err(EncryptedFft3840StreamError::Source)? else {
++                break;
++            };
++
++            let started = std::time::Instant::now();
++
++            let spectrum = self.execute(&physical);
++
++            let execution_duration = started.elapsed();
++
++            let next_completed = completed_batches
++                .checked_add(1)
++                .expect("FFT3840 batch count overflow");
++
++            let progress = EncryptedFft3840BatchProgress {
++                batch_index: completed_batches,
++                completed_batches: next_completed,
++                execution_duration,
++            };
++
++            sink(spectrum, progress).map_err(EncryptedFft3840StreamError::Sink)?;
++
++            completed_batches = next_completed;
++        }
++
++        Ok(completed_batches)
++    }
++}
++
++// R29_10B_TESTABLE_BOUNDED_SCHEDULER
++fn execute_stream_bounded_with<I, O, E, Source, Sink, Execute>(
++    mut source: Source,
++    mut sink: Sink,
++    execute: Execute,
++) -> Result<usize, EncryptedFft3840StreamError<E>>
++where
++    I: Send + Sync,
++    O: Send,
++    Source: FnMut() -> Result<Option<I>, E>,
++    Sink: FnMut(O, EncryptedFft3840BatchProgress) -> Result<(), E>,
++    Execute: Fn(&I) -> O + Sync,
++{
++    let mut completed = 0usize;
++
++    loop {
++        let Some(first) = source().map_err(EncryptedFft3840StreamError::Source)? else {
++            break;
++        };
++
++        // Both inputs are acquired before either evaluation begins.
++        // A failure here leaves the first input consumed but undelivered.
++        let second = source().map_err(EncryptedFft3840StreamError::Source)?;
++
++        let run = |input: &I| {
++            let started = std::time::Instant::now();
++            let output = execute(input);
++            (output, started.elapsed())
++        };
++
++        let (first_result, second_result) = if let Some(second) = second {
++            let (a, b) = fft3840_pool().install(|| rayon::join(|| run(&first), || run(&second)));
++            (a, Some(b))
++        } else {
++            (run(&first), None)
++        };
++
++        let next = completed
++            .checked_add(1)
++            .expect("FFT3840 batch count overflow");
++
++        sink(
++            first_result.0,
++            EncryptedFft3840BatchProgress {
++                batch_index: completed,
++                completed_batches: next,
++                execution_duration: first_result.1,
++            },
++        )
++        .map_err(EncryptedFft3840StreamError::Sink)?;
++
++        completed = next;
++
++        if let Some((output, duration)) = second_result {
++            let next = completed
++                .checked_add(1)
++                .expect("FFT3840 batch count overflow");
++
++            sink(
++                output,
++                EncryptedFft3840BatchProgress {
++                    batch_index: completed,
++                    completed_batches: next,
++                    execution_duration: duration,
++                },
++            )
++            .map_err(EncryptedFft3840StreamError::Sink)?;
++
++            completed = next;
++        } else {
++            break;
++        }
++    }
++
++    Ok(completed)
++}
++
++impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
++    /// Execute at most two encrypted FFT3840 batches concurrently.
++    ///
++    /// Inputs are acquired and outputs delivered sequentially.
++    /// Output order matches input order. Prepared operands are reused.
++    ///
++    /// Source failures during a two-batch fetch can leave an earlier
++    /// input consumed without producing an output.
++    pub fn execute_stream_bounded<E, Source, Sink>(
++        &self,
++        source: Source,
++        sink: Sink,
++    ) -> Result<usize, EncryptedFft3840StreamError<E>>
++    where
++        Source: FnMut() -> Result<Option<[RnsCkksCiphertext; 8]>, E>,
++        Sink: FnMut([RnsCkksCiphertext; 2], EncryptedFft3840BatchProgress) -> Result<(), E>,
++    {
++        execute_stream_bounded_with(source, sink, |physical| self.execute(physical))
++    }
++}
++
+ // R29_3B2A_UNIFIED_PIPELINE_MIGRATION
+ impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+     /// Execute already-computed FFT15 branches through FFT256.
+@@ -469,3 +696,213 @@ impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+         self.fft256.execute(branches)
+     }
+ }
++
++// R29_9B_PIPELINE_SYNC_PROBE
++#[allow(dead_code)]
++fn r29_9b_assert_pipeline_sync<'a, 'ctx>()
++where
++    'ctx: 'a,
++{
++    fn assert_sync<T: Sync>() {}
++    assert_sync::<EncryptedFft3840Pipeline<'a, 'ctx>>();
++}
++
++// R29_10C_BOUNDED_SCHEDULER_TESTS
++
++// R31_2B_BATCHED_HORIZONTAL_EXECUTOR
++
++/// Execute multiple encrypted FFT3840 horizontal batches.
++///
++/// Each batch contains 15 FFT15 ciphertexts at level 3.
++/// Each output contains two packed FFT3840 ciphertexts at level 7.
++///
++/// Stage zero uses operand-major streaming key generation.
++/// Later stages reuse the caller's level-specific rotation keys.
++///
++/// The caller controls batch-window size and resource lifetimes.
++#[allow(clippy::too_many_arguments)]
++pub fn execute_encrypted_fft3840_batched<F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    later_stages: &[PreparedFft256Stage; 3],
++    evaluator: &RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared_stage0: &PreparedRnsNttPlan,
++    qp_stage0: &RnsNttPlan,
++    prepared_qp_stage0: &PreparedRnsNttPlan,
++    later_contexts: [&StageContext<'_>; 3],
++    make_stage0_key: &mut F,
++) -> Vec<[RnsCkksCiphertext; 2]>
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    assert!(!batches.is_empty(), "FFT3840 batch window is empty");
++    assert!(batches
++        .iter()
++        .all(|batch| { batch.iter().all(|ct| ct.level() == 3) }));
++
++    let mut outputs =
++        crate::eblas::fused_fft256_handoff::apply_fft3840_packed_fft256_stage0_batched_streaming(
++            batches,
++            prepared_sources,
++            evaluator,
++            chain,
++            prepared_stage0,
++            qp_stage0,
++            prepared_qp_stage0,
++            make_stage0_key,
++        );
++
++    assert_eq!(outputs.len(), batches.len());
++
++    for (stage_index, context) in later_contexts.iter().enumerate() {
++        let expected_input_level = stage_index + 4;
++
++        for pair in &mut outputs {
++            for ciphertext in pair {
++                assert_eq!(ciphertext.level(), expected_input_level);
++
++                *ciphertext = crate::eblas::prepared_radix4_fft256::apply_stage(
++                    ciphertext,
++                    &later_stages[stage_index],
++                    context,
++                );
++
++                assert_eq!(ciphertext.level(), expected_input_level + 1);
++            }
++        }
++    }
++
++    assert!(outputs
++        .iter()
++        .all(|pair| { pair.iter().all(|ct| ct.level() == 7) }));
++
++    outputs
++}
++
++#[cfg(test)]
++mod r29_10c_bounded_scheduler_tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::time::Duration;
++
++    #[test]
++    fn zero_through_four_batches_preserve_order() {
++        for count in 0usize..=4 {
++            let mut inputs = 0usize..count;
++            let mut outputs = Vec::new();
++
++            let completed = execute_stream_bounded_with(
++                || Ok::<_, ()>(inputs.next()),
++                |output, progress| {
++                    outputs.push((output, progress.batch_index, progress.completed_batches));
++                    Ok::<(), ()>(())
++                },
++                |input: &usize| input * 7,
++            )
++            .expect("bounded execution failed");
++
++            assert_eq!(completed, count);
++            assert_eq!(outputs.len(), count);
++
++            for (index, (value, batch_index, completed_batches)) in outputs.into_iter().enumerate()
++            {
++                assert_eq!(value, index * 7);
++                assert_eq!(batch_index, index);
++                assert_eq!(completed_batches, index + 1);
++            }
++        }
++    }
++
++    #[test]
++    fn second_source_failure_does_not_execute_first() {
++        let mut calls = 0usize;
++        let executions = AtomicUsize::new(0);
++
++        let result = execute_stream_bounded_with(
++            || {
++                calls += 1;
++                match calls {
++                    1 => Ok::<_, &'static str>(Some(10usize)),
++                    2 => Err("source failure"),
++                    _ => panic!("unexpected source call"),
++                }
++            },
++            |_: usize, _| Ok::<(), &'static str>(()),
++            |input: &usize| {
++                executions.fetch_add(1, Ordering::SeqCst);
++                *input
++            },
++        );
++
++        assert!(matches!(
++            result,
++            Err(EncryptedFft3840StreamError::Source("source failure"))
++        ));
++        assert_eq!(executions.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn first_source_failure_is_propagated() {
++        let result = execute_stream_bounded_with(
++            || Err::<Option<usize>, _>("first source failure"),
++            |_: usize, _| Ok::<(), &'static str>(()),
++            |input: &usize| *input,
++        );
++
++        assert!(matches!(
++            result,
++            Err(EncryptedFft3840StreamError::Source("first source failure"))
++        ));
++    }
++
++    #[test]
++    fn sink_failure_stops_delivery() {
++        let mut inputs = 0usize..4;
++        let mut deliveries = 0usize;
++
++        let result = execute_stream_bounded_with(
++            || Ok::<_, &'static str>(inputs.next()),
++            |_: usize, _| {
++                deliveries += 1;
++                Err::<(), _>("sink failure")
++            },
++            |input: &usize| *input,
++        );
++
++        assert!(matches!(
++            result,
++            Err(EncryptedFft3840StreamError::Sink("sink failure"))
++        ));
++        assert_eq!(deliveries, 1);
++    }
++
++    #[test]
++    fn two_batches_can_overlap() {
++        if fft3840_pool().current_num_threads() < 2 {
++            return;
++        }
++
++        let active = AtomicUsize::new(0);
++        let peak = AtomicUsize::new(0);
++        let mut inputs = 0usize..2;
++
++        let completed = execute_stream_bounded_with(
++            || Ok::<_, ()>(inputs.next()),
++            |_: usize, _| Ok::<(), ()>(()),
++            |input: &usize| {
++                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
++                peak.fetch_max(current, Ordering::SeqCst);
++
++                std::thread::sleep(Duration::from_millis(100));
++
++                active.fetch_sub(1, Ordering::SeqCst);
++                *input
++            },
++        )
++        .expect("parallel execution failed");
++
++        assert_eq!(completed, 2);
++        assert_eq!(peak.load(Ordering::SeqCst), 2);
++    }
++}
+diff --git a/src/eblas/fused_fft256_handoff.rs b/src/eblas/fused_fft256_handoff.rs
+index 9db4894..eaae931 100644
+--- a/src/eblas/fused_fft256_handoff.rs
++++ b/src/eblas/fused_fft256_handoff.rs
+@@ -5,6 +5,7 @@
+ //!
+ //! No ciphertext operations or key generation occur during construction.
+ 
++use rayon::prelude::*;
+ use std::collections::BTreeMap;
+ 
+ use num_complex::Complex64;
+@@ -168,60 +169,111 @@ fn apply_fused_fft256_sources_with_qp(
+ 
+     let mut accumulator: Option<RnsCkksCiphertext> = None;
+ 
+-    for &(input, prepared_source) in sources {
+-        input.assert_matches_chain(ctx.chain);
+-
+-        assert_eq!(input.level(), expected_level);
+-        assert_eq!(prepared_source.level, expected_level);
+-        assert_eq!(input.scale(), expected_scale);
+-        assert_eq!(input.basis().moduli(), ctx.prepared.moduli());
+-
+-        for (offset, prepared_plaintext) in &prepared_source.operands {
+-            let rotated = if *offset == 0 {
+-                None
+-            } else {
+-                let key = ctx
+-                    .keys
+-                    .get(offset)
+-                    .expect("missing fused FFT256 rotation key");
+-
+-                let started = profile_enabled.then(std::time::Instant::now);
+-
+-                let rotated_rlwe = crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_qp(
+-                    input.rlwe(),
+-                    key,
+-                    ctx.qp_plan,
+-                    prepared_qp,
+-                );
+-
+-                if let Some(started) = started {
+-                    rotation_ms += started.elapsed().as_secs_f64() * 1000.0;
+-                    rotation_count += 1;
+-                }
+-
+-                Some(RnsCkksCiphertext::new(
+-                    rotated_rlwe,
+-                    input.state().clone(),
+-                    ctx.chain,
+-                ))
+-            };
+-
+-            let operand = rotated.as_ref().unwrap_or(input);
+-
+-            let started = profile_enabled.then(std::time::Instant::now);
+-
+-            let term = multiply_plain_rns_ckks_with_prepared_ntt(
+-                operand,
+-                prepared_plaintext,
+-                prepared_source.plain_scale,
+-                ctx.chain,
+-                ctx.prepared,
+-            );
+-
+-            if let Some(started) = started {
+-                multiply_ms += started.elapsed().as_secs_f64() * 1000.0;
+-                multiply_count += 1;
++    // R29_7A_BOUNDED_FUSED_TERMS
++    // Compute independent contributions concurrently, but accumulate
++    // in the original source/operand order before the single rescale.
++    use rayon::prelude::*;
++
++    let jobs: Vec<_> = sources
++        .iter()
++        .flat_map(|&(input, prepared_source)| {
++            input.assert_matches_chain(ctx.chain);
++            assert_eq!(input.level(), expected_level);
++            assert_eq!(prepared_source.level, expected_level);
++            assert_eq!(input.scale(), expected_scale);
++            assert_eq!(input.basis().moduli(), ctx.prepared.moduli());
++
++            prepared_source
++                .operands
++                .iter()
++                .map(move |(offset, plaintext)| {
++                    (input, prepared_source.plain_scale, *offset, plaintext)
++                })
++        })
++        .collect();
++
++    // Four temporary terms bound memory consumption. The shared
++    // FFT3840 pool remains limited by FHE_R29_FFT_WORKERS.
++    let max_inflight_terms = std::env::var("FHE_R29_FUSED_INFLIGHT")
++        .ok()
++        .map(|value| {
++            let count = value
++                .parse::<usize>()
++                .expect("FHE_R29_FUSED_INFLIGHT must be an integer");
++            assert!(count > 0, "FHE_R29_FUSED_INFLIGHT must be positive");
++            count
++        })
++        .unwrap_or(4)
++        .min(8);
++
++    for chunk in jobs.chunks(max_inflight_terms) {
++        let terms: Vec<_> = crate::eblas::encrypted_fft3840::fft3840_pool().install(|| {
++            chunk
++                .par_iter()
++                .map(|&(input, plain_scale, offset, prepared_plaintext)| {
++                    let rotation_started = profile_enabled.then(std::time::Instant::now);
++
++                    let rotated = if offset == 0 {
++                        None
++                    } else {
++                        let key = ctx
++                            .keys
++                            .get(&offset)
++                            .expect("missing fused FFT256 rotation key");
++
++                        let rotated_rlwe =
++                            crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_qp(
++                                input.rlwe(),
++                                key,
++                                ctx.qp_plan,
++                                prepared_qp,
++                            );
++
++                        Some(RnsCkksCiphertext::new(
++                            rotated_rlwe,
++                            input.state().clone(),
++                            ctx.chain,
++                        ))
++                    };
++
++                    let local_rotation_ms = if offset == 0 {
++                        0.0
++                    } else {
++                        rotation_started
++                            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
++                            .unwrap_or(0.0)
++                    };
++
++                    let operand = rotated.as_ref().unwrap_or(input);
++
++                    let multiply_started = profile_enabled.then(std::time::Instant::now);
++
++                    let term = multiply_plain_rns_ckks_with_prepared_ntt(
++                        operand,
++                        prepared_plaintext,
++                        plain_scale,
++                        ctx.chain,
++                        ctx.prepared,
++                    );
++
++                    let local_multiply_ms = multiply_started
++                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
++                        .unwrap_or(0.0);
++
++                    (term, local_rotation_ms, local_multiply_ms, offset != 0)
++                })
++                .collect()
++        });
++
++        // Indexed Rayon collection preserves the original job order.
++        for (term, local_rotation_ms, local_multiply_ms, rotated) in terms {
++            rotation_ms += local_rotation_ms;
++            multiply_ms += local_multiply_ms;
++
++            if rotated {
++                rotation_count += 1;
+             }
++            multiply_count += 1;
+ 
+             let started = profile_enabled.then(std::time::Instant::now);
+             let had_accumulator = accumulator.is_some();
+@@ -258,6 +310,763 @@ fn apply_fused_fft256_sources_with_qp(
+     result
+ }
+ 
++// R30.9A.21A: caller-managed rotation interface.
++//
++// The callback owns rotation-key lookup and key lifetime. The FFT kernel
++// owns only plaintext multiplication, accumulation, and rescaling.
++// This supports persistent or key-major evaluation without copying keys.
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fused_fft256_sources_with_rotation<F>(
++    sources: &[(&RnsCkksCiphertext, &PreparedFusedFft256Source)],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    rotate: &mut F,
++) -> RnsCkksCiphertext
++where
++    F: FnMut(isize, &RnsCkksCiphertext) -> RnsCkksCiphertext,
++{
++    assert!(!sources.is_empty(), "at least one fused source required");
++
++    let expected_level = sources[0].1.level;
++    let expected_scale = sources[0].0.scale();
++    let mut accumulator: Option<RnsCkksCiphertext> = None;
++
++    for &(input, source) in sources {
++        input.assert_matches_chain(chain);
++        assert_eq!(input.level(), expected_level);
++        assert_eq!(source.level, expected_level);
++        assert_eq!(input.scale(), expected_scale);
++        assert_eq!(input.basis().moduli(), prepared.moduli());
++
++        for (offset, plaintext) in &source.operands {
++            let rotated = if *offset == 0 {
++                None
++            } else {
++                let rotated = rotate(*offset, input);
++                rotated.assert_matches_chain(chain);
++                assert_eq!(rotated.level(), expected_level);
++                assert_eq!(rotated.scale(), expected_scale);
++                Some(rotated)
++            };
++
++            let operand = rotated.as_ref().unwrap_or(input);
++            let term = multiply_plain_rns_ckks_with_prepared_ntt(
++                operand,
++                plaintext,
++                source.plain_scale,
++                chain,
++                prepared,
++            );
++
++            accumulator = Some(match accumulator {
++                Some(previous) => evaluator.add(&previous, &term),
++                None => term,
++            });
++        }
++    }
++
++    rescale_rns_ckks_to_next(
++        &accumulator.expect("nonempty fused FFT256 accumulator"),
++        chain,
++    )
++}
++
++// R30.9A.18: sequential fused evaluation with a caller-owned key factory.
++// The factory is invoked once per nonzero term; each key is dropped before
++// the next term. Source/operand order and the single rescale are preserved.
++pub fn apply_fused_fft256_sources_streaming<F>(
++    sources: &[(&RnsCkksCiphertext, &PreparedFusedFft256Source)],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    make_key: &mut F,
++) -> RnsCkksCiphertext
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    assert!(!sources.is_empty(), "at least one fused source required");
++    let expected_level = sources[0].1.level;
++    let expected_scale = sources[0].0.scale();
++    let mut accumulator: Option<RnsCkksCiphertext> = None;
++
++    for &(input, source) in sources {
++        input.assert_matches_chain(chain);
++        assert_eq!(input.level(), expected_level);
++        assert_eq!(source.level, expected_level);
++        assert_eq!(input.scale(), expected_scale);
++        assert_eq!(input.basis().moduli(), prepared.moduli());
++        for (offset, plaintext) in &source.operands {
++            let rotated = if *offset == 0 {
++                None
++            } else {
++                let key = make_key(*offset);
++                let rlwe = crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_qp(
++                    input.rlwe(),
++                    &key,
++                    qp_plan,
++                    prepared_qp,
++                );
++                Some(RnsCkksCiphertext::new(rlwe, input.state().clone(), chain))
++            };
++            let operand = rotated.as_ref().unwrap_or(input);
++            let term = multiply_plain_rns_ckks_with_prepared_ntt(
++                operand,
++                plaintext,
++                source.plain_scale,
++                chain,
++                prepared,
++            );
++            accumulator = Some(match accumulator {
++                Some(previous) => evaluator.add(&previous, &term),
++                None => term,
++            });
++        }
++    }
++    rescale_rns_ckks_to_next(
++        &accumulator.expect("nonempty fused FFT256 accumulator"),
++        chain,
++    )
++}
++
++// R30.9A.21C: stage-0 key-generation schedule.
++//
++// One entry per nonzero operand occurrence, in the exact order
++// consumed by the original streaming evaluator.
++// The schedule is independent of the number of ciphertext batches.
++pub fn fft3840_stage0_key_schedule(
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++) -> Vec<isize> {
++    prepared_sources
++        .iter()
++        .flat_map(|source| source.rotation_offsets())
++        .filter(|&offset| offset != 0)
++        .collect()
++}
++
++// R30.9A.21B: bounded cross-batch stage-0 key reuse.
++//
++// Batches are evaluated in operand order. Each nonzero operand's
++// prepared Galois key is generated once and borrowed across every
++// batch in the window, then released.
++//
++// The caller bounds memory by controlling batches.len().
++#[allow(clippy::too_many_arguments)]
++// R35_9F_2_GROUP_AWARE_KEY_CACHE
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct Fft3840Stage0KeyCacheStats {
++    pub hits: usize,
++    pub misses: usize,
++    pub generations: usize,
++    pub peak_retained_keys: usize,
++}
++
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fft3840_packed_fft256_stage0_batched_streaming_cached<F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    make_key: &mut F,
++    eval_mode: &str,
++    eval_workers: usize,
++    capacity: usize,
++) -> (Vec<[RnsCkksCiphertext; 2]>, Fft3840Stage0KeyCacheStats)
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    use std::collections::BTreeSet;
++
++    assert!(capacity <= 48, "R36.7D supports at most 48 retained keys");
++
++    let group_offsets = |range: std::ops::Range<usize>| -> BTreeSet<isize> {
++        range
++            .flat_map(|branch| prepared_sources[branch].rotation_offsets())
++            .filter(|&offset| offset != 0)
++            .collect()
++    };
++
++    let group0 = group_offsets(0..8);
++    let group1 = group_offsets(8..15);
++
++    let retained_offsets: BTreeSet<isize> = group0
++        .intersection(&group1)
++        .copied()
++        .take(capacity)
++        .collect();
++
++    let mut cache =
++        std::collections::BTreeMap::<isize, crate::ckks::PreparedHybridRnsGaloisKey>::new();
++
++    let mut stats = Fft3840Stage0KeyCacheStats::default();
++
++    let mut provider =
++        |offset: isize, consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)| {
++            // R35_9F_4_RELEASE_AFTER_FINAL_USE
++            if let Some(key) = cache.remove(&offset) {
++                stats.hits += 1;
++                consume(&key);
++                // The second occurrence is the final scheduled use.
++                // Release the key immediately after evaluation.
++                return;
++            }
++
++            stats.misses += 1;
++            stats.generations += 1;
++
++            let key = make_key(offset);
++
++            if retained_offsets.contains(&offset) {
++                assert!(cache.len() < capacity);
++                cache.insert(offset, key);
++                stats.peak_retained_keys = stats.peak_retained_keys.max(cache.len());
++                consume(cache.get(&offset).expect("inserted retained key"));
++            } else {
++                consume(&key);
++            }
++        };
++
++    let outputs = apply_fft3840_packed_fft256_stage0_batched_streaming_with_provider(
++        batches,
++        prepared_sources,
++        evaluator,
++        chain,
++        prepared,
++        qp_plan,
++        prepared_qp,
++        &mut provider,
++        eval_mode,
++        eval_workers,
++    );
++
++    assert!(stats.peak_retained_keys <= capacity);
++
++    (outputs, stats)
++}
++
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fft3840_packed_fft256_stage0_batched_streaming_configured<F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    make_key: &mut F,
++    eval_mode: &str,
++    eval_workers: usize,
++) -> Vec<[RnsCkksCiphertext; 2]>
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    let mut provider =
++        |offset: isize, consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)| {
++            let key = make_key(offset);
++            consume(&key);
++        };
++
++    apply_fft3840_packed_fft256_stage0_batched_streaming_with_provider(
++        batches,
++        prepared_sources,
++        evaluator,
++        chain,
++        prepared,
++        qp_plan,
++        prepared_qp,
++        &mut provider,
++        eval_mode,
++        eval_workers,
++    )
++}
++
++// R36_8C_PERSISTENT_STAGE0_KEY_CACHE
++// Fixed-offset, bounded, cross-window cache. The caller owns this
++// object and must preserve it between stage-0 evaluation windows.
++pub struct Fft3840PersistentStage0KeyCache {
++    retained_offsets: std::collections::BTreeSet<isize>,
++    keys: std::collections::BTreeMap<isize, crate::ckks::PreparedHybridRnsGaloisKey>,
++    pub hits: usize,
++    pub generations: usize,
++    pub peak_keys: usize,
++}
++
++impl Fft3840PersistentStage0KeyCache {
++    pub fn new(prepared_sources: &[PreparedFusedFft256Source; 15], capacity: usize) -> Self {
++        use std::collections::BTreeSet;
++
++        assert!(capacity <= 48, "R36.8C capacity must not exceed 48");
++
++        let offsets = |range: std::ops::Range<usize>| -> BTreeSet<isize> {
++            range
++                .flat_map(|branch| prepared_sources[branch].rotation_offsets())
++                .filter(|&offset| offset != 0)
++                .collect()
++        };
++
++        let group0 = offsets(0..8);
++        let group1 = offsets(8..15);
++
++        let retained_offsets = group0
++            .intersection(&group1)
++            .copied()
++            .take(capacity)
++            .collect();
++
++        Self {
++            retained_offsets,
++            keys: std::collections::BTreeMap::new(),
++            hits: 0,
++            generations: 0,
++            peak_keys: 0,
++        }
++    }
++
++    pub fn with_key<F>(
++        &mut self,
++        offset: isize,
++        make_key: &mut F,
++        consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey),
++    ) where
++        F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++    {
++        if let Some(key) = self.keys.get(&offset) {
++            self.hits += 1;
++            consume(key);
++            return;
++        }
++
++        self.generations += 1;
++        let key = make_key(offset);
++
++        if self.retained_offsets.contains(&offset) {
++            assert!(self.keys.len() < self.retained_offsets.len());
++            assert!(self.keys.insert(offset, key).is_none());
++            self.peak_keys = self.peak_keys.max(self.keys.len());
++            consume(self.keys.get(&offset).expect("retained key must exist"));
++        } else {
++            consume(&key);
++        }
++    }
++
++    // R36_8E_1_EXTERNAL_PREPARED_KEY_API
++    /// Whether a rotation key is already retained by this cache.
++    // R36_8E_2_TEST_RETENTION_POLICY
++    #[cfg(test)]
++    fn for_test_offsets(offsets: &[isize]) -> Self {
++        Self {
++            retained_offsets: offsets.iter().copied().collect(),
++            keys: std::collections::BTreeMap::new(),
++            hits: 0,
++            generations: 0,
++            peak_keys: 0,
++        }
++    }
++
++    pub fn contains(&self, offset: isize) -> bool {
++        self.keys.contains_key(&offset)
++    }
++
++    /// Whether this offset belongs to the fixed retention set.
++    pub fn should_retain(&self, offset: isize) -> bool {
++        self.retained_offsets.contains(&offset)
++    }
++
++    /// Consume a key generated outside the cache, typically by a bounded
++    /// parallel worker batch. A cache hit must not receive a generated key.
++    ///
++    /// This preserves the accounting and retention behavior of `with_key`.
++    pub fn with_prepared_key(
++        &mut self,
++        offset: isize,
++        prepared_key: Option<crate::ckks::PreparedHybridRnsGaloisKey>,
++        consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey),
++    ) {
++        if let Some(key) = self.keys.get(&offset) {
++            assert!(
++                prepared_key.is_none(),
++                "R36.8E: prefetched key supplied for a cache hit"
++            );
++            self.hits += 1;
++            consume(key);
++            return;
++        }
++
++        let key = prepared_key.expect("R36.8E: missing prefetched key for cache miss");
++        self.generations += 1;
++
++        if self.retained_offsets.contains(&offset) {
++            assert!(
++                self.keys.len() < self.retained_offsets.len(),
++                "R36.8E: persistent cache capacity exceeded"
++            );
++            assert!(
++                self.keys.insert(offset, key).is_none(),
++                "R36.8E: duplicate retained key"
++            );
++            self.peak_keys = self.peak_keys.max(self.keys.len());
++            consume(
++                self.keys
++                    .get(&offset)
++                    .expect("R36.8E: retained key must exist"),
++            );
++        } else {
++            consume(&key);
++        }
++    }
++
++    pub fn retained_keys(&self) -> usize {
++        self.keys.len()
++    }
++
++    pub fn capacity(&self) -> usize {
++        self.retained_offsets.len()
++    }
++}
++
++// R36_8G_1A_SHARED_READ_ONLY_KEY_REGISTRY
++/// Prepared rotation keys that can be borrowed concurrently by FFT workers.
++///
++/// Keys are inserted during preparation and then accessed immutably.
++/// The caller controls the number of resident keys.
++#[derive(Debug, Default)]
++pub struct Fft3840SharedKeyRegistry {
++    keys: std::collections::BTreeMap<isize, crate::ckks::PreparedHybridRnsGaloisKey>,
++}
++
++impl Fft3840SharedKeyRegistry {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn insert(&mut self, offset: isize, key: crate::ckks::PreparedHybridRnsGaloisKey) {
++        assert_ne!(offset, 0, "identity rotation does not require a key");
++        assert!(
++            !self.keys.contains_key(&offset),
++            "duplicate prepared rotation key"
++        );
++        self.keys.insert(offset, key);
++    }
++
++    pub fn get(&self, offset: isize) -> &crate::ckks::PreparedHybridRnsGaloisKey {
++        self.keys
++            .get(&offset)
++            .expect("missing shared prepared rotation key")
++    }
++
++    // R36_8G_1B_SHARED_PROVIDER
++    /// Supply a prepared key by immutable reference to an FFT evaluator.
++    pub fn with_key(
++        &self,
++        offset: isize,
++        consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey),
++    ) {
++        consume(self.get(offset));
++    }
++
++    pub fn len(&self) -> usize {
++        self.keys.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.keys.is_empty()
++    }
++}
++
++// R35_9F_1_BORROWED_KEY_PROVIDER
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fft3840_packed_fft256_stage0_batched_streaming_with_provider<F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    with_key: &mut F,
++    eval_mode: &str,
++    eval_workers: usize,
++) -> Vec<[RnsCkksCiphertext; 2]>
++where
++    F: FnMut(isize, &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)),
++{
++    // R36_4F_CONST_GENERIC_SPECIALIZATION
++    apply_fft3840_stage0_batched_with_rotation_mode::<true, F>(
++        batches,
++        prepared_sources,
++        evaluator,
++        chain,
++        prepared,
++        qp_plan,
++        prepared_qp,
++        with_key,
++        eval_mode,
++        eval_workers,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn apply_fft3840_stage0_batched_with_rotation_mode<const CANONICAL: bool, F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    with_key: &mut F,
++    eval_mode: &str,
++    eval_workers: usize,
++) -> Vec<[RnsCkksCiphertext; 2]>
++where
++    F: FnMut(isize, &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)),
++{
++    // R35_8C_EXPLICIT_EVAL_CONFIGURATION
++
++    assert!(
++        eval_mode == "serial" || eval_mode == "parallel",
++        "invalid R35.8 stage-zero evaluation mode"
++    );
++
++    let parallel_evaluation = eval_mode == "parallel";
++
++    assert!(eval_workers >= 1);
++
++    let eval_pool = rayon::ThreadPoolBuilder::new()
++        .num_threads(eval_workers)
++        .build()
++        .expect("stage-zero evaluation thread pool");
++
++    println!("R35_8B_STAGE0_EVAL_MODE={eval_mode}");
++    println!("R35_8B_STAGE0_EVAL_WORKERS={eval_workers}");
++
++    assert!(!batches.is_empty(), "empty FFT3840 batch window");
++
++    for batch in batches {
++        assert!(batch.iter().all(|ct| ct.level() == 3));
++    }
++
++    // Output groups contain branches 0..8 and 8..15.
++    // Preserve the existing source-major, operand-major ordering
++    // independently within each batch accumulator.
++    let mut outputs: Vec<Vec<RnsCkksCiphertext>> =
++        (0..batches.len()).map(|_| Vec::with_capacity(2)).collect();
++
++    for group in 0..2 {
++        let range = if group == 0 { 0..8 } else { 8..15 };
++
++        let mut accumulators: Vec<Option<RnsCkksCiphertext>> =
++            (0..batches.len()).map(|_| None).collect();
++
++        for branch in range {
++            let source = &prepared_sources[branch];
++
++            assert_eq!(source.level, 3);
++            assert_eq!(chain.level(3).moduli(), prepared.moduli());
++
++            for batch in batches {
++                let input = &batch[branch];
++                input.assert_matches_chain(chain);
++                assert_eq!(input.level(), source.level);
++                assert_eq!(input.basis().moduli(), prepared.moduli());
++            }
++
++            // R36_5B2_INDEXED_OPTIONAL_CANONICAL_SOURCE
++            // R36_5B_CONDITIONAL_CANONICAL_PREPARATION
++            // R36_4D_STAGE0_CANONICAL_SOURCE_HOISTING
++            // Reconstruct each input a-polynomial once per source branch.
++            let canonical_sources: Vec<crate::grafting::PreparedCanonicalGaloisSource> =
++                if CANONICAL {
++                    batches
++                        .iter()
++                        .map(|batch| {
++                            let input = &batch[branch];
++                            let original_a = crate::ring::RnsPolynomial::from_residues(
++                                input
++                                    .rlwe()
++                                    .limbs()
++                                    .iter()
++                                    .map(|limb| limb.a().clone())
++                                    .collect(),
++                            );
++                            crate::grafting::PreparedCanonicalGaloisSource::new(&original_a)
++                        })
++                        .collect()
++                } else {
++                    Vec::new()
++                };
++
++            for (offset, plaintext) in &source.operands {
++                // R35_9F_1: Borrow key material for this operand only.
++                // The provider may own a temporary key or retain a cached key.
++                // R35_8A_PARALLEL_STAGE0
++                let mut run_evaluation = |key: Option<&crate::ckks::PreparedHybridRnsGaloisKey>| {
++                    let evaluate_batch = |((accumulator, batch), canonical_source): (
++                        (&mut Option<RnsCkksCiphertext>, &[RnsCkksCiphertext; 15]),
++                        Option<&crate::grafting::PreparedCanonicalGaloisSource>,
++                    )| {
++                        let input = &batch[branch];
++                        let rotated = key.map(|key| {
++                            let rlwe = if CANONICAL {
++                                crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
++                                    input.rlwe(),
++                                    key,
++                                    qp_plan,
++                                    prepared_qp,
++                                    canonical_source.expect(
++                                        "missing canonical source in canonical specialization",
++                                    ),
++                                )
++                            } else {
++                                crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_qp(
++                                    input.rlwe(),
++                                    key,
++                                    qp_plan,
++                                    prepared_qp,
++                                )
++                            };
++                            RnsCkksCiphertext::new(rlwe, input.state().clone(), chain)
++                        });
++                        let operand = rotated.as_ref().unwrap_or(input);
++                        let term = multiply_plain_rns_ckks_with_prepared_ntt(
++                            operand,
++                            plaintext,
++                            source.plain_scale,
++                            chain,
++                            prepared,
++                        );
++                        let previous = accumulator.take();
++                        *accumulator = Some(match previous {
++                            Some(previous) => evaluator.add(&previous, &term),
++                            None => term,
++                        });
++                    };
++
++                    if parallel_evaluation {
++                        eval_pool.install(|| {
++                            accumulators
++                                .par_iter_mut()
++                                .zip(batches.par_iter())
++                                .enumerate()
++                                .map(|(index, pair)| (pair, canonical_sources.get(index)))
++                                .for_each(evaluate_batch);
++                        });
++                    } else {
++                        accumulators
++                            .iter_mut()
++                            .zip(batches.iter())
++                            .enumerate()
++                            .map(|(index, pair)| (pair, canonical_sources.get(index)))
++                            .for_each(evaluate_batch);
++                    }
++                };
++
++                if *offset == 0 {
++                    run_evaluation(None);
++                } else {
++                    with_key(*offset, &mut |key| run_evaluation(Some(key)));
++                }
++            }
++        }
++
++        for (batch_index, accumulator) in accumulators.into_iter().enumerate() {
++            let result = rescale_rns_ckks_to_next(
++                &accumulator.expect("empty FFT3840 batch accumulator"),
++                chain,
++            );
++
++            assert_eq!(result.level(), 4);
++            outputs[batch_index].push(result);
++        }
++    }
++
++    outputs
++        .into_iter()
++        .map(|mut group_outputs| {
++            assert_eq!(group_outputs.len(), 2);
++            let second = group_outputs.pop().expect("missing group 1");
++            let first = group_outputs.pop().expect("missing group 0");
++            [first, second]
++        })
++        .collect()
++}
++
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fft3840_packed_fft256_stage0_batched_streaming<F>(
++    batches: &[[RnsCkksCiphertext; 15]],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    make_key: &mut F,
++) -> Vec<[RnsCkksCiphertext; 2]>
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    let eval_mode =
++        std::env::var("FHE_R35_8_STAGE0_EVAL_MODE").unwrap_or_else(|_| "parallel".to_string());
++    let eval_workers = std::env::var("FHE_R35_8_STAGE0_EVAL_WORKERS")
++        .ok()
++        .map(|v| v.parse::<usize>().expect("invalid stage-zero worker count"))
++        .unwrap_or(4);
++
++    apply_fft3840_packed_fft256_stage0_batched_streaming_configured(
++        batches,
++        prepared_sources,
++        evaluator,
++        chain,
++        prepared,
++        qp_plan,
++        prepared_qp,
++        make_key,
++        &eval_mode,
++        eval_workers,
++    )
++}
++
++/// Streaming first-stage FFT3840 evaluation. Groups are evaluated sequentially
++/// to guarantee at most one hybrid rotation key is resident at a time.
++#[allow(clippy::too_many_arguments)]
++pub fn apply_fft3840_packed_fft256_stage0_streaming<F>(
++    branches: &[RnsCkksCiphertext; 15],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
++    chain: &ModulusChain,
++    prepared: &PreparedRnsNttPlan,
++    qp_plan: &crate::ring::RnsNttPlan,
++    prepared_qp: &PreparedRnsNttPlan,
++    make_key: &mut F,
++) -> [RnsCkksCiphertext; 2]
++where
++    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
++{
++    assert!(branches.iter().all(|ct| ct.level() == 3));
++    std::array::from_fn(|group| {
++        let range = if group == 0 { 0..8 } else { 8..15 };
++        let inputs: Vec<_> = range
++            .map(|i| (&branches[i], &prepared_sources[i]))
++            .collect();
++        let output = apply_fused_fft256_sources_streaming(
++            &inputs,
++            evaluator,
++            chain,
++            prepared,
++            qp_plan,
++            prepared_qp,
++            make_key,
++        );
++        assert_eq!(output.level(), 4);
++        output
++    })
++}
++
+ /// Apply a full-slot diagonal operator to plaintext values.
+ ///
+ /// This is a mathematical reference, not a ciphertext evaluator.
+@@ -319,6 +1128,39 @@ pub fn apply_fft3840_packed_fft256_from_fft15(
+     )
+ }
+ 
++// R30_9A_16A_STAGEWISE_FFT3840
++/// Execute the fused first FFT256 stage for both packed FFT3840 groups.
++///
++/// The caller owns the stage-0 rotation keys and may release them
++/// after this function returns.
++pub fn apply_fft3840_packed_fft256_stage0(
++    branches: &[RnsCkksCiphertext; 15],
++    prepared_sources: &[PreparedFusedFft256Source; 15],
++    ctx: &crate::eblas::prepared_radix4_fft256::StageContext<'_>,
++    prepared_qp: &crate::ring::PreparedRnsNttPlan,
++) -> [RnsCkksCiphertext; 2] {
++    assert!(
++        branches.iter().all(|ciphertext| ciphertext.level() == 3),
++        "packed FFT3840 requires level-3 FFT15 branches"
++    );
++
++    let evaluate_group = |group: usize| {
++        let range = if group == 0 { 0..8 } else { 8..15 };
++        let inputs: Vec<(&RnsCkksCiphertext, &PreparedFusedFft256Source)> = range
++            .map(|branch| (&branches[branch], &prepared_sources[branch]))
++            .collect();
++
++        let output = apply_fused_fft256_sources_with_qp(&inputs, ctx, prepared_qp);
++        assert_eq!(output.level(), 4);
++        output
++    };
++
++    let (output0, output1) = crate::eblas::encrypted_fft3840::fft3840_pool()
++        .install(|| rayon::join(|| evaluate_group(0), || evaluate_group(1)));
++
++    [output0, output1]
++}
++
+ pub fn apply_fft3840_packed_fft256_with_context(
+     branches: &[RnsCkksCiphertext; 15],
+     prepared_sources: &[PreparedFusedFft256Source; 15],
+@@ -337,9 +1179,10 @@ pub fn apply_fft3840_packed_fft256_with_context(
+ 
+     // R28_FFT_STAGE_TIMING: opt-in, non-invasive stage instrumentation.
+     let timing_enabled = std::env::var("FHE_R28_FFT_STAGE_TIMING").is_ok_and(|value| value == "1");
+-    let mut stage_totals_ms = [0.0_f64; 4];
+ 
+-    let outputs = std::array::from_fn(|group| {
++    // R29_5_PARALLEL_FFT3840
++    let evaluate_group = |group: usize| {
++        let mut stage_totals_ms = [0.0_f64; 4];
+         let range = if group == 0 { 0..8 } else { 8..15 };
+ 
+         let inputs: Vec<(&RnsCkksCiphertext, &PreparedFusedFft256Source)> = range
+@@ -377,8 +1220,14 @@ pub fn apply_fft3840_packed_fft256_with_context(
+             assert_eq!(output.level(), stage + 5);
+         }
+ 
+-        output
+-    });
++        (output, stage_totals_ms)
++    };
++
++    let ((output0, timing0), (output1, timing1)) = crate::eblas::encrypted_fft3840::fft3840_pool()
++        .install(|| rayon::join(|| evaluate_group(0), || evaluate_group(1)));
++
++    let outputs = [output0, output1];
++    let stage_totals_ms: [f64; 4] = std::array::from_fn(|stage| timing0[stage] + timing1[stage]);
+ 
+     if timing_enabled {
+         for (stage, elapsed_ms) in stage_totals_ms.iter().enumerate() {
+@@ -397,6 +1246,253 @@ pub fn apply_fft3840_packed_fft256_with_context(
+ mod tests {
+     use super::*;
+ 
++    // R36_4E_EXACT_BATCHED_STAGE0_EQUIVALENCE
++    #[test]
++    fn r36_4e_stage0_canonical_hoisting_matches_legacy_exactly() {
++        use crate::ckks::hybrid_rns_galois_key::PreparedHybridRnsGaloisKey;
++        use crate::ckks::{CkksChainState, RnsCkksEvaluationKeys, RnsCkksEvaluator};
++        use crate::grafting::{BoundedGadgetLayout, RnsRlweCiphertext};
++        use crate::ring::{Modulus, ModulusBasis, Polynomial, RnsNttPlan};
++        use crate::rlwe::ErrorDistribution;
++        use crate::rlwe::RlweCiphertext;
++        use rand::SeedableRng;
++        use rand_chacha::ChaCha20Rng;
++
++        const N: usize = 16;
++
++        let q = ModulusBasis::new(
++            [12_289_u64, 40_961, 65_537, 114_689, 786_433]
++                .into_iter()
++                .map(Modulus::new)
++                .collect(),
++        );
++
++        let p = ModulusBasis::new(vec![Modulus::new(147_457), Modulus::new(163_841)]);
++
++        let chain = ModulusChain::from_top_basis(q);
++
++        assert_eq!(chain.max_level(), 4);
++
++        let level = 3;
++        let active_q = chain.level(level).clone();
++
++        assert_eq!(active_q.moduli().len(), 2);
++
++        let q_plan = RnsNttPlan::new(active_q.moduli().to_vec(), N);
++        let prepared_q = PreparedRnsNttPlan::new(&q_plan);
++
++        let mut qp_moduli = active_q.moduli().to_vec();
++        qp_moduli.extend_from_slice(p.moduli());
++
++        let qp_plan = RnsNttPlan::new(qp_moduli, N);
++        let prepared_qp = PreparedRnsNttPlan::new(&qp_plan);
++
++        let embedding = CkksCanonicalEmbedding::new(N);
++        let slots = embedding.slot_count();
++
++        let plain_scale = chain
++            .dropped_modulus(level)
++            .expect("level 3 must permit rescaling")
++            .value() as f64;
++
++        let make_diagonals = |branch: usize| {
++            let mut diagonals = FusedSourceDiagonals::new();
++
++            diagonals.insert(0, vec![Complex64::new(0.25, 0.0); slots]);
++
++            if branch == 0 || branch == 8 {
++                diagonals.insert(1, vec![Complex64::new(0.125, 0.0); slots]);
++            }
++
++            diagonals
++        };
++
++        let prepared_sources: [PreparedFusedFft256Source; 15] = std::array::from_fn(|branch| {
++            PreparedFusedFft256Source::new(
++                level,
++                &make_diagonals(branch),
++                &embedding,
++                &chain,
++                &prepared_q,
++            )
++        });
++
++        let secret: [i8; N] = [1, 0, -1, 1, 0, -1, 1, 0, -1, 0, 1, 0, 1, -1, 0, 1];
++
++        let make_ciphertext = |batch_index: usize, branch: usize| {
++            let limbs = active_q
++                .moduli()
++                .iter()
++                .copied()
++                .map(|modulus| {
++                    let b = Polynomial::new(
++                        modulus,
++                        (0..N)
++                            .map(|i| {
++                                (11 + 17 * i as u64 + 29 * branch as u64 + 37 * batch_index as u64)
++                                    % modulus.value()
++                            })
++                            .collect(),
++                    );
++
++                    let a = Polynomial::new(
++                        modulus,
++                        (0..N)
++                            .map(|i| {
++                                (7 + 23 * i as u64 + 31 * branch as u64 + 41 * batch_index as u64)
++                                    % modulus.value()
++                            })
++                            .collect(),
++                    );
++
++                    RlweCiphertext::new(b, a)
++                })
++                .collect();
++
++            let rlwe = RnsRlweCiphertext::from_limbs(limbs);
++
++            RnsCkksCiphertext::new(
++                rlwe,
++                CkksChainState::new(&chain, level, plain_scale),
++                &chain,
++            )
++        };
++
++        let batches: Vec<[RnsCkksCiphertext; 15]> = (0..2)
++            .map(|batch_index| std::array::from_fn(|branch| make_ciphertext(batch_index, branch)))
++            .collect();
++
++        let exponent = crate::ckks::rotation_exponent_left(N, 1);
++
++        let mut key_rng = ChaCha20Rng::seed_from_u64(0x364e_2026);
++
++        let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++            BoundedGadgetLayout::new(active_q.clone(), 8),
++            p,
++            &secret,
++            exponent,
++            ErrorDistribution::BoundedUniform { bound: 0 },
++            2,
++            &qp_plan,
++            &mut key_rng,
++        );
++
++        let evaluation_keys = RnsCkksEvaluationKeys::new();
++        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
++
++        for (batch_count, mode, workers) in [
++            (1_usize, "serial", 1_usize),
++            (1, "parallel", 2),
++            (2, "parallel", 2),
++        ] {
++            let run = |use_canonical: bool| {
++                let mut provider =
++                    |offset: isize, consume: &mut dyn FnMut(&PreparedHybridRnsGaloisKey)| {
++                        assert_eq!(offset, 1);
++                        consume(&key);
++                    };
++
++                if use_canonical {
++                    apply_fft3840_stage0_batched_with_rotation_mode::<true, _>(
++                        &batches[..batch_count],
++                        &prepared_sources,
++                        &evaluator,
++                        &chain,
++                        &prepared_q,
++                        &qp_plan,
++                        &prepared_qp,
++                        &mut provider,
++                        mode,
++                        workers,
++                    )
++                } else {
++                    apply_fft3840_stage0_batched_with_rotation_mode::<false, _>(
++                        &batches[..batch_count],
++                        &prepared_sources,
++                        &evaluator,
++                        &chain,
++                        &prepared_q,
++                        &qp_plan,
++                        &prepared_qp,
++                        &mut provider,
++                        mode,
++                        workers,
++                    )
++                }
++            };
++
++            let legacy = run(false);
++            let canonical = run(true);
++
++            // R36_5C1_CONTROLLED_STAGE0_BENCHMARK
++            if std::env::var("FHE_R36_5C_BENCH").as_deref() == Ok("1") {
++                let warmups = 2usize;
++                let repeats = 7usize;
++
++                for use_canonical in [false, true] {
++                    let implementation = if use_canonical { "canonical" } else { "legacy" };
++
++                    for _ in 0..warmups {
++                        let _ = run(use_canonical);
++                    }
++
++                    let mut measurements = Vec::with_capacity(repeats);
++
++                    for _ in 0..repeats {
++                        let started = std::time::Instant::now();
++                        let result = run(use_canonical);
++                        let seconds = started.elapsed().as_secs_f64();
++
++                        assert_eq!(result.len(), batch_count);
++                        measurements.push(seconds);
++                    }
++
++                    measurements.sort_by(f64::total_cmp);
++
++                    println!(
++                        "R36_5C_BENCH implementation={} batches={} mode={} workers={} warmups={} repeats={} median_seconds={:.9} min_seconds={:.9} max_seconds={:.9}",
++                        implementation,
++                        batch_count,
++                        mode,
++                        workers,
++                        warmups,
++                        repeats,
++                        measurements[repeats / 2],
++                        measurements[0],
++                        measurements[repeats - 1],
++                    );
++                }
++            }
++
++            assert_eq!(legacy.len(), canonical.len());
++
++            for (batch_index, (reference, optimized)) in
++                legacy.iter().zip(canonical.iter()).enumerate()
++            {
++                for group in 0..2 {
++                    assert_eq!(
++                        reference[group].rlwe(),
++                        optimized[group].rlwe(),
++                        "R36.4E exact RLWE mismatch: \
++                         batches={batch_count} mode={mode} \
++                         batch={batch_index} group={group}"
++                    );
++
++                    assert_eq!(reference[group].state(), optimized[group].state());
++
++                    assert_eq!(reference[group].level(), 4);
++                }
++            }
++
++            println!(
++                "R36_4E_CASE=PASS batches={batch_count} \
++                 mode={mode} workers={workers}"
++            );
++        }
++
++        println!("R36_4E_EXACT_STAGE0_EQUIVALENCE_STATUS=PASS");
++    }
++
+     #[test]
+     fn fused_source_lane_ignores_unselected_source_slots() {
+         let slots = 32;
+@@ -453,3 +1549,47 @@ mod tests {
+         }
+     }
+ }
++
++// R36_8E_2_CACHE_POLICY_TESTS
++#[cfg(test)]
++mod r36_8e_2_cache_tests {
++    use super::Fft3840PersistentStage0KeyCache;
++
++    #[test]
++    fn retained_offsets_are_selected_without_keys() {
++        let cache = Fft3840PersistentStage0KeyCache::for_test_offsets(&[3, 7, 11, 13]);
++
++        for offset in [3, 7, 11, 13] {
++            assert!(cache.should_retain(offset));
++            assert!(!cache.contains(offset));
++        }
++
++        for offset in [1, 5, 9, 15] {
++            assert!(!cache.should_retain(offset));
++            assert!(!cache.contains(offset));
++        }
++
++        assert_eq!(cache.capacity(), 4);
++        assert_eq!(cache.retained_keys(), 0);
++    }
++
++    #[test]
++    fn initial_accounting_is_zero() {
++        let cache = Fft3840PersistentStage0KeyCache::for_test_offsets(&[2, 4]);
++
++        assert_eq!(cache.hits, 0);
++        assert_eq!(cache.generations, 0);
++        assert_eq!(cache.peak_keys, 0);
++        assert_eq!(cache.retained_keys(), 0);
++    }
++
++    #[test]
++    fn duplicate_retention_offsets_do_not_increase_capacity() {
++        let cache = Fft3840PersistentStage0KeyCache::for_test_offsets(&[3, 3, 7, 7]);
++
++        assert_eq!(cache.capacity(), 2);
++        assert!(cache.should_retain(3));
++        assert!(cache.should_retain(7));
++        assert!(!cache.should_retain(5));
++    }
++}
+diff --git a/src/eblas/mod.rs b/src/eblas/mod.rs
+index 70b5de1..31f2f1a 100644
+--- a/src/eblas/mod.rs
++++ b/src/eblas/mod.rs
+@@ -12,8 +12,11 @@
+ 
+ pub mod backend_policy;
+ pub mod correlation;
++pub mod encrypted_fft2160;
+ pub mod encrypted_fft3840;
++pub mod encrypted_uhd_fft2;
+ pub mod fft;
++pub mod fft3840_key_policy;
+ pub mod fused_fft256_handoff;
+ pub mod mixed_radix_ckks;
+ pub mod mixed_radix_fft;
+diff --git a/src/grafting/bounded_gadget.rs b/src/grafting/bounded_gadget.rs
+index d26061a..58cde0a 100644
+--- a/src/grafting/bounded_gadget.rs
++++ b/src/grafting/bounded_gadget.rs
+@@ -63,12 +63,22 @@ impl BoundedGadgetLayout {
+             "polynomial basis must match bounded gadget layout"
+         );
+ 
++        let canonical = reconstruct_coefficients_big(polynomial);
++        self.decompose_canonical(&canonical)
++    }
++
++    // R36_4A_CANONICAL_DECOMPOSITION
++    /// Decompose canonical coefficients in [0, Q), without repeating CRT.
++    ///
++    /// This preserves the centered balanced-digit convention used by
++    /// the original RNS decomposition.
++    pub fn decompose_canonical(&self, canonical: &[BigUint]) -> BoundedGadgetDecomposition {
+         let modulus = composite_modulus_big(&self.full_basis);
+         let base = BigInt::from(self.base);
+         let half_base = BigInt::from(self.base / 2);
+ 
+-        let canonical = reconstruct_coefficients_big(polynomial);
+         let degree = canonical.len();
++        assert!(degree > 0, "canonical decomposition requires coefficients");
+         let mut digits = vec![vec![0_i128; degree]; self.digit_count];
+ 
+         for (coefficient_index, coefficient) in canonical.iter().enumerate() {
+@@ -108,6 +118,86 @@ impl BoundedGadgetLayout {
+     }
+ }
+ 
++// R36_4B_PREPARED_CANONICAL_SOURCE
++/// Reusable canonical representation of an RNS polynomial.
++///
++/// The expensive CRT reconstruction is performed once. Subsequent
++/// automorphisms operate on canonical coefficients modulo Q.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PreparedCanonicalGaloisSource {
++    basis: ModulusBasis,
++    canonical: Vec<BigUint>,
++    modulus: BigUint,
++}
++
++impl PreparedCanonicalGaloisSource {
++    pub fn new(polynomial: &RnsPolynomial) -> Self {
++        let basis = polynomial.basis().clone();
++        let modulus = composite_modulus_big(&basis);
++        let canonical = reconstruct_coefficients_big(polynomial);
++
++        Self {
++            basis,
++            canonical,
++            modulus,
++        }
++    }
++
++    pub fn basis(&self) -> &ModulusBasis {
++        &self.basis
++    }
++
++    pub fn degree(&self) -> usize {
++        self.canonical.len()
++    }
++
++    pub fn automorphism_canonical(&self, exponent: usize) -> Vec<BigUint> {
++        let degree = self.degree();
++
++        assert!(
++            degree >= 2 && degree.is_power_of_two(),
++            "canonical Galois source requires power-of-two degree >= 2"
++        );
++
++        let two_n = 2 * degree;
++        let exponent = exponent % two_n;
++
++        assert!(
++            exponent % 2 == 1,
++            "canonical Galois exponent must be odd modulo 2N"
++        );
++
++        let mut output = vec![BigUint::zero(); degree];
++
++        for (source_index, coefficient) in self.canonical.iter().enumerate() {
++            let mapped = (source_index * exponent) % two_n;
++            let target = mapped % degree;
++
++            output[target] = if mapped < degree || coefficient.is_zero() {
++                coefficient.clone()
++            } else {
++                &self.modulus - coefficient
++            };
++        }
++
++        output
++    }
++
++    pub fn decompose_automorphism(
++        &self,
++        layout: &BoundedGadgetLayout,
++        exponent: usize,
++    ) -> BoundedGadgetDecomposition {
++        assert_eq!(
++            layout.full_basis(),
++            &self.basis,
++            "prepared canonical source basis mismatch"
++        );
++
++        layout.decompose_canonical(&self.automorphism_canonical(exponent))
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct BoundedGadgetDecomposition {
+     layout: BoundedGadgetLayout,
+@@ -240,6 +330,95 @@ mod tests {
+         ])
+     }
+ 
++    #[test]
++    fn r36_4b_prepared_source_matches_rotated_rns_digits_exactly() {
++        use crate::ckks::apply_automorphism;
++
++        let basis = basis();
++        let layout = BoundedGadgetLayout::new(basis.clone(), 8);
++
++        let coefficients = vec![0_u128, 1, 2, 127, 128, 255, 65_535, 1_000_000];
++
++        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
++
++        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
++
++        assert_eq!(prepared.basis(), &basis);
++        assert_eq!(prepared.degree(), polynomial.degree());
++
++        for exponent in (1..16).step_by(2) {
++            let rotated_residues = polynomial
++                .residues()
++                .iter()
++                .map(|residue| apply_automorphism(residue, exponent))
++                .collect();
++
++            let rotated = RnsPolynomial::from_residues(rotated_residues);
++
++            assert_eq!(
++                prepared.decompose_automorphism(&layout, exponent),
++                layout.decompose(&rotated),
++                "R36.4B exact digit mismatch at exponent {exponent}",
++            );
++        }
++
++        println!("R36_4B_EXACT_DIGIT_EQUIVALENCE=PASS");
++    }
++
++    #[test]
++    fn r36_4a_canonical_decomposition_matches_rns_exactly() {
++        use crate::ckks::apply_automorphism;
++        use crate::ring::reconstruct_coefficients_big;
++
++        let basis = basis();
++        let layout = BoundedGadgetLayout::new(basis.clone(), 8);
++        let degree = 8;
++
++        let coefficients = vec![0_u128, 1, 2, 127, 128, 255, 65_535, 1_000_000];
++
++        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
++
++        let canonical = reconstruct_coefficients_big(&polynomial);
++        assert_eq!(
++            layout.decompose(&polynomial),
++            layout.decompose_canonical(&canonical),
++        );
++
++        let modulus = composite_modulus_big(&basis);
++        let two_n = 2 * degree;
++
++        for exponent in (1..two_n).step_by(2) {
++            let mut rotated = vec![BigUint::zero(); degree];
++
++            for (index, coefficient) in canonical.iter().enumerate() {
++                let mapped = (index * exponent) % two_n;
++                let target = mapped % degree;
++
++                rotated[target] = if mapped < degree || coefficient.is_zero() {
++                    coefficient.clone()
++                } else {
++                    &modulus - coefficient
++                };
++            }
++
++            let rotated_residues = polynomial
++                .residues()
++                .iter()
++                .map(|residue| apply_automorphism(residue, exponent))
++                .collect();
++
++            let rotated_rns = RnsPolynomial::from_residues(rotated_residues);
++
++            assert_eq!(
++                layout.decompose(&rotated_rns),
++                layout.decompose_canonical(&rotated),
++                "R36.4A exact digit mismatch at exponent {exponent}",
++            );
++        }
++
++        println!("R36_4A_EXACT_DIGIT_EQUIVALENCE=PASS");
++    }
++
+     #[test]
+     fn layout_reports_expected_power_of_two_base() {
+         let layout = BoundedGadgetLayout::new(basis(), 8);
+@@ -432,3 +611,218 @@ mod wide_modulus_tests {
+         }
+     }
+ }
++
++// R36_5C3_PRODUCTION_DECOMPOSITION_BENCHMARK
++#[cfg(test)]
++mod r36_5c3_benchmark {
++    use super::*;
++    use crate::ckks::research_profile_65536_for_levels;
++    use crate::ring::{ModulusChain, Polynomial};
++    use std::time::Instant;
++
++    #[test]
++    #[ignore = "production-scale performance characterization"]
++    fn r36_5c3_production_canonical_decomposition_benchmark() {
++        let degree = 65_536usize;
++        let profile = research_profile_65536_for_levels(13, 3);
++
++        assert_eq!(profile.degree(), degree);
++
++        let chain = ModulusChain::from_top_basis(profile.modulus_chain().top().clone());
++
++        assert_eq!(chain.top().moduli().len(), 16);
++
++        let q = chain.level(3).clone();
++        assert_eq!(q.moduli().len(), 13);
++
++        let layout = BoundedGadgetLayout::new(q.clone(), 32);
++
++        let polynomial = RnsPolynomial::from_residues(
++            q.moduli()
++                .iter()
++                .map(|&modulus| {
++                    Polynomial::new(
++                        modulus,
++                        (0..degree)
++                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
++                            .collect(),
++                    )
++                })
++                .collect(),
++        );
++
++        let exponents: Vec<usize> = (0..32).map(|i| 2 * i + 3).collect();
++
++        let started = Instant::now();
++        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
++        let preparation_seconds = started.elapsed().as_secs_f64();
++
++        let mut legacy_total = 0.0f64;
++        let mut canonical_total = 0.0f64;
++
++        for (index, &exponent) in exponents.iter().enumerate() {
++            let transformed = RnsPolynomial::from_residues(
++                polynomial
++                    .residues()
++                    .iter()
++                    .map(|residue| {
++                        let modulus = residue.modulus();
++                        let mut output = vec![0_u64; degree];
++
++                        for (i, &value) in residue.coefficients().iter().enumerate() {
++                            let mapped = (i * exponent) % (2 * degree);
++                            let target = mapped % degree;
++
++                            output[target] = if mapped < degree || value == 0 {
++                                value
++                            } else {
++                                modulus.value() - value
++                            };
++                        }
++
++                        Polynomial::new(modulus, output)
++                    })
++                    .collect(),
++            );
++
++            let started = Instant::now();
++            let legacy = layout.decompose(&transformed);
++            legacy_total += started.elapsed().as_secs_f64();
++
++            let started = Instant::now();
++            let canonical = prepared.decompose_automorphism(&layout, exponent);
++            canonical_total += started.elapsed().as_secs_f64();
++
++            assert_eq!(legacy, canonical, "R36.5C.3 mismatch exponent={exponent}");
++
++            let rotations = index + 1;
++
++            if [1, 2, 4, 8, 16, 32].contains(&rotations) {
++                let amortized = preparation_seconds + canonical_total;
++
++                println!(
++                    "R36_5C3_RESULT degree={} q_limbs={} base_log=32 rotations={} preparation_seconds={:.6} legacy_seconds={:.6} canonical_seconds={:.6} amortized_canonical_seconds={:.6} speedup={:.6}",
++                    degree,
++                    q.moduli().len(),
++                    rotations,
++                    preparation_seconds,
++                    legacy_total,
++                    canonical_total,
++                    amortized,
++                    legacy_total / amortized,
++                );
++            }
++        }
++
++        println!("R36_5C3_EXACT_DECOMPOSITION_STATUS=PASS");
++    }
++}
++
++// R36_5C2_CANONICAL_DECOMPOSITION_BENCHMARK
++#[cfg(test)]
++mod r36_5c2_benchmark {
++    use super::*;
++    use crate::ring::{Modulus, Polynomial};
++    use std::time::Instant;
++
++    #[test]
++    #[ignore = "opt-in performance characterization"]
++    fn r36_5c2_canonical_decomposition_benchmark() {
++        let degree: usize = std::env::var("FHE_R36_5C2_DEGREE")
++            .ok()
++            .map(|value| value.parse().expect("invalid degree"))
++            .unwrap_or(1024);
++
++        assert!(degree >= 16 && degree.is_power_of_two());
++
++        let q = ModulusBasis::new(
++            [12_289_u64, 40_961, 65_537]
++                .into_iter()
++                .map(Modulus::new)
++                .collect(),
++        );
++
++        let polynomial = RnsPolynomial::from_residues(
++            q.moduli()
++                .iter()
++                .map(|&modulus| {
++                    Polynomial::new(
++                        modulus,
++                        (0..degree)
++                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
++                            .collect(),
++                    )
++                })
++                .collect(),
++        );
++
++        let layout = BoundedGadgetLayout::new(q, 32);
++
++        let started = Instant::now();
++        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
++        let preparation_seconds = started.elapsed().as_secs_f64();
++
++        let exponents = [3_usize, 5, 7, 11, 15, 19, 23, 27];
++
++        for count in [1_usize, 2, 4, 8] {
++            let mut legacy_seconds = 0.0;
++            let mut canonical_seconds = 0.0;
++
++            for &exponent in exponents.iter().take(count) {
++                let transformed = RnsPolynomial::from_residues(
++                    polynomial
++                        .residues()
++                        .iter()
++                        .map(|residue| {
++                            let modulus = residue.modulus();
++                            let coefficients = residue.coefficients();
++                            let mut output = vec![0_u64; degree];
++
++                            for (i, &value) in coefficients.iter().enumerate() {
++                                let mapped = (i * exponent) % (2 * degree);
++                                let target = mapped % degree;
++
++                                output[target] = if mapped < degree || value == 0 {
++                                    value
++                                } else {
++                                    modulus.value() - value
++                                };
++                            }
++
++                            Polynomial::new(modulus, output)
++                        })
++                        .collect(),
++                );
++
++                let started = Instant::now();
++                let legacy = layout.decompose(&transformed);
++                legacy_seconds += started.elapsed().as_secs_f64();
++
++                let started = Instant::now();
++                let canonical = prepared.decompose_automorphism(&layout, exponent);
++                canonical_seconds += started.elapsed().as_secs_f64();
++
++                assert_eq!(
++                    legacy, canonical,
++                    "R36.5C.2 gadget mismatch exponent={exponent}"
++                );
++            }
++
++            let amortized_canonical_seconds = preparation_seconds + canonical_seconds;
++
++            println!(
++                "R36_5C2_RESULT degree={} q_limbs={} rotations={} preparation_seconds={:.9} legacy_seconds={:.9} canonical_seconds={:.9} amortized_canonical_seconds={:.9} speedup={:.6}",
++                degree,
++                layout.full_basis().moduli().len(),
++                count,
++                preparation_seconds,
++                legacy_seconds,
++                canonical_seconds,
++                amortized_canonical_seconds,
++                legacy_seconds / amortized_canonical_seconds,
++            );
++        }
++
++        println!("R36_5C2_EXACT_DECOMPOSITION_STATUS=PASS");
++    }
++}
+diff --git a/src/grafting/mod.rs b/src/grafting/mod.rs
+index 5f035ec..f5c1d5d 100644
+--- a/src/grafting/mod.rs
++++ b/src/grafting/mod.rs
+@@ -46,7 +46,9 @@ pub use rns_key_switch::{
+ pub mod rns_key_switch;
+ pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};
+ pub mod rns_gadget;
+-pub use bounded_gadget::{BoundedGadgetDecomposition, BoundedGadgetLayout};
++pub use bounded_gadget::{
++    BoundedGadgetDecomposition, BoundedGadgetLayout, PreparedCanonicalGaloisSource,
++};
+ pub mod bounded_gadget;
+ pub use bounded_key_switch::{
+     bounded_rns_relinearize_with_ntt, bounded_rns_relinearize_with_ntt_observed,
+diff --git a/src/ring/modulus.rs b/src/ring/modulus.rs
+index cf7a9a7..8e16c39 100644
+--- a/src/ring/modulus.rs
++++ b/src/ring/modulus.rs
+@@ -261,6 +261,136 @@ mod tests {
+         println!("MODULUS_CANONICAL_MUL_EQUIVALENCE=PASS");
+     }
+ 
++    // R36_5F1_PRODUCTION_MODULUS_EQUIVALENCE
++
++    // R36_5F5_COMPLETE_QP_MODULUS_EQUIVALENCE
++    #[test]
++    fn r36_5f5_complete_qp_modulus_equivalence() {
++        use crate::ckks::research_profile_65536_for_levels;
++
++        let profile = research_profile_65536_for_levels(13, 3);
++        let extended = research_profile_65536_for_levels(15, 3);
++
++        let top = profile.modulus_chain().top().clone();
++        let extended_moduli = extended.modulus_chain().top().moduli().to_vec();
++
++        assert_eq!(top.moduli().len(), 16);
++        assert_eq!(extended_moduli.len(), 18);
++        assert_eq!(&extended_moduli[..16], top.moduli());
++
++        // The rotation fixture uses level 3: Q13 + P2.
++        let q = &top.moduli()[..13];
++        let p = &extended_moduli[16..18];
++
++        let mut qp = q.to_vec();
++        qp.extend_from_slice(p);
++
++        assert_eq!(qp.len(), 15);
++
++        for modulus in qp {
++            let prepared = PreparedModulus::new(modulus);
++            let prime = modulus.value();
++
++            let edges = [
++                0,
++                1,
++                2,
++                prime / 3,
++                prime / 2,
++                prime - 3,
++                prime - 2,
++                prime - 1,
++            ];
++
++            for &a in &edges {
++                for &b in &edges {
++                    assert_eq!(
++                        prepared.mul_canonical(a, b),
++                        modulus.mul(a, b),
++                        "QP edge mismatch q={prime} a={a} b={b}"
++                    );
++                }
++            }
++
++            let mut state = 0x365f_5000_1234_5678_u64 ^ prime;
++
++            for _ in 0..50_000 {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                let a = state % prime;
++
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                let b = state % prime;
++
++                assert_eq!(
++                    prepared.mul_canonical(a, b),
++                    modulus.mul(a, b),
++                    "QP random mismatch q={prime} a={a} b={b}"
++                );
++            }
++
++            println!("R36_5F5_QP_MODULUS={} status=PASS", prime);
++        }
++
++        println!("R36_5F5_QP_MODULUS_COUNT=15");
++        println!("R36_5F5_QP_ARITHMETIC_STATUS=PASS");
++    }
++
++    #[test]
++    fn r36_5f1_prepared_modulus_production_range_equivalence() {
++        let profile = crate::ckks::research_profile_65536_for_levels(13, 3);
++
++        let mut moduli: Vec<u64> = profile.modulus_values().to_vec();
++
++        // Include representative auxiliary-prime and boundary cases.
++        moduli.extend([268_238_849, 68_712_923_137]);
++
++        moduli.sort_unstable();
++        moduli.dedup();
++
++        for q in moduli {
++            let modulus = Modulus::new(q);
++            let prepared = PreparedModulus::new(modulus);
++
++            let edges = [0, 1, 2, q / 4, q / 2, q - 3, q - 2, q - 1];
++
++            for &a in &edges {
++                for &b in &edges {
++                    assert_eq!(
++                        prepared.mul_canonical(a, b),
++                        modulus.mul(a, b),
++                        "edge mismatch q={q} a={a} b={b}"
++                    );
++                }
++            }
++
++            let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ q;
++
++            for _ in 0..20_000 {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                let a = state % q;
++
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                let b = state % q;
++
++                assert_eq!(
++                    prepared.mul_canonical(a, b),
++                    modulus.mul(a, b),
++                    "random mismatch q={q} a={a} b={b}"
++                );
++            }
++        }
++
++        println!("R36_5F1_PREPARED_MODULUS_EQUIVALENCE=PASS");
++    }
++
+     #[test]
+     fn prepared_modulus_multiplication_matches_general_multiplication() {
+         let moduli = [Modulus::new(268_238_849), Modulus::new(68_712_923_137)];
+diff --git a/src/ring/prepared_ntt.rs b/src/ring/prepared_ntt.rs
+index 4e8f5a9..99800dc 100644
+--- a/src/ring/prepared_ntt.rs
++++ b/src/ring/prepared_ntt.rs
+@@ -61,6 +61,52 @@ impl PreparedNttPlan {
+         self.degree
+     }
+ 
++    // R36_5E2_OWNED_FORWARD
++    /// Applies the prepared forward NTT to an owned vector of
++    /// canonical coefficient residues, avoiding an intermediate copy.
++    // R36_5F3_PREPARED_FORWARD_OWNED
++    /// Experimental owned-vector forward NTT with prepared butterfly arithmetic.
++    pub fn forward_owned_prepared_mul(&self, mut values: Vec<u64>) -> Vec<u64> {
++        assert_eq!(
++            values.len(),
++            self.degree,
++            "coefficient count must match prepared NTT degree"
++        );
++        assert!(
++            values.iter().all(|&value| value < self.modulus.value()),
++            "forward_owned_prepared_mul requires canonical residues"
++        );
++
++        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
++            *value = self.prepared_modulus.mul_canonical(*value, twist);
++        }
++
++        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
++
++        values
++    }
++
++    pub fn forward_owned(&self, mut values: Vec<u64>) -> Vec<u64> {
++        assert_eq!(
++            values.len(),
++            self.degree,
++            "coefficient count must match prepared NTT degree"
++        );
++        assert!(
++            values.iter().all(|&value| value < self.modulus.value()),
++            "forward_owned requires canonical residues"
++        );
++
++        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
++            *value = self.prepared_modulus.mul_canonical(*value, twist);
++        }
++
++        // R36_5F5_PRODUCTION_FORWARD_PROMOTION
++        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
++
++        values
++    }
++
+     pub fn forward(&self, polynomial: &Polynomial) -> Vec<u64> {
+         assert_eq!(
+             polynomial.modulus(),
+@@ -167,6 +213,40 @@ impl PreparedNttPlan {
+         batch
+     }
+ 
++    // R36_5G1_PREPARED_INVERSE
++    /// Experimental inverse NTT using prepared modular multiplication.
++    ///
++    /// The standard inverse() remains the reference implementation.
++    pub fn inverse_prepared_mul(&self, values: &[u64]) -> Polynomial {
++        assert_eq!(
++            values.len(),
++            self.degree,
++            "NTT value count must match prepared NTT degree"
++        );
++        assert!(
++            values.iter().all(|&value| value < self.modulus.value()),
++            "inverse_prepared_mul requires canonical residues"
++        );
++
++        let mut coefficients = values.to_vec();
++
++        cyclic_ntt_prepared_mul(
++            &mut coefficients,
++            self.modulus,
++            &self.inverse_stage_twiddles,
++        );
++
++        for (coefficient, &untwist) in coefficients.iter_mut().zip(&self.inverse_twists) {
++            *coefficient = self
++                .prepared_modulus
++                .mul_canonical(*coefficient, self.degree_inverse);
++
++            *coefficient = self.prepared_modulus.mul_canonical(*coefficient, untwist);
++        }
++
++        Polynomial::new(self.modulus, coefficients)
++    }
++
+     pub fn inverse(&self, values: &[u64]) -> Polynomial {
+         assert_eq!(
+             values.len(),
+@@ -267,6 +347,48 @@ fn cyclic_ntt_prepared(values: &mut [u64], modulus: Modulus, stage_twiddles: &[V
+     }
+ }
+ 
++// R36_5F2_PREPARED_BUTTERFLY
++fn cyclic_ntt_prepared_mul(values: &mut [u64], modulus: Modulus, stage_twiddles: &[Vec<u64>]) {
++    assert!(
++        !values.is_empty() && values.len().is_power_of_two(),
++        "radix-2 NTT length must be a positive power of two"
++    );
++
++    assert_eq!(
++        stage_twiddles.len(),
++        values.len().trailing_zeros() as usize,
++        "prepared NTT stage count must match transform degree"
++    );
++
++    let prepared_modulus = PreparedModulus::new(modulus);
++
++    bit_reverse_permute(values);
++
++    let mut len = 2_usize;
++
++    for twiddles in stage_twiddles {
++        let half = len / 2;
++
++        assert_eq!(
++            twiddles.len(),
++            half,
++            "prepared NTT twiddle count must match stage width"
++        );
++
++        for start in (0..values.len()).step_by(len) {
++            for (offset, &twiddle) in twiddles.iter().enumerate() {
++                let even = values[start + offset];
++                let odd = prepared_modulus.mul_canonical(values[start + offset + half], twiddle);
++
++                values[start + offset] = modulus.add_canonical(even, odd);
++                values[start + offset + half] = modulus.sub_canonical(even, odd);
++            }
++        }
++
++        len *= 2;
++    }
++}
++
+ fn bit_reverse_permute(values: &mut [u64]) {
+     let n = values.len();
+     let mut j = 0_usize;
+@@ -291,6 +413,137 @@ fn bit_reverse_permute(values: &mut [u64]) {
+ mod tests {
+     use super::*;
+ 
++    // R36_5F2_BUTTERFLY_EQUIVALENCE
++    #[test]
++    fn r36_5f2_prepared_butterfly_equivalence() {
++        for (degree, q) in [
++            (16_usize, 268_238_849_u64),
++            (256, 268_238_849),
++            (8192, 68_712_923_137),
++            (65536, 68_712_923_137),
++        ] {
++            let modulus = Modulus::new(q);
++            let plan = crate::ring::make_ntt_plan(modulus, degree);
++            let prepared = PreparedNttPlan::new(&plan);
++
++            let original: Vec<u64> = (0..degree)
++                .map(|index| {
++                    let x = index as u64;
++                    (x.wrapping_mul(37).wrapping_add(19)) % q
++                })
++                .collect();
++
++            let mut reference = original.clone();
++            let mut candidate = original;
++
++            cyclic_ntt_prepared(&mut reference, modulus, &prepared.forward_stage_twiddles);
++
++            cyclic_ntt_prepared_mul(&mut candidate, modulus, &prepared.forward_stage_twiddles);
++
++            assert_eq!(
++                reference, candidate,
++                "R36.5F.2 mismatch degree={degree} modulus={q}"
++            );
++
++            println!(
++                "R36_5F2_EQUIVALENCE degree={} modulus={} status=PASS",
++                degree, q
++            );
++        }
++    }
++
++    #[test]
++    #[ignore]
++    fn r36_5f2_prepared_butterfly_ab_benchmark() {
++        use std::time::Instant;
++
++        let degree = 65536_usize;
++        let modulus = Modulus::new(68_712_923_137);
++        let plan = crate::ring::make_ntt_plan(modulus, degree);
++        let prepared = PreparedNttPlan::new(&plan);
++
++        let input: Vec<u64> = (0..degree)
++            .map(|index| {
++                let x = index as u64;
++                (x.wrapping_mul(37).wrapping_add(19)) % modulus.value()
++            })
++            .collect();
++
++        let mut reference_samples = Vec::new();
++        let mut candidate_samples = Vec::new();
++
++        for iteration in 0..9 {
++            let mut reference = input.clone();
++            let mut candidate = input.clone();
++
++            let started = Instant::now();
++            cyclic_ntt_prepared(&mut reference, modulus, &prepared.forward_stage_twiddles);
++            let reference_ms = started.elapsed().as_secs_f64() * 1000.0;
++
++            let started = Instant::now();
++            cyclic_ntt_prepared_mul(&mut candidate, modulus, &prepared.forward_stage_twiddles);
++            let candidate_ms = started.elapsed().as_secs_f64() * 1000.0;
++
++            assert_eq!(reference, candidate);
++
++            println!(
++                "R36_5F2_ITERATION={} warmup={} reference_ms={:.6} candidate_ms={:.6}",
++                iteration,
++                iteration == 0,
++                reference_ms,
++                candidate_ms
++            );
++
++            if iteration != 0 {
++                reference_samples.push(reference_ms);
++                candidate_samples.push(candidate_ms);
++            }
++        }
++
++        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
++
++        println!(
++            "R36_5F2_BUTTERFLY_SPEEDUP={:.6}",
++            mean(&reference_samples) / mean(&candidate_samples)
++        );
++        println!("R36_5F2_EXACT_EQUIVALENCE=PASS");
++    }
++
++    // R36_5F3_COMPLETE_FORWARD_EQUIVALENCE
++    #[test]
++    fn r36_5f3_prepared_forward_exact_equivalence() {
++        for (degree, q) in [
++            (16_usize, 268_238_849_u64),
++            (256, 268_238_849),
++            (8192, 68_712_923_137),
++            (65536, 68_712_923_137),
++        ] {
++            let modulus = Modulus::new(q);
++            let plan = crate::ring::make_ntt_plan(modulus, degree);
++            let prepared = PreparedNttPlan::new(&plan);
++
++            let values: Vec<u64> = (0..degree)
++                .map(|index| {
++                    let x = index as u64;
++                    x.wrapping_mul(37).wrapping_add(19) % q
++                })
++                .collect();
++
++            let reference = prepared.forward_owned(values.clone());
++            let candidate = prepared.forward_owned_prepared_mul(values);
++
++            assert_eq!(
++                reference, candidate,
++                "R36.5F.3 complete forward mismatch degree={degree} q={q}"
++            );
++
++            println!(
++                "R36_5F3_FORWARD_EQUIVALENCE degree={} modulus={} status=PASS",
++                degree, q
++            );
++        }
++    }
++
+     fn plan() -> NttPlan {
+         NttPlan::new(Modulus::new(97), 8, 8)
+     }
+@@ -321,6 +574,33 @@ mod tests {
+         println!("PREPARED_NTT_FORWARD_EQUIVALENCE=PASS");
+     }
+ 
++    // R36_5E2_OWNED_FORWARD_EQUIVALENCE
++    #[test]
++    fn r36_5e2_owned_forward_matches_prepared_exactly() {
++        for degree in [16_usize, 256, 8192] {
++            let modulus = Modulus::new(268_238_849);
++            let plan = crate::ring::make_ntt_plan(modulus, degree);
++            let prepared = PreparedNttPlan::new(&plan);
++
++            let coefficients: Vec<u64> = (0..degree)
++                .map(|index| {
++                    let x = index as u64;
++                    (11 + 13 * x + 3 * x * x) % modulus.value()
++                })
++                .collect();
++
++            let polynomial = Polynomial::new(modulus, coefficients.clone());
++
++            assert_eq!(
++                prepared.forward_owned(coefficients),
++                prepared.forward(&polynomial),
++                "degree={degree}"
++            );
++        }
++
++        println!("R36_5E2_OWNED_FORWARD_EQUIVALENCE=PASS");
++    }
++
+     #[test]
+     #[ignore]
+     fn sd3b_forward_ntt_microbench_degree_8192() {
+@@ -519,6 +799,170 @@ mod tests {
+         println!("PREPARED_NTT_BATCH_FORWARD_EQUIVALENCE=PASS");
+     }
+ 
++    // R36_5G1_INVERSE_EQUIVALENCE
++
++    // R36_5G2_PRODUCTION_QP_INVERSE_EQUIVALENCE
++    #[test]
++    fn r36_5g2_production_qp_inverse_equivalence() {
++        use crate::ckks::research_profile_65536_for_levels;
++        use crate::ring::{ModulusBasis, ModulusChain};
++
++        const DEGREE: usize = 65_536;
++
++        let profile = research_profile_65536_for_levels(13, 3);
++        let extended = research_profile_65536_for_levels(15, 3);
++
++        let top = profile.modulus_chain().top().clone();
++        let extended_moduli = extended.modulus_chain().top().moduli().to_vec();
++
++        assert_eq!(top.moduli().len(), 16);
++        assert_eq!(extended_moduli.len(), 18);
++        assert_eq!(&extended_moduli[..16], top.moduli());
++
++        let chain = ModulusChain::from_top_basis(top);
++        let q = chain.level(3).clone();
++        let p = ModulusBasis::new(extended_moduli[16..18].to_vec());
++
++        assert_eq!(q.moduli().len(), 13);
++        assert_eq!(p.moduli().len(), 2);
++
++        let mut qp_moduli = q.moduli().to_vec();
++        qp_moduli.extend_from_slice(p.moduli());
++
++        assert_eq!(qp_moduli.len(), 15);
++
++        for (limb, &modulus) in qp_moduli.iter().enumerate() {
++            let plan = crate::ring::make_ntt_plan(modulus, DEGREE);
++            let prepared = PreparedNttPlan::new(&plan);
++
++            let coefficients: Vec<u64> = (0..DEGREE)
++                .map(|index| {
++                    let x = index as u64;
++                    x.wrapping_mul(37)
++                        .wrapping_add(19)
++                        .wrapping_add(limb as u64)
++                        % modulus.value()
++                })
++                .collect();
++
++            let polynomial = Polynomial::new(modulus, coefficients.clone());
++            let transformed = prepared.forward(&polynomial);
++
++            let reference = prepared.inverse(&transformed);
++            let candidate = prepared.inverse_prepared_mul(&transformed);
++
++            assert_eq!(
++                reference, candidate,
++                "R36.5G.2 inverse mismatch limb={limb}"
++            );
++
++            assert_eq!(
++                candidate.coefficients(),
++                coefficients.as_slice(),
++                "R36.5G.2 roundtrip mismatch limb={limb}"
++            );
++
++            println!(
++                "R36_5G2_QP_LIMB={} modulus={} status=PASS",
++                limb,
++                modulus.value()
++            );
++        }
++
++        println!("R36_5G2_QP_LIMB_COUNT=15");
++        println!("R36_5G2_PRODUCTION_INVERSE_EXACT_STATUS=PASS");
++    }
++
++    #[test]
++    fn r36_5g1_prepared_inverse_exact_equivalence() {
++        for (degree, q) in [
++            (16_usize, 268_238_849_u64),
++            (256, 268_238_849),
++            (8192, 68_712_923_137),
++            (65_536, 68_712_923_137),
++        ] {
++            let modulus = Modulus::new(q);
++            let plan = crate::ring::make_ntt_plan(modulus, degree);
++            let prepared = PreparedNttPlan::new(&plan);
++
++            let values: Vec<u64> = (0..degree)
++                .map(|index| {
++                    let x = index as u64;
++                    x.wrapping_mul(37).wrapping_add(19) % q
++                })
++                .collect();
++
++            let reference = prepared.inverse(&values);
++            let candidate = prepared.inverse_prepared_mul(&values);
++
++            assert_eq!(
++                reference, candidate,
++                "R36.5G.1 inverse mismatch degree={degree} q={q}"
++            );
++
++            println!(
++                "R36_5G1_INVERSE_EQUIVALENCE degree={} modulus={} status=PASS",
++                degree, q
++            );
++        }
++
++        println!("R36_5G1_INVERSE_EXACT_STATUS=PASS");
++    }
++
++    #[test]
++    #[ignore = "isolated inverse NTT performance characterization"]
++    fn r36_5g1_inverse_ab_benchmark() {
++        use std::time::Instant;
++
++        const DEGREE: usize = 65_536;
++        const MODULUS: u64 = 68_712_923_137;
++
++        let modulus = Modulus::new(MODULUS);
++        let plan = crate::ring::make_ntt_plan(modulus, DEGREE);
++        let prepared = PreparedNttPlan::new(&plan);
++
++        let values: Vec<u64> = (0..DEGREE)
++            .map(|index| {
++                let x = index as u64;
++                x.wrapping_mul(37).wrapping_add(19) % MODULUS
++            })
++            .collect();
++
++        let mut reference_total = 0.0_f64;
++        let mut candidate_total = 0.0_f64;
++
++        for iteration in 0..6 {
++            let started = Instant::now();
++            let reference = prepared.inverse(&values);
++            let reference_ms = started.elapsed().as_secs_f64() * 1000.0;
++
++            let started = Instant::now();
++            let candidate = prepared.inverse_prepared_mul(&values);
++            let candidate_ms = started.elapsed().as_secs_f64() * 1000.0;
++
++            assert_eq!(reference, candidate);
++
++            println!(
++                "R36_5G1_ITERATION={} warmup={} reference_ms={:.6} prepared_ms={:.6}",
++                iteration,
++                iteration == 0,
++                reference_ms,
++                candidate_ms
++            );
++
++            if iteration > 0 {
++                reference_total += reference_ms;
++                candidate_total += candidate_ms;
++            }
++        }
++
++        println!(
++            "R36_5G1_INVERSE_SPEEDUP={:.6}",
++            reference_total / candidate_total
++        );
++        println!("R36_5G1_INVERSE_BENCHMARK_EXACT_STATUS=PASS");
++    }
++
+     #[test]
+     fn prepared_inverse_matches_radix2_exactly() {
+         let plan = plan();
+diff --git a/tests/r16_5_18d2_ckks_rotation.rs b/tests/r16_5_18d2_ckks_rotation.rs
+index d94e29c..156a40e 100644
+--- a/tests/r16_5_18d2_ckks_rotation.rs
++++ b/tests/r16_5_18d2_ckks_rotation.rs
+@@ -76,6 +76,12 @@ fn error_metrics(actual: &[Complex64], expected: &[Complex64]) -> (f64, f64) {
+ #[test]
+ #[ignore = "explicit degree-4096 hybrid CKKS experiment"]
+ fn r16_5_18d2_ckks_rotation() {
++    let base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
++        .ok()
++        .map(|value| value.parse().expect("invalid gadget base"))
++        .unwrap_or(BASE_LOG);
++    assert!([8, 16, 32].contains(&base_log));
++
+     let started = Instant::now();
+ 
+     let profile = research_profile_4096();
+@@ -153,7 +159,7 @@ fn r16_5_18d2_ckks_rotation() {
+     let keygen_started = Instant::now();
+ 
+     let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+-        BoundedGadgetLayout::new(q_basis.clone(), BASE_LOG),
++        BoundedGadgetLayout::new(q_basis.clone(), base_log),
+         p_basis,
+         &secret,
+         exponent,
+@@ -166,7 +172,7 @@ fn r16_5_18d2_ckks_rotation() {
+     let keygen_seconds = keygen_started.elapsed().as_secs_f64();
+ 
+     println!("R16_5_18D2_GALOIS_EXPONENT={exponent}");
+-    println!("R16_5_18D2_GADGET_BASE_LOG={BASE_LOG}");
++    println!("R16_5_18D2_GADGET_BASE_LOG={base_log}");
+     println!("R16_5_18D2_GADGET_DIGITS={}", key.digit_count());
+     println!("R16_5_18D2_KEYGEN_SECONDS={keygen_seconds:.6}");
+ 
+@@ -212,7 +218,7 @@ fn r16_5_18d2_ckks_rotation() {
+     let qonly_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
+         BoundedRnsKeygenConfig {
+             plaintext_modulus: 2,
+-            layout: BoundedGadgetLayout::new(q_basis.clone(), BASE_LOG),
++            layout: BoundedGadgetLayout::new(q_basis.clone(), base_log),
+             plan: &q_plan,
+         },
+         &secret,
+diff --git a/tests/r16_5_18h5_fft256_precision.rs b/tests/r16_5_18h5_fft256_precision.rs
+index 1a8cd5f..8d0ebef 100644
+--- a/tests/r16_5_18h5_fft256_precision.rs
++++ b/tests/r16_5_18h5_fft256_precision.rs
+@@ -112,6 +112,13 @@ fn decode(
+ 
+ #[test]
+ fn r16_5_18h5_fft256_precision_characterization() {
++    let hybrid_base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
++        .ok()
++        .map(|value| value.parse().expect("invalid hybrid gadget base"))
++        .unwrap_or(8);
++    assert!([8, 16, 32].contains(&hybrid_base_log));
++    println!("R30_9A_15_HYBRID_BASE_LOG={hybrid_base_log}");
++
+     const DEGREE: usize = 1024;
+     const SCALE: f64 = 33_554_432.0;
+     const SIGMA: f64 = 3.19;
+@@ -265,7 +272,7 @@ fn r16_5_18h5_fft256_precision_characterization() {
+                     };
+ 
+                     let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+-                        BoundedGadgetLayout::new(stage_q.clone(), 8),
++                        BoundedGadgetLayout::new(stage_q.clone(), hybrid_base_log),
+                         p.clone(),
+                         &secret,
+                         exponent,
+diff --git a/tests/r26_h11_15c_integrated_fft3840.rs b/tests/r26_h11_15c_integrated_fft3840.rs
+index 9776cbc..a37637f 100644
+--- a/tests/r26_h11_15c_integrated_fft3840.rs
++++ b/tests/r26_h11_15c_integrated_fft3840.rs
+@@ -333,18 +333,195 @@ type PackedRotationKeys = std::collections::BTreeMap<isize, PreparedHybridRnsGal
+ fn r26_h11_15c_integrated_encrypted_fft3840() {
+     let total_started = Instant::now();
+ 
+-    let profile = research_profile_65536_for_levels(5, 5);
++    // R30_9A_4_SHARED_PROFILE_HORIZONTAL
++    let shared_profile = std::env::var_os("R30_9A_SHARED_PROFILE").is_some();
++
++    let profile = if shared_profile {
++        research_profile_65536_for_levels(13, 3)
++    } else {
++        research_profile_65536_for_levels(5, 5)
++    };
++
+     let degree = profile.degree();
+     assert_eq!(degree, 65536);
+ 
+     let validated = profile.modulus_chain().top().clone();
+-    assert!(validated.moduli().len() >= 10);
+ 
+-    let q = ModulusBasis::new(validated.moduli()[..8].to_vec());
+-    let p = ModulusBasis::new(validated.moduli()[8..10].to_vec());
++    let (q, p) = if shared_profile {
++        let extended = research_profile_65536_for_levels(15, 3);
++        let extended_chain = extended.modulus_chain();
++        let moduli = extended_chain.top().moduli();
++
++        assert_eq!(validated.moduli().len(), 16);
++        assert_eq!(moduli.len(), 18);
++        assert_eq!(&moduli[..16], validated.moduli());
++
++        (
++            ModulusBasis::new(validated.moduli().to_vec()),
++            ModulusBasis::new(moduli[16..18].to_vec()),
++        )
++    } else {
++        assert!(validated.moduli().len() >= 10);
++
++        (
++            ModulusBasis::new(validated.moduli()[..8].to_vec()),
++            ModulusBasis::new(validated.moduli()[8..10].to_vec()),
++        )
++    };
++
+     let chain = ModulusChain::from_top_basis(q);
+ 
+-    assert_eq!(chain.max_level(), 7);
++    assert_eq!(chain.max_level(), if shared_profile { 15 } else { 7 });
++
++    if shared_profile {
++        assert_eq!(chain.level(7).moduli().len(), 9);
++
++        for modulus in p.moduli() {
++            assert_eq!((modulus.value() - 1) % (2 * degree as u64), 0);
++            assert!(!chain.top().moduli().contains(modulus));
++        }
++
++        println!("R30_9A_SHARED_PROFILE=ENABLED");
++        println!("R30_9A_Q_LIMBS=16");
++        println!("R30_9A_P_LIMBS=2");
++        println!("R30_9A_HANDOFF_LEVEL=7");
++        println!("R30_9A_HANDOFF_Q_LIMBS=9");
++    }
++
++    // R30.9A.16C: early, allocation-free hybrid-QP key memory preflight.
++    if std::env::var("R30_9A_16_MEMORY_PREFLIGHT").as_deref() == Ok("1") {
++        let base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
++            .ok()
++            .map(|value| value.parse().expect("invalid hybrid gadget base"))
++            .unwrap_or(32);
++        assert!([8, 16, 32].contains(&base_log));
++
++        let stage0_offsets: BTreeSet<isize> = (0..15)
++            .flat_map(|branch| {
++                let destination_lane = if branch < 8 { branch } else { branch - 8 };
++                fuse_fft256_source_lane(
++                    &first_stage_diagonals(branch),
++                    SLOTS,
++                    LANE_SLOTS,
++                    0,
++                    destination_lane,
++                )
++                .keys()
++                .copied()
++                .filter(|&offset| offset != 0)
++                .collect::<Vec<_>>()
++            })
++            .collect();
++
++        let mut total_bytes = 0_u128;
++        let mut peak_stage_bytes = 0_u128;
++
++        for stage in 0..4 {
++            let offsets: BTreeSet<isize> = if stage == 0 {
++                stage0_offsets.clone()
++            } else {
++                let span = [16, 64, 256][stage - 1];
++                let local = later_stage_diagonals(span);
++                let lanes: Vec<&Diagonals> = (0..8).map(|_| &local).collect();
++                pack_fft256_branch_diagonals(&lanes, LANE_SLOTS)
++                    .keys()
++                    .copied()
++                    .filter(|&offset| offset != 0)
++                    .collect()
++            };
++
++            let q_basis = chain.level(stage + 3);
++            let digits = BoundedGadgetLayout::new(q_basis.clone(), base_log).digit_count();
++
++            let limbs = q_basis.moduli().len() + p.moduli().len();
++            let bytes_per_key = 2_u128 * degree as u128 * limbs as u128 * digits as u128 * 8;
++
++            let stage_bytes = bytes_per_key * offsets.len() as u128;
++            total_bytes += stage_bytes;
++            peak_stage_bytes = peak_stage_bytes.max(stage_bytes);
++
++            println!(
++                "R30_9A_16_STAGE={stage} KEYS={} Q_LIMBS={} P_LIMBS={} DIGITS={} PAYLOAD_GIB={:.3}",
++                offsets.len(),
++                q_basis.moduli().len(),
++                p.moduli().len(),
++                digits,
++                stage_bytes as f64 / 1073741824.0
++            );
++        }
++
++        let peak_gib = peak_stage_bytes as f64 / 1073741824.0;
++
++        println!("R30_9A_16_BASE_LOG={base_log}");
++        println!(
++            "R30_9A_16_ALL_STAGES_GIB={:.3}",
++            total_bytes as f64 / 1073741824.0
++        );
++        println!("R30_9A_16_PEAK_STAGE_GIB={peak_gib:.3}");
++        println!(
++            "R30_9A_16_STAGEWISE_BUDGET_18GIB={}",
++            if peak_gib <= 18.0 { "PASS" } else { "EXCEEDS" }
++        );
++
++        // R30.9A.17A: key-lifetime scheduling audit.
++        // Preserve the source/operand order used by the fused evaluator.
++        let group_offsets: Vec<Vec<isize>> = [0..8, 8..15]
++            .iter()
++            .map(|range| {
++                range
++                    .clone()
++                    .flat_map(|branch| {
++                        let destination_lane = if branch < 8 { branch } else { branch - 8 };
++                        fuse_fft256_source_lane(
++                            &first_stage_diagonals(branch),
++                            SLOTS,
++                            LANE_SLOTS,
++                            0,
++                            destination_lane,
++                        )
++                        .keys()
++                        .copied()
++                        .filter(|&offset| offset != 0)
++                        .collect::<Vec<_>>()
++                    })
++                    .collect()
++            })
++            .collect();
++
++        let mut global_peak = 0usize;
++
++        for (group, offsets) in group_offsets.iter().enumerate() {
++            let mut last_use = std::collections::BTreeMap::new();
++            for (index, &offset) in offsets.iter().enumerate() {
++                last_use.insert(offset, index);
++            }
++
++            let mut live = BTreeSet::new();
++            let mut peak = 0usize;
++
++            for (index, &offset) in offsets.iter().enumerate() {
++                live.insert(offset);
++                peak = peak.max(live.len());
++
++                if last_use[&offset] == index {
++                    live.remove(&offset);
++                }
++            }
++
++            global_peak = global_peak.max(peak);
++
++            println!(
++                "R30_9A_17_GROUP={group} TERMS={} DISTINCT_KEYS={} PEAK_LIVE_KEYS={peak}",
++                offsets.len(),
++                last_use.len()
++            );
++        }
++
++        println!("R30_9A_17_PEAK_LIVE_KEYS={global_peak}");
++        println!("R30_9A_17_SCHEDULING_AUDIT=PASS");
++        println!("R30_9A_16_MEMORY_PREFLIGHT_STATUS=PASS");
++        return;
++    }
+ 
+     let scale = profile.initial_scale();
+     let embedding = CkksCanonicalEmbedding::new(degree);
+@@ -512,6 +689,55 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
+         })
+         .collect();
+ 
++    // R30.9A.21D: characterize stage-0 rotation-key reuse.
++    //
++    // This analysis does not generate keys or execute encrypted FFTs.
++    let stage0_schedule: Vec<isize> = prepared_sources
++        .iter()
++        .flat_map(|source| source.rotation_offsets())
++        .filter(|&offset| offset != 0)
++        .collect();
++
++    let unique_offsets: BTreeSet<isize> = stage0_schedule.iter().copied().collect();
++
++    let operand_keys = stage0_schedule.len();
++    let unique_keys = unique_offsets.len();
++    let repeated_keys = operand_keys - unique_keys;
++
++    // R30.9A.21E: consecutive offset reuse without reordering.
++    let consecutive_reuses = stage0_schedule
++        .windows(2)
++        .filter(|pair| pair[0] == pair[1])
++        .count();
++
++    let one_key_cache_generations = stage0_schedule.len() - consecutive_reuses;
++
++    println!("R30_9A_21E_CONSECUTIVE_REUSES={consecutive_reuses}");
++    println!("R30_9A_21E_ONE_KEY_CACHE_GENERATIONS={one_key_cache_generations}");
++    println!(
++        "R30_9A_21E_ONE_KEY_CACHE_REDUCTION_FACTOR={:.3}",
++        stage0_schedule.len() as f64 / one_key_cache_generations.max(1) as f64
++    );
++
++    println!("R30_9A_21D_STAGE0_OPERAND_KEYS={operand_keys}");
++    println!("R30_9A_21D_STAGE0_UNIQUE_OFFSETS={unique_keys}");
++    println!("R30_9A_21D_STAGE0_REPEATED_OCCURRENCES={repeated_keys}");
++
++    let independent_two_batch_calls = 2 * operand_keys;
++    let batched_two_batch_calls = operand_keys;
++
++    println!("R30_9A_21D_TWO_BATCH_INDEPENDENT_KEYGEN_CALLS={independent_two_batch_calls}");
++    println!("R30_9A_21D_TWO_BATCH_KEYGEN_CALLS={batched_two_batch_calls}");
++
++    if unique_keys > 0 {
++        println!(
++            "R30_9A_21D_UNIQUE_KEY_REDUCTION_FACTOR={:.3}",
++            operand_keys as f64 / unique_keys as f64
++        );
++    }
++
++    println!("R30_9A_21D_SCHEDULE_STATUS=PASS");
++
+     let later_diagonals: Vec<Diagonals> = [16, 64, 256]
+         .iter()
+         .map(|&span| {
+@@ -541,6 +767,424 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
+ 
+     // Generate each required rotation key once per level.
+     // The same level-specific keys are shared by groups A and B.
++
++    // R30_9A_10: allocation-free memory-model mode.
++    if std::env::var("R30_9A_10_MEMORY_ONLY").as_deref() == Ok("1") {
++        let mut total_bytes = 0_u128;
++
++        for stage_index in 0..4 {
++            let level = stage_index + 3;
++
++            let offsets: BTreeSet<isize> = if stage_index == 0 {
++                prepared_sources
++                    .iter()
++                    .flat_map(|prepared| prepared.rotation_offsets())
++                    .filter(|&offset| offset != 0)
++                    .collect()
++            } else {
++                later_diagonals[stage_index - 1]
++                    .keys()
++                    .copied()
++                    .filter(|&offset| offset != 0)
++                    .collect()
++            };
++
++            let q_basis = chain.level(level);
++            let q_limbs = q_basis.moduli().len();
++            let p_limbs = p.moduli().len();
++
++            for base_log in [8_u32, 16, 32] {
++                let digits = BoundedGadgetLayout::new(q_basis.clone(), base_log).digit_count();
++
++                let bytes = 2_u128
++                    * degree as u128
++                    * (q_limbs + p_limbs) as u128
++                    * digits as u128
++                    * offsets.len() as u128
++                    * 8;
++
++                println!(
++                    "R30_9A_10_MEMORY stage={stage_index} base_log={base_log}                      keys={} q_limbs={q_limbs} p_limbs={p_limbs}                      digits={digits} gib={:.3}",
++                    offsets.len(),
++                    bytes as f64 / 1073741824.0
++                );
++
++                if base_log == 8 {
++                    total_bytes += bytes;
++                }
++            }
++        }
++
++        println!(
++            "R30_9A_10_BASE8_TOTAL_GIB={:.3}",
++            total_bytes as f64 / 1073741824.0
++        );
++        println!("R30_9A_10_MEMORY_ONLY_STATUS=PASS");
++        return;
++    }
++
++    // R30.9A.14: configurable hybrid-QP gadget base.
++    // Default 8 preserves the existing validated behavior.
++    let hybrid_base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
++        .ok()
++        .map(|value| value.parse().expect("invalid hybrid gadget base"))
++        .unwrap_or(8);
++
++    assert!(
++        [8, 16, 32].contains(&hybrid_base_log),
++        "hybrid gadget base must be 8, 16, or 32"
++    );
++
++    println!("R30_9A_14_HYBRID_BASE_LOG={hybrid_base_log}");
++
++    // R30.9A.18: opt-in bounded-key complete FFT3840 handoff.
++    // Keep the original production regression untouched as the default.
++    if std::env::var("R30_9A_18_STREAMING").as_deref() == Ok("1") {
++        assert!(shared_profile, "streaming requires shared Q16 profile");
++        assert_eq!(hybrid_base_log, 32, "streaming requires base 32");
++        assert!(
++            std::env::var_os("R30_9A_HANDOFF_ONLY").is_some(),
++            "streaming currently validates the level-7 handoff only"
++        );
++        let evaluator_keys = RnsCkksEvaluationKeys::new();
++        let evaluator = RnsCkksEvaluator::new(&chain, &evaluator_keys);
++        let source_array: [RnsCkksCiphertext; 15] = sources
++            .try_into()
++            .unwrap_or_else(|_| panic!("expected 15 FFT15 sources"));
++        let prepared_array: [PreparedFusedFft256Source; 15] = prepared_sources
++            .try_into()
++            .unwrap_or_else(|_| panic!("expected 15 prepared sources"));
++        let later_array: [PreparedFft256Stage; 3] = later_prepared
++            .try_into()
++            .unwrap_or_else(|_| panic!("expected 3 prepared stages"));
++        let stage0_qp = PreparedRnsNttPlan::new(&qp_plans[0]);
++        let mut generated_keys = 0usize;
++        let parallel_workers = std::env::var("FHE_R27_KEYGEN_THREADS")
++            .ok()
++            .and_then(|value| value.parse::<usize>().ok())
++            .unwrap_or(1)
++            .max(1);
++
++        let mut stage0_offsets = Vec::new();
++        for source in &prepared_array {
++            stage0_offsets.extend(source.rotation_offsets().filter(|&offset| offset != 0));
++        }
++
++        let parallel_jobs: Vec<(isize, [u8; 32])> = stage0_offsets
++            .iter()
++            .map(|&offset| {
++                let mut seed = [0_u8; 32];
++                rand::RngCore::fill_bytes(&mut rng, &mut seed);
++                (offset, seed)
++            })
++            .collect();
++
++        let generate = |(offset, seed): (isize, [u8; 32])| {
++            let exponent = if offset > 0 {
++                rotation_exponent_left(degree, offset as usize)
++            } else {
++                rotation_exponent_right(degree, (-offset) as usize)
++            };
++
++            let mut key_rng = ChaCha20Rng::from_seed(seed);
++
++            PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++                BoundedGadgetLayout::new(chain.level(3).clone(), hybrid_base_log),
++                p.clone(),
++                &secret,
++                exponent,
++                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
++                2,
++                &qp_plans[0],
++                &mut key_rng,
++            )
++        };
++
++        let pool = ThreadPoolBuilder::new()
++            .num_threads(parallel_workers)
++            .build()
++            .expect("R30.9A.19 keygen thread pool creation failed");
++
++        let mut next_key = 0usize;
++        let mut pending_keys =
++            std::collections::VecDeque::<(isize, PreparedHybridRnsGaloisKey)>::new();
++
++        let mut make_key = |offset: isize| {
++            if pending_keys.is_empty() {
++                let end = (next_key + parallel_workers).min(parallel_jobs.len());
++                assert!(next_key < end, "R30.9A.19 exhausted key schedule");
++
++                let batch: Vec<_> = pool.install(|| {
++                    parallel_jobs[next_key..end]
++                        .par_iter()
++                        .copied()
++                        .map(|job| {
++                            let key = generate(job);
++                            (job.0, key)
++                        })
++                        .collect()
++                });
++
++                pending_keys.extend(batch);
++                next_key = end;
++            }
++
++            let (expected_offset, key) = pending_keys
++                .pop_front()
++                .expect("R30.9A.19 missing generated key");
++
++            assert_eq!(
++                expected_offset, offset,
++                "R30.9A.19 key schedule differs from evaluator order"
++            );
++
++            generated_keys += 1;
++            key
++        };
++
++        let started = Instant::now();
++        let mut results =
++            ccmm_rs::eblas::fused_fft256_handoff::apply_fft3840_packed_fft256_stage0_streaming(
++                &source_array,
++                &prepared_array,
++                &evaluator,
++                &chain,
++                &prepared_plans[0],
++                &qp_plans[0],
++                &stage0_qp,
++                &mut make_key,
++            );
++        assert_eq!(generated_keys, parallel_jobs.len());
++        assert!(pending_keys.is_empty());
++        println!("R30_9A_19_KEYGEN_WORKERS={parallel_workers}");
++        println!("R30_9A_19_KEYGEN_BATCH_LIMIT={parallel_workers}");
++        println!("R30_9A_18_STAGE0_KEYS_GENERATED={generated_keys}");
++        println!(
++            "R30_9A_18_STAGE0_SECONDS={:.3}",
++            started.elapsed().as_secs_f64()
++        );
++        for stage_index in 1..4 {
++            let level = stage_index + 3;
++            let offsets: BTreeSet<isize> = later_diagonals[stage_index - 1]
++                .keys()
++                .copied()
++                .filter(|&offset| offset != 0)
++                .collect();
++            let mut keys = PackedRotationKeys::new();
++            for offset in offsets {
++                let exponent = if offset > 0 {
++                    rotation_exponent_left(degree, offset as usize)
++                } else {
++                    rotation_exponent_right(degree, (-offset) as usize)
++                };
++                let mut seed = [0_u8; 32];
++                rand::RngCore::fill_bytes(&mut rng, &mut seed);
++                let mut key_rng = ChaCha20Rng::from_seed(seed);
++                let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
++                    BoundedGadgetLayout::new(chain.level(level).clone(), hybrid_base_log),
++                    p.clone(),
++                    &secret,
++                    exponent,
++                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
++                    2,
++                    &qp_plans[stage_index],
++                    &mut key_rng,
++                );
++                keys.insert(offset, key);
++            }
++            let ctx = PackedStageContext {
++                keys: &keys,
++                evaluator: &evaluator,
++                chain: &chain,
++                qp_plan: &qp_plans[stage_index],
++                prepared: &prepared_plans[stage_index],
++            };
++            for result in &mut results {
++                *result = ccmm_rs::eblas::prepared_radix4_fft256::apply_stage(
++                    result,
++                    &later_array[stage_index - 1],
++                    &ctx,
++                );
++                assert_eq!(result.level(), level + 1);
++            }
++            drop(keys);
++            println!("R30_9A_18_STAGE_{stage_index}_STATUS=PASS");
++        }
++        let expected_basis = chain.level(7).moduli();
++        for result in &results {
++            assert_eq!(result.level(), 7);
++            assert_eq!(result.basis().moduli(), expected_basis);
++        }
++        println!("R30_9A_18_OUTPUT_LEVEL=7");
++        println!(
++            "R30_9A_18_TOTAL_SECONDS={:.3}",
++            total_started.elapsed().as_secs_f64()
++        );
++        println!("R30_9A_18_STREAMING_STATUS=PASS");
++
++        // R30.9A.20: numerical validation of the streaming handoff.
++        // Reconstruct the natural-order 3840-point frequency spectrum.
++        let mut reference = vec![Complex64::new(0.0, 0.0); 16 * 3840];
++
++        // Independent FFT15 x FFT256 reference, natural frequency order.
++        for row in 0..16 {
++            for k_cross in 0..TILES {
++                let mut local = vec![Complex64::new(0.0, 0.0); 256];
++
++                for (s, value) in local.iter_mut().enumerate() {
++                    let cross: Complex64 = (0..TILES)
++                        .map(|tile| natural[tile][row * 256 + s] * root(TILES, k_cross * tile))
++                        .sum();
++
++                    *value = cross * root(3840, k_cross * s);
++                }
++
++                // Independent iterative radix-2 FFT256.
++                for i in 0usize..256 {
++                    let j = i.reverse_bits() >> (usize::BITS - 8);
++                    if i < j {
++                        local.swap(i, j);
++                    }
++                }
++
++                let mut len = 2;
++                while len <= 256 {
++                    for base in (0..256).step_by(len) {
++                        for j in 0..len / 2 {
++                            let a = local[base + j];
++                            let b = local[base + j + len / 2] * root(len, j);
++                            local[base + j] = a + b;
++                            local[base + j + len / 2] = a - b;
++                        }
++                    }
++                    len *= 2;
++                }
++
++                for (k_local, &value) in local.iter().enumerate() {
++                    reference[row * 3840 + k_cross + TILES * k_local] = value;
++                }
++            }
++        }
++
++        // Independently verify selected bins by direct DFT.
++        for &row in &[0usize, 7, 15] {
++            for &frequency in &[0usize, 7, 255, 1024, 3839] {
++                let direct: Complex64 = (0..3840)
++                    .map(|n| {
++                        let tile = n / 256;
++                        let local = n % 256;
++                        natural[tile][row * 256 + local] * root(3840, frequency * n)
++                    })
++                    .sum();
++
++                let staged = reference[row * 3840 + frequency];
++                assert!(
++                    (direct - staged).norm() < 1.0e-8,
++                    "R30.9A.20 reference disagreement: row={row} frequency={frequency}"
++                );
++            }
++        }
++
++        println!("R30_9A_20_REFERENCE_STATUS=PASS");
++
++        let mut error_sq = 0.0_f64;
++        let mut reference_sq = 0.0_f64;
++        let mut max_abs = 0.0_f64;
++        let mut checked = 0usize;
++
++        // R30.9A.20B: numerical error localization.
++        let mut group_error_sq = [0.0_f64; 2];
++        let mut group_reference_sq = [0.0_f64; 2];
++        let mut worst_error = 0.0_f64;
++        let mut worst_frequency = 0usize;
++        let mut worst_group = 0usize;
++        let mut cross = Complex64::new(0.0, 0.0);
++        let mut actual_sq = 0.0_f64;
++
++        for (group, ciphertext) in results.iter().enumerate() {
++            let actual = decode(ciphertext, &secret, &embedding);
++            let branches = if group == 0 { 0..8 } else { 8..15 };
++
++            for (lane, branch) in branches.enumerate() {
++                for row in 0..16 {
++                    for k in 0..256 {
++                        let slot = lane * HALF + row * 256 + k;
++                        let frequency = row * 3840 + branch + 15 * k;
++                        let expected = reference[frequency];
++                        let error = (actual[slot] - expected).norm();
++
++                        error_sq += error * error;
++                        reference_sq += expected.norm_sqr();
++                        group_error_sq[group] += error * error;
++                        group_reference_sq[group] += expected.norm_sqr();
++                        cross += actual[slot] * expected.conj();
++                        actual_sq += actual[slot].norm_sqr();
++
++                        if error > worst_error {
++                            worst_error = error;
++                            worst_frequency = frequency;
++                            worst_group = group;
++                        }
++
++                        max_abs = max_abs.max(error);
++                        checked += 1;
++                    }
++                }
++            }
++        }
++
++        assert_eq!(checked, 61_440);
++        assert!(reference_sq > 0.0);
++
++        let relative_l2 = (error_sq / reference_sq).sqrt();
++
++        println!("R30_9A_20_SPECTRAL_VALUES={checked}");
++        println!("R30_9A_20_MAX_ABS={max_abs:.12e}");
++        println!("R30_9A_20_RELATIVE_L2={relative_l2:.12e}");
++
++        for group in 0..2 {
++            assert!(group_reference_sq[group] > 0.0);
++            let group_relative_l2 = (group_error_sq[group] / group_reference_sq[group]).sqrt();
++            println!("R30_9A_20B_GROUP_{group}_RELATIVE_L2={group_relative_l2:.12e}");
++        }
++
++        let gain = cross / reference_sq;
++        let residual_sq = (actual_sq - cross.norm_sqr() / reference_sq).max(0.0);
++        let residual_relative_l2 = (residual_sq / reference_sq).sqrt();
++
++        println!("R30_9A_20B_WORST_GROUP={worst_group}");
++        println!("R30_9A_20B_WORST_FREQUENCY={worst_frequency}");
++        println!("R30_9A_20B_WORST_ROW={}", worst_frequency / 3840);
++        println!("R30_9A_20B_WORST_BIN={}", worst_frequency % 3840);
++        println!("R30_9A_20B_GAIN_REAL={:.12e}", gain.re);
++        println!("R30_9A_20B_GAIN_IMAG={:.12e}", gain.im);
++        println!("R30_9A_20B_GAIN_CORRECTED_RELATIVE_L2={residual_relative_l2:.12e}");
++        println!("R30_9A_20B_DIAGNOSTICS_STATUS=PASS");
++
++        // R30.9A.20C: distinguish the strict numerical target from
++        // provisional research-profile integration acceptance.
++        const STRICT_TARGET: f64 = 1.0e-5;
++        const RESEARCH_PROFILE_LIMIT: f64 = 1.1e-5;
++
++        let strict_pass = relative_l2.is_finite() && relative_l2 < STRICT_TARGET;
++
++        println!(
++            "R30_9A_20_STRICT_NUMERICAL_STATUS={}",
++            if strict_pass { "PASS" } else { "FAIL" }
++        );
++        println!("R30_9A_20_STRICT_TARGET={STRICT_TARGET:.12e}");
++        println!("R30_9A_20_RESEARCH_PROFILE_LIMIT={RESEARCH_PROFILE_LIMIT:.12e}");
++
++        assert!(
++            relative_l2.is_finite() && relative_l2 < RESEARCH_PROFILE_LIMIT,
++            "R30.9A.20 research-profile accuracy limit exceeded"
++        );
++
++        println!("R30_9A_20_RESEARCH_PROFILE_STATUS=PASS");
++        println!("R30_9A_20_NUMERICAL_STATUS=PROVISIONAL_PASS");
++        return;
++    }
++
+     let keygen_started = Instant::now();
+     let mut stage_keys = Vec::new();
+ 
+@@ -561,6 +1205,36 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
+                 .collect()
+         };
+ 
++        // R30_9A_10: exact logical hybrid-QP key payload estimate.
++        // No key generation or allocation is required for this estimate.
++        {
++            let q_basis = chain.level(level);
++            let q_limbs = q_basis.moduli().len();
++            let p_limbs = p.moduli().len();
++            let layout = BoundedGadgetLayout::new(q_basis.clone(), hybrid_base_log);
++            let digits = layout.digit_count();
++            let key_count = offsets.len();
++
++            let bytes_per_key = (2_u128)
++                * (degree as u128)
++                * ((q_limbs + p_limbs) as u128)
++                * (digits as u128)
++                * 8_u128;
++
++            let stage_bytes = bytes_per_key * (key_count as u128);
++
++            println!("R30_9A_10_STAGE={stage_index}");
++            println!("R30_9A_10_Q_LIMBS={q_limbs}");
++            println!("R30_9A_10_P_LIMBS={p_limbs}");
++            println!("R30_9A_10_GADGET_DIGITS={digits}");
++            println!("R30_9A_10_KEY_COUNT={key_count}");
++            println!("R30_9A_10_BYTES_PER_KEY={bytes_per_key}");
++            println!(
++                "R30_9A_10_STAGE_GIB={:.3}",
++                stage_bytes as f64 / 1073741824.0
++            );
++        }
++
+         let stage_started = Instant::now();
+ 
+         let workers = std::env::var("FHE_R27_KEYGEN_THREADS")
+@@ -592,7 +1266,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
+             let mut key_rng = ChaCha20Rng::from_seed(seed);
+ 
+             let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+-                BoundedGadgetLayout::new(chain.level(level).clone(), 8),
++                BoundedGadgetLayout::new(chain.level(level).clone(), hybrid_base_log),
+                 p.clone(),
+                 &secret,
+                 exponent,
+@@ -698,12 +1372,85 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
+ 
+     let results = pipeline.execute_prepared_branches(&source_array);
+ 
++    // R30_9A_5_CIPHERTEXT_HANDOFF
++    if shared_profile {
++        let vertical_profile = research_profile_65536_for_levels(13, 3);
++        let vertical_chain = vertical_profile.modulus_chain();
++        let expected_basis = vertical_chain.level(7);
++
++        assert_eq!(results.len(), 2);
++        assert_eq!(expected_basis.moduli().len(), 9);
++        assert_eq!(chain.level(7).moduli(), expected_basis.moduli());
++
++        for (group, ciphertext) in results.iter().enumerate() {
++            assert_eq!(
++                ciphertext.level(),
++                7,
++                "horizontal output group {group} has wrong CKKS level"
++            );
++            assert_eq!(
++                ciphertext.basis().moduli(),
++                expected_basis.moduli(),
++                "horizontal output group {group} has wrong Q basis"
++            );
++        }
++
++        println!("R30_9A_5_OUTPUT_CIPHERTEXTS=2");
++        println!("R30_9A_5_OUTPUT_LEVEL=7");
++        println!("R30_9A_5_OUTPUT_Q_LIMBS=9");
++        println!("R30_9A_5_HANDOFF_BASIS_STATUS=PASS");
++    }
++
++    // R30_9A_9_HANDOFF_ONLY
++    if std::env::var_os("R30_9A_HANDOFF_ONLY").is_some() {
++        assert!(
++            shared_profile,
++            "handoff-only validation requires the shared Q16 profile"
++        );
++        println!("R30_9A_9_HANDOFF_ONLY_STATUS=PASS");
++        println!(
++            "R30_9A_9_TOTAL_ELAPSED_SECONDS={:.3}",
++            total_started.elapsed().as_secs_f64()
++        );
++        return;
++    }
++
+     // R28_4B3_TWO_IMAGE_FFT256
+     // Reuse all FFT256 public operands, rotation keys, and QP context.
+     let second_results = if let Some((_, physical_b)) = second_image.as_ref() {
+         let started = Instant::now();
+ 
+-        let results_b = pipeline.execute(physical_b);
++        // R29_4B_STREAMING_INTEGRATION
++        // Exercise the production streaming controller with image B.
++        // Preserve the independent numerical oracle below.
++        let mut pending_input = Some(physical_b.clone());
++        let mut streamed_result = None;
++        let mut observed_batches = 0usize;
++
++        let completed = pipeline
++            .execute_stream(
++                || Ok::<_, ()>(pending_input.take()),
++                |spectrum, progress| {
++                    assert_eq!(progress.batch_index, 0);
++                    assert_eq!(progress.completed_batches, 1);
++                    assert!(spectrum.iter().all(|ct| ct.level() == 7));
++
++                    observed_batches += 1;
++                    streamed_result = Some(spectrum);
++
++                    Ok::<(), ()>(())
++                },
++            )
++            .expect("encrypted FFT3840 streaming execution failed");
++
++        assert_eq!(completed, 1);
++        assert_eq!(observed_batches, 1);
++
++        let results_b = streamed_result.expect("streaming sink did not receive image B");
++
++        println!("R29_4B_STREAM_BATCHES={completed}");
++        println!("R29_4B_STREAM_OUTPUT_LEVEL=7");
++        println!("R29_4B_STREAM_STATUS=PASS");
+         println!("R29_3C_SECOND_IMAGE_COMPLETE_PIPELINE_STATUS=PASS");
+ 
+         assert_eq!(results_b.len(), 2);

@@ -1,0 +1,35 @@
+{
+  "baseline": "R21_4K_FULL_8x4",
+  "created_utc": "2026-10-24T14:19:08.987402+00:00",
+  "source_directory": "results/eblas_fft_evidence/icpp_4k_full_8x4",
+  "files": {
+    "configuration.txt": {
+      "bytes": 164,
+      "sha256": "44f5155a1f0e32c03e709eeda447f100cb614e3d8a5e9deef469845857d7ace1"
+    },
+    "exit_status.txt": {
+      "bytes": 14,
+      "sha256": "1a6500879981d8f90ebe882c21c2df7ce5483e6c9d7e13e9773bd91be9f36318"
+    },
+    "full_run.log": {
+      "bytes": 7234,
+      "sha256": "66faa94a0fc4acbe4705280a280947bfc80beeed279dc8d884903ab7942a80ce"
+    },
+    "git_head.txt": {
+      "bytes": 41,
+      "sha256": "7d936aa1493fafe728c67c2952e6db5b50c09797f8eba2354d515f045ed04122"
+    },
+    "input_sha256.txt": {
+      "bytes": 145,
+      "sha256": "550079968f1a4f54fa48d48fa3f46ea779c1b66aa612f465fe799020a3d40d76"
+    },
+    "memory_rss_kib.log": {
+      "bytes": 7600,
+      "sha256": "3fe3cebd54d0027b2cf4a51ec4e55bfb9c188431d0a7c1dae70ae2294dcb14bb"
+    },
+    "working_tree.diff": {
+      "bytes": 188922,
+      "sha256": "c296476702126062df812637ce6cb3ed81bf51c92b5b3090e3f20b112346b5b7"
+    }
+  }
+}

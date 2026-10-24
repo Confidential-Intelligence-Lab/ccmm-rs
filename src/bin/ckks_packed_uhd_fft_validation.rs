@@ -83,13 +83,18 @@ fn load_normalized_uhd_image(path: &Path) -> Vec<Complex64> {
         .expect("failed to load UHD image")
         .to_luma8();
 
-    assert_eq!(image.width() as usize, UHD_WIDTH);
-    assert_eq!(image.height() as usize, UHD_HEIGHT);
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+
+    assert!(
+        (width == UHD_WIDTH && height == UHD_HEIGHT) || (width == IMAGE_DIM && height == IMAGE_DIM),
+        "expected 3840x2160 or 4096x4096 grayscale image"
+    );
 
     let mut values = vec![Complex64::new(0.0, 0.0); IMAGE_DIM * IMAGE_DIM];
 
-    for row in 0..UHD_HEIGHT {
-        for col in 0..UHD_WIDTH {
+    for row in 0..height {
+        for col in 0..width {
             let pixel = image.get_pixel(col as u32, row as u32)[0];
             values[row * IMAGE_DIM + col] = Complex64::new(f64::from(pixel) / 255.0, 0.0);
         }
@@ -334,7 +339,7 @@ fn fill_uhd_slots(
     slots
 }
 
-fn validate_uhd_packing(image: &[Complex64]) {
+fn validate_uhd_packing(image: &[Complex64], input_width: usize, input_height: usize) {
     assert_eq!(image.len(), IMAGE_DIM * IMAGE_DIM);
 
     let mut reconstructed = vec![Complex64::new(0.0, 0.0); IMAGE_DIM * IMAGE_DIM];
@@ -378,7 +383,7 @@ fn validate_uhd_packing(image: &[Complex64]) {
                             let error = (slots[slot] - image[index]).norm();
                             max_abs_error = max_abs_error.max(error);
 
-                            if (global_row >= UHD_HEIGHT || global_col >= UHD_WIDTH)
+                            if (global_row >= input_height || global_col >= input_width)
                                 && slots[slot].norm() != 0.0
                             {
                                 padding_nonzero += 1;
@@ -749,6 +754,10 @@ fn main() {
         .nth(1)
         .expect("usage: ckks_packed_uhd_fft_validation <uhd-image>");
 
+    let input_image = image::open(&input_path).expect("failed to inspect input image");
+    let input_width = input_image.width() as usize;
+    let input_height = input_image.height() as usize;
+
     let oracle_input = load_normalized_uhd_image(Path::new(&input_path));
 
     assert!(
@@ -760,7 +769,7 @@ fn main() {
 
     println!("R21_UHD_INPUT_RANGE_STATUS=PASS");
 
-    validate_uhd_packing(&oracle_input);
+    validate_uhd_packing(&oracle_input, input_width, input_height);
 
     if std::env::var("R21_UHD_PREFLIGHT_ONLY").as_deref() == Ok("1") {
         println!("R21_UHD_PREFLIGHT_ONLY=PASS");
@@ -768,10 +777,17 @@ fn main() {
     }
 
     println!("R21_UHD_INPUT={input_path}");
-    println!("R21_UHD_INPUT_DIMENSION=3840x2160");
+    println!("R21_UHD_INPUT_DIMENSION={input_width}x{input_height}");
     println!("R21_UHD_FFT_DIMENSION=4096x4096");
     println!("R21_UHD_INPUT_SCALE=NORMALIZED_0_TO_1");
-    println!("R21_UHD_PADDING=ZERO");
+    println!(
+        "R21_UHD_PADDING={}",
+        if input_width == IMAGE_DIM && input_height == IMAGE_DIM {
+            "NONE"
+        } else {
+            "ZERO"
+        }
+    );
     println!("R21_UHD_SECURITY_BEARING=false");
 
     let oracle = fft2_pp(

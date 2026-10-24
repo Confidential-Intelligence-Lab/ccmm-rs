@@ -1,0 +1,1 @@
+7939621968e32052bbf47a67de3639825418b483d22a37b7139c01be3861f7b3  results/image_filter/source/benchmarks/fhe_fft_architecture_gray_4096x4096.png
