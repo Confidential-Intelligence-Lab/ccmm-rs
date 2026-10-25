@@ -112,6 +112,13 @@ fn decode(
 
 #[test]
 fn r16_5_18h5_fft256_precision_characterization() {
+    let hybrid_base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
+        .ok()
+        .map(|value| value.parse().expect("invalid hybrid gadget base"))
+        .unwrap_or(8);
+    assert!([8, 16, 32].contains(&hybrid_base_log));
+    println!("R30_9A_15_HYBRID_BASE_LOG={hybrid_base_log}");
+
     const DEGREE: usize = 1024;
     const SCALE: f64 = 33_554_432.0;
     const SIGMA: f64 = 3.19;
@@ -265,7 +272,7 @@ fn r16_5_18h5_fft256_precision_characterization() {
                     };
 
                     let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                        BoundedGadgetLayout::new(stage_q.clone(), 8),
+                        BoundedGadgetLayout::new(stage_q.clone(), hybrid_base_log),
                         p.clone(),
                         &secret,
                         exponent,

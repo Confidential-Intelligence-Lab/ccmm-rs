@@ -1259,7 +1259,7 @@ fn batch_large_dft_iterative(
     output
 }
 
-fn batch_large_crt_profiled(
+pub(super) fn batch_large_crt_profiled(
     ciphertexts: &[crate::grafting::RnsRlweCiphertext],
     scalar_degree: usize,
 ) -> (
@@ -2108,6 +2108,20 @@ pub fn batch_ccmm_execute(
     dimension: usize,
     context: &BatchCcmmExecutionContext<'_>,
 ) -> Vec<crate::ckks::RnsCkksCiphertext> {
+    let resident_rhs = std::env::var("FHE_CCMM_RESIDENT_RHS")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+
+    batch_ccmm_execute_with_resident_rhs(lhs, rhs, dimension, context, resident_rhs)
+}
+
+fn batch_ccmm_execute_with_resident_rhs(
+    lhs: &[crate::grafting::RnsRlweCiphertext],
+    rhs: &[crate::grafting::RnsRlweCiphertext],
+    dimension: usize,
+    context: &BatchCcmmExecutionContext<'_>,
+    resident_rhs: bool,
+) -> Vec<crate::ckks::RnsCkksCiphertext> {
     let scalar_plan = context.scalar_plan;
     let prepared_scalar_plan = context.prepared_scalar_plan;
     let prepared_large_plan = context.prepared_large_plan;
@@ -2178,39 +2192,79 @@ pub fn batch_ccmm_execute(
     assert_eq!(lhs_mod.len(), 2 * dimension);
 
     // ----------------------------------------------------------
-    // 2. Default coefficient-domain RHS C-MT.
-    // ----------------------------------------------------------
+    // 2-4. RHS C-MT, ranked slicing, and modular GEMM.
+    //
+    // Default: established coefficient-domain implementation.
+    // Opt-in: NTT-resident RHS execution.
 
-    let rhs_t = batch_ciphertext_transpose_prepared_dynamic(
-        rhs,
-        scalar_degree,
-        prepared_galois_keys,
-        prepared_large_plan,
-    );
+    let product_mod = if resident_rhs {
+        let canonical_large_plan = crate::ring::RnsNttPlan::new(
+            prepared_large_plan.moduli().to_vec(),
+            prepared_large_plan.degree(),
+        );
 
-    // ----------------------------------------------------------
-    // 3. Ranked slice and transpose RHS.
-    // ----------------------------------------------------------
+        let canonical_scalar_plan = scalar_plan;
 
-    let rhs_t_mod = batch_ccmm_slice_ranked(&rhs_t, dimension);
+        let rhs_t_ntt = super::batch_resident::batch_ciphertext_transpose_resident(
+            rhs,
+            scalar_degree,
+            prepared_galois_keys,
+            prepared_large_plan,
+            &canonical_large_plan,
+        );
 
-    assert_eq!(rhs_t_mod.len(), 2 * dimension);
+        let rhs_t_mod_ntt = super::batch_resident::batch_ccmm_slice_ranked_resident_ntt(
+            &rhs_t_ntt,
+            dimension,
+            &canonical_large_plan,
+            canonical_scalar_plan,
+        );
 
-    let rhs_t_mod_t = batch_ccmm_transpose_matrix(&rhs_t_mod);
+        assert_eq!(rhs_t_mod_ntt.len(), 2 * dimension);
 
-    assert_eq!(rhs_t_mod_t.len(), dimension);
+        // Transpose scalar-ring RHS while preserving NTT representation.
+        let rows = rhs_t_mod_ntt.len();
+        let columns = rhs_t_mod_ntt[0].len();
 
-    assert!(rhs_t_mod_t.iter().all(|row| row.len() == 2 * dimension));
+        assert!(rhs_t_mod_ntt.iter().all(|row| row.len() == columns));
 
-    // ----------------------------------------------------------
-    // 4. Delayed-reduction modular matrix multiplication.
-    // ----------------------------------------------------------
+        let rhs_t_mod_t_ntt: Vec<Vec<crate::ring::RnsNttPolynomial>> = (0..columns)
+            .map(|column| {
+                (0..rows)
+                    .map(|row| rhs_t_mod_ntt[row][column].clone())
+                    .collect()
+            })
+            .collect();
 
-    let product_mod =
-        batch_ccmm_modular_product_delayed_ntt(&lhs_mod, &rhs_t_mod_t, prepared_scalar_plan);
+        assert_eq!(rhs_t_mod_t_ntt.len(), dimension);
+        assert!(rhs_t_mod_t_ntt.iter().all(|row| row.len() == 2 * dimension));
+
+        super::batch_resident::batch_ccmm_modular_product_delayed_ntt_rhs_resident(
+            &lhs_mod,
+            &rhs_t_mod_t_ntt,
+            prepared_scalar_plan,
+        )
+    } else {
+        let rhs_t = batch_ciphertext_transpose_prepared_dynamic(
+            rhs,
+            scalar_degree,
+            prepared_galois_keys,
+            prepared_large_plan,
+        );
+
+        let rhs_t_mod = batch_ccmm_slice_ranked(&rhs_t, dimension);
+
+        assert_eq!(rhs_t_mod.len(), 2 * dimension);
+
+        let rhs_t_mod_t = batch_ccmm_transpose_matrix(&rhs_t_mod);
+
+        assert_eq!(rhs_t_mod_t.len(), dimension);
+        assert!(rhs_t_mod_t.iter().all(|row| row.len() == 2 * dimension));
+
+        batch_ccmm_modular_product_delayed_ntt(&lhs_mod, &rhs_t_mod_t, prepared_scalar_plan)
+    };
 
     assert_eq!(product_mod.len(), 2 * dimension);
-
     assert!(product_mod.iter().all(|row| row.len() == 2 * dimension));
 
     // ----------------------------------------------------------
@@ -4556,67 +4610,6 @@ mod sinc_tests {
         )
     }
 
-    fn batch_ccmm_slice_ranked_resident_ntt(
-        ciphertexts: &[crate::grafting::RnsNttRlweCiphertext],
-        dimension: usize,
-        large_plan: &crate::ring::RnsNttPlan,
-        scalar_plan: &crate::ring::RnsNttPlan,
-    ) -> Vec<Vec<crate::ring::RnsNttPolynomial>> {
-        assert!(!ciphertexts.is_empty());
-        assert!(dimension > 0);
-
-        let sliced: Vec<_> = ciphertexts
-            .iter()
-            .map(|ciphertext| {
-                assert_eq!(
-                    ciphertext.degree(),
-                    large_plan.degree(),
-                    "resident Batch CCMM ciphertext degree must match large NTT plan"
-                );
-
-                assert_eq!(
-                    ciphertext.moduli(),
-                    large_plan.moduli(),
-                    "resident Batch CCMM ciphertext basis must match large NTT plan"
-                );
-
-                let b_rows = batch_large_ntt_to_scalar_ntt_radix2(
-                    ciphertext.b(),
-                    dimension,
-                    large_plan,
-                    scalar_plan,
-                );
-
-                let a_rows = batch_large_ntt_to_scalar_ntt_radix2(
-                    ciphertext.a(),
-                    dimension,
-                    large_plan,
-                    scalar_plan,
-                );
-
-                assert_eq!(b_rows.len(), dimension);
-                assert_eq!(a_rows.len(), dimension);
-
-                (b_rows, a_rows)
-            })
-            .collect();
-
-        (0..2 * dimension)
-            .map(|ranked_row| {
-                sliced
-                    .iter()
-                    .map(|(b_rows, a_rows)| {
-                        if ranked_row < dimension {
-                            b_rows[ranked_row].clone()
-                        } else {
-                            a_rows[ranked_row - dimension].clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
     /// Exact Rust analogue of MatrixCutter::slice for rank-1 RLWE.
     ///
     /// The authors use rankedRow(num_row, rank, row):
@@ -5034,290 +5027,6 @@ mod sinc_tests {
 
         println!(
             "BATCH_CCMM_DELAYED_PHASE_FORWARD_NTT_MS={:.3}",
-            forward_elapsed.as_secs_f64() * 1.0e3
-        );
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_LAYER_MATERIALIZE_MS={:.3}",
-            materialize_elapsed.as_secs_f64() * 1.0e3
-        );
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_ACCUMULATE_MS={:.3}",
-            accumulate_elapsed.as_secs_f64() * 1.0e3
-        );
-
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_REDUCTION_MS={:.3}",
-            reduction_elapsed.as_secs_f64() * 1.0e3
-        );
-
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_GEMM_MS={:.3}",
-            gemm_elapsed.as_secs_f64() * 1.0e3
-        );
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_ASSEMBLE_NTT_MS={:.3}",
-            assemble_elapsed.as_secs_f64() * 1.0e3
-        );
-
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_INVERSE_NTT_MS={:.3}",
-            inverse_elapsed.as_secs_f64() * 1.0e3
-        );
-
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_RECONSTRUCT_INVERSE_MS={:.3}",
-            reconstruct_elapsed.as_secs_f64() * 1.0e3
-        );
-
-        output
-    }
-
-    fn batch_ccmm_modular_product_delayed_ntt_rhs_resident(
-        lhs: &[Vec<crate::ring::RnsPolynomial>],
-        rhs_transposed_ntt: &[Vec<crate::ring::RnsNttPolynomial>],
-        plan: &crate::ring::PreparedRnsNttPlan,
-    ) -> Vec<Vec<crate::ring::RnsPolynomial>> {
-        let block = std::env::var("CCMM_GEMM_BLOCK")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(128);
-
-        assert!(block > 0, "CCMM GEMM block size must be nonzero");
-
-        assert!(!lhs.is_empty(), "Batch CCMM lhs must not be empty");
-        assert!(
-            !rhs_transposed_ntt.is_empty(),
-            "Batch CCMM rhs must not be empty"
-        );
-
-        let output_rows = lhs.len();
-        let inner = lhs[0].len();
-
-        assert!(inner > 0);
-        assert!(lhs.iter().all(|row| row.len() == inner));
-
-        assert_eq!(
-            rhs_transposed_ntt.len(),
-            inner,
-            "Batch CCMM modular inner dimensions must match"
-        );
-
-        let output_columns = rhs_transposed_ntt[0].len();
-
-        assert!(output_columns > 0);
-        assert!(rhs_transposed_ntt
-            .iter()
-            .all(|row| row.len() == output_columns));
-
-        let degree = plan.degree();
-        let limb_count = plan.moduli().len();
-
-        // Transform each polynomial matrix entry exactly once.
-        let forward_start = std::time::Instant::now();
-
-        let lhs_ntt: Vec<Vec<crate::ring::RnsNttPolynomial>> = lhs
-            .iter()
-            .map(|row| row.iter().map(|entry| plan.forward(entry)).collect())
-            .collect();
-
-        let rhs_ntt = rhs_transposed_ntt;
-
-        let forward_elapsed = forward_start.elapsed();
-
-        let output_layer_size = output_rows * output_columns;
-
-        // [limb][coordinate][row * output_columns + column]
-        let mut output_layers = vec![vec![vec![0_u64; output_layer_size]; degree]; limb_count];
-
-        let mut materialize_elapsed = std::time::Duration::ZERO;
-        let mut gemm_elapsed = std::time::Duration::ZERO;
-
-        let mut limb_materialize_elapsed = vec![std::time::Duration::ZERO; limb_count];
-
-        let mut limb_gemm_elapsed = vec![std::time::Duration::ZERO; limb_count];
-
-        let mut accumulate_elapsed = std::time::Duration::ZERO;
-
-        let mut reduction_elapsed = std::time::Duration::ZERO;
-
-        let mut limb_accumulate_elapsed = vec![std::time::Duration::ZERO; limb_count];
-
-        let mut limb_reduction_elapsed = vec![std::time::Duration::ZERO; limb_count];
-
-        for (limb_index, output_limb_layers) in
-            output_layers.iter_mut().enumerate().take(limb_count)
-        {
-            let modulus = plan.moduli()[limb_index];
-            let q = u128::from(modulus.value());
-
-            let max_product = (q - 1) * (q - 1);
-
-            max_product
-                .checked_mul(inner as u128)
-                .expect("CCMM delayed-reduction dot product must fit in u128");
-
-            for (coordinate, output_layer) in output_limb_layers.iter_mut().enumerate().take(degree)
-            {
-                let materialize_start = std::time::Instant::now();
-
-                let mut lhs_layer = vec![0_u64; output_rows * inner];
-
-                let mut rhs_layer = vec![0_u64; inner * output_columns];
-
-                for row in 0..output_rows {
-                    for k in 0..inner {
-                        lhs_layer[row * inner + k] =
-                            lhs_ntt[row][k].residue(limb_index).values()[coordinate];
-                    }
-                }
-
-                for k in 0..inner {
-                    for column in 0..output_columns {
-                        rhs_layer[k * output_columns + column] =
-                            rhs_ntt[k][column].residue(limb_index).values()[coordinate];
-                    }
-                }
-
-                let materialize_coordinate_elapsed = materialize_start.elapsed();
-
-                materialize_elapsed += materialize_coordinate_elapsed;
-
-                limb_materialize_elapsed[limb_index] += materialize_coordinate_elapsed;
-
-                let mut wide = vec![0_u128; output_layer_size];
-
-                let gemm_start = std::time::Instant::now();
-
-                let accumulate_start = std::time::Instant::now();
-
-                // Dense blocked i-k-j multiplication with no modular
-                // reduction in the cubic loop.
-                for ii in (0..output_rows).step_by(block) {
-                    let i_end = (ii + block).min(output_rows);
-
-                    for kk in (0..inner).step_by(block) {
-                        let k_end = (kk + block).min(inner);
-
-                        for jj in (0..output_columns).step_by(block) {
-                            let j_end = (jj + block).min(output_columns);
-
-                            for row in ii..i_end {
-                                let lhs_base = row * inner;
-
-                                let out_base = row * output_columns;
-
-                                for k in kk..k_end {
-                                    let lhs_value = u128::from(lhs_layer[lhs_base + k]);
-
-                                    let rhs_base = k * output_columns;
-
-                                    for column in jj..j_end {
-                                        let rhs_value = u128::from(rhs_layer[rhs_base + column]);
-
-                                        wide[out_base + column] += lhs_value * rhs_value;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let accumulate_coordinate_elapsed = accumulate_start.elapsed();
-
-                accumulate_elapsed += accumulate_coordinate_elapsed;
-
-                limb_accumulate_elapsed[limb_index] += accumulate_coordinate_elapsed;
-
-                let reduction_start = std::time::Instant::now();
-
-                // One exact reduction per output matrix entry.
-                for index in 0..output_layer_size {
-                    output_layer[index] = (wide[index] % q) as u64;
-                }
-
-                let reduction_coordinate_elapsed = reduction_start.elapsed();
-
-                reduction_elapsed += reduction_coordinate_elapsed;
-
-                limb_reduction_elapsed[limb_index] += reduction_coordinate_elapsed;
-
-                let gemm_coordinate_elapsed = gemm_start.elapsed();
-
-                gemm_elapsed += gemm_coordinate_elapsed;
-
-                limb_gemm_elapsed[limb_index] += gemm_coordinate_elapsed;
-            }
-        }
-
-        for limb_index in 0..limb_count {
-            println!(
-                "BATCH_CCMM_DELAYED_LIMB_{}_MATERIALIZE_MS={:.3}",
-                limb_index,
-                limb_materialize_elapsed[limb_index].as_secs_f64() * 1.0e3
-            );
-
-            println!(
-                "BATCH_CCMM_DELAYED_LIMB_{}_GEMM_MS={:.3}",
-                limb_index,
-                limb_gemm_elapsed[limb_index].as_secs_f64() * 1.0e3
-            );
-
-            println!(
-                "BATCH_CCMM_DELAYED_LIMB_{}_ACCUMULATE_MS={:.3}",
-                limb_index,
-                limb_accumulate_elapsed[limb_index].as_secs_f64() * 1.0e3
-            );
-
-            println!(
-                "BATCH_CCMM_DELAYED_LIMB_{}_REDUCTION_MS={:.3}",
-                limb_index,
-                limb_reduction_elapsed[limb_index].as_secs_f64() * 1.0e3
-            );
-        }
-
-        let assemble_start = std::time::Instant::now();
-
-        let output_ntt: Vec<Vec<crate::ring::RnsNttPolynomial>> = (0..output_rows)
-            .map(|row| {
-                (0..output_columns)
-                    .map(|column| {
-                        let residues = (0..limb_count)
-                            .map(|limb_index| {
-                                let values: Vec<u64> = (0..degree)
-                                    .map(|coordinate| {
-                                        output_layers[limb_index][coordinate]
-                                            [row * output_columns + column]
-                                    })
-                                    .collect();
-
-                                crate::ring::NttPolynomial::from_prepared_values(
-                                    plan.plan(limb_index),
-                                    values,
-                                )
-                            })
-                            .collect();
-
-                        crate::ring::RnsNttPolynomial::from_residues(residues)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let assemble_elapsed = assemble_start.elapsed();
-
-        let inverse_start = std::time::Instant::now();
-
-        let output: Vec<Vec<crate::ring::RnsPolynomial>> = output_ntt
-            .iter()
-            .map(|row| row.iter().map(|ntt| plan.inverse(ntt)).collect())
-            .collect();
-
-        let inverse_elapsed = inverse_start.elapsed();
-
-        let reconstruct_elapsed = assemble_elapsed + inverse_elapsed;
-
-        println!(
-            "BATCH_CCMM_DELAYED_PHASE_FORWARD_NTT_RHS_RESIDENT_MS={:.3}",
             forward_elapsed.as_secs_f64() * 1.0e3
         );
         println!(
@@ -6423,6 +6132,42 @@ mod sinc_tests {
             .map(|key| crate::ckks::PreparedRnsGaloisKey::new(key, &plan))
             .collect();
 
+        // R30.17h.1e: compare against the actual production C-MT,
+        // not the older test-local implementation.
+        let prepared_plan = crate::ring::PreparedRnsNttPlan::new(&plan);
+
+        let production_transposed = super::batch_ciphertext_transpose_prepared_dynamic(
+            &ciphertexts,
+            SCALAR_DEGREE,
+            &prepared_galois_keys,
+            &prepared_plan,
+        );
+
+        let resident_transposed = crate::ccmm::batch_resident::batch_ciphertext_transpose_resident(
+            &ciphertexts,
+            SCALAR_DEGREE,
+            &prepared_galois_keys,
+            &prepared_plan,
+            &plan,
+        );
+
+        assert_eq!(resident_transposed.len(), production_transposed.len());
+
+        for (column, (resident, production)) in resident_transposed
+            .iter()
+            .zip(production_transposed.iter())
+            .enumerate()
+        {
+            let resident_coefficient = resident.to_coefficient(&prepared_plan);
+
+            assert_eq!(
+                &resident_coefficient, production,
+                "R30.17h resident C-MT ciphertext mismatch at column {column}"
+            );
+        }
+
+        println!("R30_17H_RESIDENT_CMT_EXACT=PASS");
+
         let transposed =
             batch_ciphertext_transpose(&ciphertexts, SCALAR_DEGREE, &prepared_galois_keys, &plan);
 
@@ -7129,7 +6874,11 @@ mod sinc_tests {
         let expected = batch_ccmm_modular_product_delayed_ntt(&lhs, &rhs, &prepared_plan);
 
         let actual =
-            batch_ccmm_modular_product_delayed_ntt_rhs_resident(&lhs, &rhs_ntt, &prepared_plan);
+            crate::ccmm::batch_resident::batch_ccmm_modular_product_delayed_ntt_rhs_resident(
+                &lhs,
+                &rhs_ntt,
+                &prepared_plan,
+            );
 
         assert_eq!(
             actual, expected,
@@ -7225,7 +6974,7 @@ mod sinc_tests {
         //   -> direct O18d bridge
         //   -> ranked scalar-ring NTT slices
         //   -> transpose.
-        let direct_ranked = batch_ccmm_slice_ranked_resident_ntt(
+        let direct_ranked = crate::ccmm::batch_resident::batch_ccmm_slice_ranked_resident_ntt(
             &resident_ciphertexts,
             dimension,
             &large_plan,
@@ -7360,7 +7109,7 @@ mod sinc_tests {
                 &scalar_plan,
             );
 
-            let actual = batch_large_ntt_to_scalar_ntt_radix2(
+            let actual = crate::ccmm::batch_resident::batch_large_ntt_to_scalar_ntt_radix2(
                 &large_ntt,
                 dimension,
                 &large_plan,
@@ -7468,6 +7217,75 @@ mod sinc_tests {
         }
 
         println!("O18D_ROOT_RELATION=PASS");
+    }
+
+    #[test]
+    fn r30_17h_resident_inverse_crt_matches_coefficient_exactly() {
+        let basis = crate::ring::ModulusBasis::new(sd3b_moduli());
+
+        for &(dimension, scalar_degree) in &[(4_usize, 8_usize), (8_usize, 8_usize)] {
+            let degree = dimension * scalar_degree;
+            let plan = crate::ring::RnsNttPlan::new(basis.moduli().to_vec(), degree);
+            let prepared = crate::ring::PreparedRnsNttPlan::new(&plan);
+
+            let make_polynomial = |seed: u64| {
+                crate::ring::RnsPolynomial::from_residues(
+                    basis
+                        .moduli()
+                        .iter()
+                        .enumerate()
+                        .map(|(limb, &modulus)| {
+                            crate::ring::Polynomial::new(
+                                modulus,
+                                (0..degree)
+                                    .map(|i| {
+                                        (seed + 17 * i as u64 + 13 * limb as u64) % modulus.value()
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            };
+
+            let coefficient: Vec<_> = (0..dimension)
+                .map(|index| {
+                    let b = make_polynomial(19 + 101 * index as u64);
+                    let a = make_polynomial(53 + 131 * index as u64);
+
+                    crate::grafting::RnsRlweCiphertext::from_limbs(
+                        b.residues()
+                            .iter()
+                            .zip(a.residues())
+                            .map(|(b, a)| crate::rlwe::RlweCiphertext::new(b.clone(), a.clone()))
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            let resident: Vec<_> = coefficient
+                .iter()
+                .map(|ct| crate::grafting::RnsNttRlweCiphertext::from_coefficient(ct, &prepared))
+                .collect();
+
+            let expected = batch_large_inv_crt(&coefficient, scalar_degree);
+
+            let actual = crate::ccmm::batch_resident::batch_large_inv_crt_ntt_resident(
+                &resident,
+                scalar_degree,
+                &plan,
+            )
+            .iter()
+            .map(|ct| ct.to_coefficient(&prepared))
+            .collect::<Vec<_>>();
+
+            assert_eq!(
+                actual, expected,
+                "R30.17h resident inverse CRT must exactly match coefficient CRT"
+            );
+        }
+
+        println!("R30_17H_RESIDENT_INVERSE_CRT_EXACT=PASS");
     }
 
     #[test]
@@ -8293,18 +8111,70 @@ mod sinc_tests {
             scale,
         };
 
-        let geometry = crate::eblas::BatchGemmGeometry::new(
-            crate::eblas::BatchGemmMechanism::Ccmm,
-            dimension,
-            scalar_degree,
-            LARGE_DEGREE,
-        );
-
         let matrix_mult_start = std::time::Instant::now();
 
-        let output_ciphertexts = crate::eblas::batch_gemm_ccmm(geometry, &lhs, &rhs, &context);
+        // R30.17h.2d: reference and resident execution use
+        // exactly the same encrypted operands and evaluation keys.
+        let output_ciphertexts =
+            super::batch_ccmm_execute_with_resident_rhs(&lhs, &rhs, dimension, &context, false);
 
-        let matrix_mult_elapsed = matrix_mult_start.elapsed();
+        let reference_elapsed = matrix_mult_start.elapsed();
+
+        println!(
+            "R30_17H_REFERENCE_CCMM_MS={:.3}",
+            reference_elapsed.as_secs_f64() * 1.0e3
+        );
+
+        let resident_start = std::time::Instant::now();
+
+        let resident_ciphertexts =
+            super::batch_ccmm_execute_with_resident_rhs(&lhs, &rhs, dimension, &context, true);
+
+        let resident_elapsed = resident_start.elapsed();
+
+        assert_eq!(
+            output_ciphertexts.len(),
+            resident_ciphertexts.len(),
+            "Resident CCMM output column count mismatch"
+        );
+
+        for (column, (reference, resident)) in output_ciphertexts
+            .iter()
+            .zip(resident_ciphertexts.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                reference.rlwe(),
+                resident.rlwe(),
+                "Resident CCMM RLWE mismatch at output column {column}"
+            );
+
+            assert_eq!(
+                reference.level(),
+                resident.level(),
+                "Resident CCMM CKKS level mismatch at column {column}"
+            );
+
+            assert_eq!(
+                reference.scale(),
+                resident.scale(),
+                "Resident CCMM CKKS scale mismatch at column {column}"
+            );
+
+            assert_eq!(
+                reference.basis(),
+                resident.basis(),
+                "Resident CCMM CKKS basis mismatch at column {column}"
+            );
+        }
+
+        println!(
+            "R30_17H_RESIDENT_RHS_CCMM_MS={:.3}",
+            resident_elapsed.as_secs_f64() * 1.0e3
+        );
+        println!("R30_17H_RESIDENT_RHS_CCMM_EXACT=PASS");
+
+        let matrix_mult_elapsed = reference_elapsed;
 
         assert!(output_ciphertexts
             .iter()

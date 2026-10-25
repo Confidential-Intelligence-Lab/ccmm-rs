@@ -46,7 +46,9 @@ pub use rns_key_switch::{
 pub mod rns_key_switch;
 pub use rns_gadget::{RnsGadgetBlock, RnsGadgetDecomposition, RnsGadgetLayout};
 pub mod rns_gadget;
-pub use bounded_gadget::{BoundedGadgetDecomposition, BoundedGadgetLayout};
+pub use bounded_gadget::{
+    BoundedGadgetDecomposition, BoundedGadgetLayout, PreparedCanonicalGaloisSource,
+};
 pub mod bounded_gadget;
 pub use bounded_key_switch::{
     bounded_rns_relinearize_with_ntt, bounded_rns_relinearize_with_ntt_observed,
@@ -289,3 +291,6 @@ mod tests {
 
 #[cfg(test)]
 mod differential;
+
+pub mod ordinary_ntt;
+pub use ordinary_ntt::{hybrid_relinearize_ordinary_ntt_prepared, PreparedOrdinaryNttKey};

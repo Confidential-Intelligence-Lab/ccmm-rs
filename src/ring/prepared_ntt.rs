@@ -61,6 +61,52 @@ impl PreparedNttPlan {
         self.degree
     }
 
+    // R36_5E2_OWNED_FORWARD
+    /// Applies the prepared forward NTT to an owned vector of
+    /// canonical coefficient residues, avoiding an intermediate copy.
+    // R36_5F3_PREPARED_FORWARD_OWNED
+    /// Experimental owned-vector forward NTT with prepared butterfly arithmetic.
+    pub fn forward_owned_prepared_mul(&self, mut values: Vec<u64>) -> Vec<u64> {
+        assert_eq!(
+            values.len(),
+            self.degree,
+            "coefficient count must match prepared NTT degree"
+        );
+        assert!(
+            values.iter().all(|&value| value < self.modulus.value()),
+            "forward_owned_prepared_mul requires canonical residues"
+        );
+
+        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
+            *value = self.prepared_modulus.mul_canonical(*value, twist);
+        }
+
+        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
+
+        values
+    }
+
+    pub fn forward_owned(&self, mut values: Vec<u64>) -> Vec<u64> {
+        assert_eq!(
+            values.len(),
+            self.degree,
+            "coefficient count must match prepared NTT degree"
+        );
+        assert!(
+            values.iter().all(|&value| value < self.modulus.value()),
+            "forward_owned requires canonical residues"
+        );
+
+        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
+            *value = self.prepared_modulus.mul_canonical(*value, twist);
+        }
+
+        // R36_5F5_PRODUCTION_FORWARD_PROMOTION
+        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
+
+        values
+    }
+
     pub fn forward(&self, polynomial: &Polynomial) -> Vec<u64> {
         assert_eq!(
             polynomial.modulus(),
@@ -79,7 +125,7 @@ impl PreparedNttPlan {
             *value = self.prepared_modulus.mul_canonical(*value, twist);
         }
 
-        cyclic_ntt_prepared(&mut values, self.modulus, &self.forward_stage_twiddles);
+        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
 
         values
     }
@@ -165,6 +211,40 @@ impl PreparedNttPlan {
         }
 
         batch
+    }
+
+    // R36_5G1_PREPARED_INVERSE
+    /// Experimental inverse NTT using prepared modular multiplication.
+    ///
+    /// The standard inverse() remains the reference implementation.
+    pub fn inverse_prepared_mul(&self, values: &[u64]) -> Polynomial {
+        assert_eq!(
+            values.len(),
+            self.degree,
+            "NTT value count must match prepared NTT degree"
+        );
+        assert!(
+            values.iter().all(|&value| value < self.modulus.value()),
+            "inverse_prepared_mul requires canonical residues"
+        );
+
+        let mut coefficients = values.to_vec();
+
+        cyclic_ntt_prepared_mul(
+            &mut coefficients,
+            self.modulus,
+            &self.inverse_stage_twiddles,
+        );
+
+        for (coefficient, &untwist) in coefficients.iter_mut().zip(&self.inverse_twists) {
+            *coefficient = self
+                .prepared_modulus
+                .mul_canonical(*coefficient, self.degree_inverse);
+
+            *coefficient = self.prepared_modulus.mul_canonical(*coefficient, untwist);
+        }
+
+        Polynomial::new(self.modulus, coefficients)
     }
 
     pub fn inverse(&self, values: &[u64]) -> Polynomial {
@@ -267,6 +347,48 @@ fn cyclic_ntt_prepared(values: &mut [u64], modulus: Modulus, stage_twiddles: &[V
     }
 }
 
+// R36_5F2_PREPARED_BUTTERFLY
+fn cyclic_ntt_prepared_mul(values: &mut [u64], modulus: Modulus, stage_twiddles: &[Vec<u64>]) {
+    assert!(
+        !values.is_empty() && values.len().is_power_of_two(),
+        "radix-2 NTT length must be a positive power of two"
+    );
+
+    assert_eq!(
+        stage_twiddles.len(),
+        values.len().trailing_zeros() as usize,
+        "prepared NTT stage count must match transform degree"
+    );
+
+    let prepared_modulus = PreparedModulus::new(modulus);
+
+    bit_reverse_permute(values);
+
+    let mut len = 2_usize;
+
+    for twiddles in stage_twiddles {
+        let half = len / 2;
+
+        assert_eq!(
+            twiddles.len(),
+            half,
+            "prepared NTT twiddle count must match stage width"
+        );
+
+        for start in (0..values.len()).step_by(len) {
+            for (offset, &twiddle) in twiddles.iter().enumerate() {
+                let even = values[start + offset];
+                let odd = prepared_modulus.mul_canonical(values[start + offset + half], twiddle);
+
+                values[start + offset] = modulus.add_canonical(even, odd);
+                values[start + offset + half] = modulus.sub_canonical(even, odd);
+            }
+        }
+
+        len *= 2;
+    }
+}
+
 fn bit_reverse_permute(values: &mut [u64]) {
     let n = values.len();
     let mut j = 0_usize;
@@ -290,6 +412,137 @@ fn bit_reverse_permute(values: &mut [u64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R36_5F2_BUTTERFLY_EQUIVALENCE
+    #[test]
+    fn r36_5f2_prepared_butterfly_equivalence() {
+        for (degree, q) in [
+            (16_usize, 268_238_849_u64),
+            (256, 268_238_849),
+            (8192, 68_712_923_137),
+            (65536, 68_712_923_137),
+        ] {
+            let modulus = Modulus::new(q);
+            let plan = crate::ring::make_ntt_plan(modulus, degree);
+            let prepared = PreparedNttPlan::new(&plan);
+
+            let original: Vec<u64> = (0..degree)
+                .map(|index| {
+                    let x = index as u64;
+                    (x.wrapping_mul(37).wrapping_add(19)) % q
+                })
+                .collect();
+
+            let mut reference = original.clone();
+            let mut candidate = original;
+
+            cyclic_ntt_prepared(&mut reference, modulus, &prepared.forward_stage_twiddles);
+
+            cyclic_ntt_prepared_mul(&mut candidate, modulus, &prepared.forward_stage_twiddles);
+
+            assert_eq!(
+                reference, candidate,
+                "R36.5F.2 mismatch degree={degree} modulus={q}"
+            );
+
+            println!(
+                "R36_5F2_EQUIVALENCE degree={} modulus={} status=PASS",
+                degree, q
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn r36_5f2_prepared_butterfly_ab_benchmark() {
+        use std::time::Instant;
+
+        let degree = 65536_usize;
+        let modulus = Modulus::new(68_712_923_137);
+        let plan = crate::ring::make_ntt_plan(modulus, degree);
+        let prepared = PreparedNttPlan::new(&plan);
+
+        let input: Vec<u64> = (0..degree)
+            .map(|index| {
+                let x = index as u64;
+                (x.wrapping_mul(37).wrapping_add(19)) % modulus.value()
+            })
+            .collect();
+
+        let mut reference_samples = Vec::new();
+        let mut candidate_samples = Vec::new();
+
+        for iteration in 0..9 {
+            let mut reference = input.clone();
+            let mut candidate = input.clone();
+
+            let started = Instant::now();
+            cyclic_ntt_prepared(&mut reference, modulus, &prepared.forward_stage_twiddles);
+            let reference_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            let started = Instant::now();
+            cyclic_ntt_prepared_mul(&mut candidate, modulus, &prepared.forward_stage_twiddles);
+            let candidate_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(reference, candidate);
+
+            println!(
+                "R36_5F2_ITERATION={} warmup={} reference_ms={:.6} candidate_ms={:.6}",
+                iteration,
+                iteration == 0,
+                reference_ms,
+                candidate_ms
+            );
+
+            if iteration != 0 {
+                reference_samples.push(reference_ms);
+                candidate_samples.push(candidate_ms);
+            }
+        }
+
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+
+        println!(
+            "R36_5F2_BUTTERFLY_SPEEDUP={:.6}",
+            mean(&reference_samples) / mean(&candidate_samples)
+        );
+        println!("R36_5F2_EXACT_EQUIVALENCE=PASS");
+    }
+
+    // R36_5F3_COMPLETE_FORWARD_EQUIVALENCE
+    #[test]
+    fn r36_5f3_prepared_forward_exact_equivalence() {
+        for (degree, q) in [
+            (16_usize, 268_238_849_u64),
+            (256, 268_238_849),
+            (8192, 68_712_923_137),
+            (65536, 68_712_923_137),
+        ] {
+            let modulus = Modulus::new(q);
+            let plan = crate::ring::make_ntt_plan(modulus, degree);
+            let prepared = PreparedNttPlan::new(&plan);
+
+            let values: Vec<u64> = (0..degree)
+                .map(|index| {
+                    let x = index as u64;
+                    x.wrapping_mul(37).wrapping_add(19) % q
+                })
+                .collect();
+
+            let reference = prepared.forward_owned(values.clone());
+            let candidate = prepared.forward_owned_prepared_mul(values);
+
+            assert_eq!(
+                reference, candidate,
+                "R36.5F.3 complete forward mismatch degree={degree} q={q}"
+            );
+
+            println!(
+                "R36_5F3_FORWARD_EQUIVALENCE degree={} modulus={} status=PASS",
+                degree, q
+            );
+        }
+    }
 
     fn plan() -> NttPlan {
         NttPlan::new(Modulus::new(97), 8, 8)
@@ -319,6 +572,33 @@ mod tests {
         }
 
         println!("PREPARED_NTT_FORWARD_EQUIVALENCE=PASS");
+    }
+
+    // R36_5E2_OWNED_FORWARD_EQUIVALENCE
+    #[test]
+    fn r36_5e2_owned_forward_matches_prepared_exactly() {
+        for degree in [16_usize, 256, 8192] {
+            let modulus = Modulus::new(268_238_849);
+            let plan = crate::ring::make_ntt_plan(modulus, degree);
+            let prepared = PreparedNttPlan::new(&plan);
+
+            let coefficients: Vec<u64> = (0..degree)
+                .map(|index| {
+                    let x = index as u64;
+                    (11 + 13 * x + 3 * x * x) % modulus.value()
+                })
+                .collect();
+
+            let polynomial = Polynomial::new(modulus, coefficients.clone());
+
+            assert_eq!(
+                prepared.forward_owned(coefficients),
+                prepared.forward(&polynomial),
+                "degree={degree}"
+            );
+        }
+
+        println!("R36_5E2_OWNED_FORWARD_EQUIVALENCE=PASS");
     }
 
     #[test]
@@ -517,6 +797,170 @@ mod tests {
         assert_eq!(actual, reference);
 
         println!("PREPARED_NTT_BATCH_FORWARD_EQUIVALENCE=PASS");
+    }
+
+    // R36_5G1_INVERSE_EQUIVALENCE
+
+    // R36_5G2_PRODUCTION_QP_INVERSE_EQUIVALENCE
+    #[test]
+    fn r36_5g2_production_qp_inverse_equivalence() {
+        use crate::ckks::research_profile_65536_for_levels;
+        use crate::ring::{ModulusBasis, ModulusChain};
+
+        const DEGREE: usize = 65_536;
+
+        let profile = research_profile_65536_for_levels(13, 3);
+        let extended = research_profile_65536_for_levels(15, 3);
+
+        let top = profile.modulus_chain().top().clone();
+        let extended_moduli = extended.modulus_chain().top().moduli().to_vec();
+
+        assert_eq!(top.moduli().len(), 16);
+        assert_eq!(extended_moduli.len(), 18);
+        assert_eq!(&extended_moduli[..16], top.moduli());
+
+        let chain = ModulusChain::from_top_basis(top);
+        let q = chain.level(3).clone();
+        let p = ModulusBasis::new(extended_moduli[16..18].to_vec());
+
+        assert_eq!(q.moduli().len(), 13);
+        assert_eq!(p.moduli().len(), 2);
+
+        let mut qp_moduli = q.moduli().to_vec();
+        qp_moduli.extend_from_slice(p.moduli());
+
+        assert_eq!(qp_moduli.len(), 15);
+
+        for (limb, &modulus) in qp_moduli.iter().enumerate() {
+            let plan = crate::ring::make_ntt_plan(modulus, DEGREE);
+            let prepared = PreparedNttPlan::new(&plan);
+
+            let coefficients: Vec<u64> = (0..DEGREE)
+                .map(|index| {
+                    let x = index as u64;
+                    x.wrapping_mul(37)
+                        .wrapping_add(19)
+                        .wrapping_add(limb as u64)
+                        % modulus.value()
+                })
+                .collect();
+
+            let polynomial = Polynomial::new(modulus, coefficients.clone());
+            let transformed = prepared.forward(&polynomial);
+
+            let reference = prepared.inverse(&transformed);
+            let candidate = prepared.inverse_prepared_mul(&transformed);
+
+            assert_eq!(
+                reference, candidate,
+                "R36.5G.2 inverse mismatch limb={limb}"
+            );
+
+            assert_eq!(
+                candidate.coefficients(),
+                coefficients.as_slice(),
+                "R36.5G.2 roundtrip mismatch limb={limb}"
+            );
+
+            println!(
+                "R36_5G2_QP_LIMB={} modulus={} status=PASS",
+                limb,
+                modulus.value()
+            );
+        }
+
+        println!("R36_5G2_QP_LIMB_COUNT=15");
+        println!("R36_5G2_PRODUCTION_INVERSE_EXACT_STATUS=PASS");
+    }
+
+    #[test]
+    fn r36_5g1_prepared_inverse_exact_equivalence() {
+        for (degree, q) in [
+            (16_usize, 268_238_849_u64),
+            (256, 268_238_849),
+            (8192, 68_712_923_137),
+            (65_536, 68_712_923_137),
+        ] {
+            let modulus = Modulus::new(q);
+            let plan = crate::ring::make_ntt_plan(modulus, degree);
+            let prepared = PreparedNttPlan::new(&plan);
+
+            let values: Vec<u64> = (0..degree)
+                .map(|index| {
+                    let x = index as u64;
+                    x.wrapping_mul(37).wrapping_add(19) % q
+                })
+                .collect();
+
+            let reference = prepared.inverse(&values);
+            let candidate = prepared.inverse_prepared_mul(&values);
+
+            assert_eq!(
+                reference, candidate,
+                "R36.5G.1 inverse mismatch degree={degree} q={q}"
+            );
+
+            println!(
+                "R36_5G1_INVERSE_EQUIVALENCE degree={} modulus={} status=PASS",
+                degree, q
+            );
+        }
+
+        println!("R36_5G1_INVERSE_EXACT_STATUS=PASS");
+    }
+
+    #[test]
+    #[ignore = "isolated inverse NTT performance characterization"]
+    fn r36_5g1_inverse_ab_benchmark() {
+        use std::time::Instant;
+
+        const DEGREE: usize = 65_536;
+        const MODULUS: u64 = 68_712_923_137;
+
+        let modulus = Modulus::new(MODULUS);
+        let plan = crate::ring::make_ntt_plan(modulus, DEGREE);
+        let prepared = PreparedNttPlan::new(&plan);
+
+        let values: Vec<u64> = (0..DEGREE)
+            .map(|index| {
+                let x = index as u64;
+                x.wrapping_mul(37).wrapping_add(19) % MODULUS
+            })
+            .collect();
+
+        let mut reference_total = 0.0_f64;
+        let mut candidate_total = 0.0_f64;
+
+        for iteration in 0..6 {
+            let started = Instant::now();
+            let reference = prepared.inverse(&values);
+            let reference_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            let started = Instant::now();
+            let candidate = prepared.inverse_prepared_mul(&values);
+            let candidate_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(reference, candidate);
+
+            println!(
+                "R36_5G1_ITERATION={} warmup={} reference_ms={:.6} prepared_ms={:.6}",
+                iteration,
+                iteration == 0,
+                reference_ms,
+                candidate_ms
+            );
+
+            if iteration > 0 {
+                reference_total += reference_ms;
+                candidate_total += candidate_ms;
+            }
+        }
+
+        println!(
+            "R36_5G1_INVERSE_SPEEDUP={:.6}",
+            reference_total / candidate_total
+        );
+        println!("R36_5G1_INVERSE_BENCHMARK_EXACT_STATUS=PASS");
     }
 
     #[test]

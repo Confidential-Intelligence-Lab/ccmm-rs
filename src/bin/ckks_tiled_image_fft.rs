@@ -112,6 +112,25 @@ const TOLERANCE: f64 = 5.0e-3;
  */
 const FFT_ENCRYPTION_PARALLELISM: usize = 4;
 const FFT_LOCAL_TILE_PARALLELISM: usize = 2;
+
+// R30_20N_LOCAL_TILE_SCHEDULING
+fn fft_local_tile_workers() -> usize {
+    match std::env::var("FHE_FFT_LOCAL_TILE_WORKERS") {
+        Ok(value) => {
+            let workers: usize = value
+                .parse()
+                .expect("FHE_FFT_LOCAL_TILE_WORKERS must be an integer");
+            assert!(
+                (1..=3).contains(&workers),
+                "FHE_FFT_LOCAL_TILE_WORKERS must be between 1 and 3"
+            );
+            workers
+        }
+        Err(std::env::VarError::NotPresent) => FFT_LOCAL_TILE_PARALLELISM,
+        Err(error) => panic!("cannot read FHE_FFT_LOCAL_TILE_WORKERS: {error}"),
+    }
+}
+
 const FFT_GLOBAL_PAIR_PARALLELISM: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
@@ -1668,7 +1687,10 @@ fn main() {
     println!("FFT_RESOURCE_PLAN_BEGIN");
     println!("FFT_RESOURCE_AVAILABLE_PARALLELISM={available_parallelism}");
     println!("FFT_RESOURCE_ENCRYPTION_PARALLELISM={FFT_ENCRYPTION_PARALLELISM}");
-    println!("FFT_RESOURCE_LOCAL_TILE_PARALLELISM={FFT_LOCAL_TILE_PARALLELISM}");
+    println!(
+        "FFT_RESOURCE_LOCAL_TILE_PARALLELISM={}",
+        fft_local_tile_workers()
+    );
     println!("FFT_RESOURCE_GLOBAL_PAIR_PARALLELISM={FFT_GLOBAL_PAIR_PARALLELISM}");
     println!("FFT_RESOURCE_KEYGEN_PARALLELISM=2");
     println!("FFT_RESOURCE_ROTATION_PARALLELISM=2");
@@ -2300,8 +2322,8 @@ fn main() {
 
             let mut stage_results = Vec::with_capacity(tile_count);
 
-            for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
-                let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+            for batch_start in (0..tile_count).step_by(fft_local_tile_workers()) {
+                let batch_end = (batch_start + fft_local_tile_workers()).min(tile_count);
 
                 let batch = std::thread::scope(|scope| {
                     let mut workers = Vec::with_capacity(batch_end - batch_start);
@@ -2565,8 +2587,8 @@ fn main() {
 
             let mut stage_results = Vec::with_capacity(tile_count);
 
-            for batch_start in (0..tile_count).step_by(FFT_LOCAL_TILE_PARALLELISM) {
-                let batch_end = (batch_start + FFT_LOCAL_TILE_PARALLELISM).min(tile_count);
+            for batch_start in (0..tile_count).step_by(fft_local_tile_workers()) {
+                let batch_end = (batch_start + fft_local_tile_workers()).min(tile_count);
 
                 let batch = std::thread::scope(|scope| {
                     let mut workers = Vec::with_capacity(batch_end - batch_start);

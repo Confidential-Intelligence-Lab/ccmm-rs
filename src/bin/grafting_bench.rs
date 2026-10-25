@@ -5,11 +5,12 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 use ccmm_rs::grafting::{
-    hybrid_relinearize, hybrid_relinearize_helper_prime, hybrid_relinearize_prepared,
-    HelperPrimeNttPlan, HybridMultiplicationKey, HybridQuadraticCiphertext, MixedGadgetLayout,
-    Pow2GraftedBasis, PreparedHybridMultiplicationKey,
+    hybrid_relinearize, hybrid_relinearize_helper_prime, hybrid_relinearize_ordinary_ntt_prepared,
+    hybrid_relinearize_prepared, HelperPrimeNttPlan, HybridMultiplicationKey,
+    HybridQuadraticCiphertext, MixedGadgetLayout, Pow2GraftedBasis,
+    PreparedHybridMultiplicationKey, PreparedOrdinaryNttKey,
 };
-use ccmm_rs::ring::{Modulus, ModulusBasis};
+use ccmm_rs::ring::{make_ntt_plan, Modulus, ModulusBasis, Polynomial};
 
 const HELPER_PRIME: u64 = 2_013_265_921;
 
@@ -49,8 +50,79 @@ fn run_case(degree: usize, bits: u32) {
     let prepare_start = Instant::now();
 
     let prepared = PreparedHybridMultiplicationKey::prepare(&key, &helper);
-
     let prepare_ns = prepare_start.elapsed().as_nanos();
+
+    // R30.12b: verify exact backend equivalence before timing.
+    let reference = hybrid_relinearize(&product, &key);
+    let helper_output = hybrid_relinearize_helper_prime(&product, &key, &helper);
+    let prepared_output = hybrid_relinearize_prepared(&product, &prepared, &helper);
+
+    assert_eq!(
+        helper_output, reference,
+        "R30.12b helper/reference mismatch: degree={degree}, bits={bits}"
+    );
+    assert_eq!(
+        prepared_output, reference,
+        "R30.12b prepared/reference mismatch: degree={degree}, bits={bits}"
+    );
+
+    println!("BACKEND_EXACT_EQUIVALENCE=PASS");
+
+    // R30.12c.3: complete hybrid ciphertext equality.
+    let ordinary_prepare_start = Instant::now();
+    let prepared_ordinary = PreparedOrdinaryNttKey::prepare(&key, degree);
+    let ordinary_prepare_ns = ordinary_prepare_start.elapsed().as_nanos();
+
+    let ntt_output = hybrid_relinearize_ordinary_ntt_prepared(
+        &product,
+        &key,
+        &prepared_ordinary,
+        &prepared,
+        &helper,
+    );
+
+    assert_eq!(
+        ntt_output, reference,
+        "R30.12c.3 full ciphertext mismatch: degree={degree}, bits={bits}"
+    );
+
+    println!("ORDINARY_NTT_FULL_CIPHERTEXT_EQUIVALENCE=PASS");
+    println!("ORDINARY_NTT_PREPARE_NS={ordinary_prepare_ns}");
+
+    // R30.12c: ordinary-limb NTT exactness for every key component.
+    let ordinary_basis = key.layout().ordinary_basis();
+    let ordinary_blocks = key.layout().ordinary_layout().block_count();
+
+    for limb_index in 0..ordinary_basis.len() {
+        let modulus = ordinary_basis.modulus(limb_index);
+        let plan = make_ntt_plan(modulus, degree);
+
+        let digit = Polynomial::new(
+            modulus,
+            product
+                .c2()
+                .ordinary()
+                .residue(limb_index)
+                .coefficients()
+                .to_vec(),
+        );
+
+        for block_index in 0..=ordinary_blocks {
+            let entry = key.entry(block_index).ordinary().limb(limb_index);
+
+            for operand in [entry.a(), entry.b()] {
+                let expected = digit.negacyclic_mul(operand);
+                let actual = plan.negacyclic_mul(&digit, operand);
+
+                assert_eq!(
+                    actual, expected,
+                    "R30.12c NTT mismatch: degree={degree}, bits={bits}, limb={limb_index}, block={block_index}"
+                );
+            }
+        }
+    }
+
+    println!("ORDINARY_NTT_EXACT_EQUIVALENCE=PASS");
 
     /*
      * Sprout-only multiplication benchmark using a real
@@ -182,6 +254,16 @@ fn run_case(degree: usize, bits: u32) {
         );
     } else {
         println!("CACHE_BREAK_EVEN_RELINEARIZATIONS=INF");
+    }
+
+    // Amortization relative to the uncached helper-prime backend.
+    if helper_uncached > helper_cached {
+        println!(
+            "CACHE_VS_HELPER_BREAK_EVEN_RELINEARIZATIONS={:.3}",
+            prepare_ns as f64 / (helper_uncached - helper_cached)
+        );
+    } else {
+        println!("CACHE_VS_HELPER_BREAK_EVEN_RELINEARIZATIONS=INF");
     }
 
     println!("CASE_STATUS=PASS");

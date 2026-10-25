@@ -576,13 +576,22 @@ pub fn hybrid_relinearize_prepared(
     helper_plan: &HelperPrimeNttPlan,
 ) -> HybridRlweCiphertext {
     let key = prepared_key.key();
-
     let ordinary = relinearize_ordinary_limbs(product, key);
+    let decomposition = key.layout().decompose(product.c2());
 
-    let layout = key.layout();
+    let sprout = relinearize_prepared_sprout(product, prepared_key, helper_plan, &decomposition);
 
-    let decomposition = layout.decompose(product.c2());
+    HybridRlweCiphertext::new(ordinary, sprout)
+}
 
+/// Computes only the prepared helper-prime sprout component.
+pub(super) fn relinearize_prepared_sprout(
+    product: &HybridQuadraticCiphertext,
+    prepared_key: &PreparedHybridMultiplicationKey,
+    helper_plan: &HelperPrimeNttPlan,
+    decomposition: &crate::grafting::MixedGadgetDecomposition,
+) -> Pow2RlweCiphertext {
+    let layout = prepared_key.key().layout();
     let ordinary_block_count = layout.ordinary_layout().block_count();
 
     let bits = layout.sprout_bits();
@@ -616,7 +625,7 @@ pub fn hybrid_relinearize_prepared(
 
     sprout_a = sprout_a.add(&helper_plan.negacyclic_mul_prepared(&sprout_digit, entry.a()));
 
-    HybridRlweCiphertext::new(ordinary, Pow2RlweCiphertext::new(sprout_b, sprout_a))
+    Pow2RlweCiphertext::new(sprout_b, sprout_a)
 }
 
 /// Concrete backend used for hybrid relinearization.

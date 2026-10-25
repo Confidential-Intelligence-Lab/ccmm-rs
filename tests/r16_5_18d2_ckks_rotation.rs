@@ -76,6 +76,12 @@ fn error_metrics(actual: &[Complex64], expected: &[Complex64]) -> (f64, f64) {
 #[test]
 #[ignore = "explicit degree-4096 hybrid CKKS experiment"]
 fn r16_5_18d2_ckks_rotation() {
+    let base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
+        .ok()
+        .map(|value| value.parse().expect("invalid gadget base"))
+        .unwrap_or(BASE_LOG);
+    assert!([8, 16, 32].contains(&base_log));
+
     let started = Instant::now();
 
     let profile = research_profile_4096();
@@ -153,7 +159,7 @@ fn r16_5_18d2_ckks_rotation() {
     let keygen_started = Instant::now();
 
     let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-        BoundedGadgetLayout::new(q_basis.clone(), BASE_LOG),
+        BoundedGadgetLayout::new(q_basis.clone(), base_log),
         p_basis,
         &secret,
         exponent,
@@ -166,7 +172,7 @@ fn r16_5_18d2_ckks_rotation() {
     let keygen_seconds = keygen_started.elapsed().as_secs_f64();
 
     println!("R16_5_18D2_GALOIS_EXPONENT={exponent}");
-    println!("R16_5_18D2_GADGET_BASE_LOG={BASE_LOG}");
+    println!("R16_5_18D2_GADGET_BASE_LOG={base_log}");
     println!("R16_5_18D2_GADGET_DIGITS={}", key.digit_count());
     println!("R16_5_18D2_KEYGEN_SECONDS={keygen_seconds:.6}");
 
@@ -212,7 +218,7 @@ fn r16_5_18d2_ckks_rotation() {
     let qonly_key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
         BoundedRnsKeygenConfig {
             plaintext_modulus: 2,
-            layout: BoundedGadgetLayout::new(q_basis.clone(), BASE_LOG),
+            layout: BoundedGadgetLayout::new(q_basis.clone(), base_log),
             plan: &q_plan,
         },
         &secret,

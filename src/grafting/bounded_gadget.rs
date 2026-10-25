@@ -63,12 +63,22 @@ impl BoundedGadgetLayout {
             "polynomial basis must match bounded gadget layout"
         );
 
+        let canonical = reconstruct_coefficients_big(polynomial);
+        self.decompose_canonical(&canonical)
+    }
+
+    // R36_4A_CANONICAL_DECOMPOSITION
+    /// Decompose canonical coefficients in [0, Q), without repeating CRT.
+    ///
+    /// This preserves the centered balanced-digit convention used by
+    /// the original RNS decomposition.
+    pub fn decompose_canonical(&self, canonical: &[BigUint]) -> BoundedGadgetDecomposition {
         let modulus = composite_modulus_big(&self.full_basis);
         let base = BigInt::from(self.base);
         let half_base = BigInt::from(self.base / 2);
 
-        let canonical = reconstruct_coefficients_big(polynomial);
         let degree = canonical.len();
+        assert!(degree > 0, "canonical decomposition requires coefficients");
         let mut digits = vec![vec![0_i128; degree]; self.digit_count];
 
         for (coefficient_index, coefficient) in canonical.iter().enumerate() {
@@ -105,6 +115,86 @@ impl BoundedGadgetLayout {
             layout: self.clone(),
             digits,
         }
+    }
+}
+
+// R36_4B_PREPARED_CANONICAL_SOURCE
+/// Reusable canonical representation of an RNS polynomial.
+///
+/// The expensive CRT reconstruction is performed once. Subsequent
+/// automorphisms operate on canonical coefficients modulo Q.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCanonicalGaloisSource {
+    basis: ModulusBasis,
+    canonical: Vec<BigUint>,
+    modulus: BigUint,
+}
+
+impl PreparedCanonicalGaloisSource {
+    pub fn new(polynomial: &RnsPolynomial) -> Self {
+        let basis = polynomial.basis().clone();
+        let modulus = composite_modulus_big(&basis);
+        let canonical = reconstruct_coefficients_big(polynomial);
+
+        Self {
+            basis,
+            canonical,
+            modulus,
+        }
+    }
+
+    pub fn basis(&self) -> &ModulusBasis {
+        &self.basis
+    }
+
+    pub fn degree(&self) -> usize {
+        self.canonical.len()
+    }
+
+    pub fn automorphism_canonical(&self, exponent: usize) -> Vec<BigUint> {
+        let degree = self.degree();
+
+        assert!(
+            degree >= 2 && degree.is_power_of_two(),
+            "canonical Galois source requires power-of-two degree >= 2"
+        );
+
+        let two_n = 2 * degree;
+        let exponent = exponent % two_n;
+
+        assert!(
+            exponent % 2 == 1,
+            "canonical Galois exponent must be odd modulo 2N"
+        );
+
+        let mut output = vec![BigUint::zero(); degree];
+
+        for (source_index, coefficient) in self.canonical.iter().enumerate() {
+            let mapped = (source_index * exponent) % two_n;
+            let target = mapped % degree;
+
+            output[target] = if mapped < degree || coefficient.is_zero() {
+                coefficient.clone()
+            } else {
+                &self.modulus - coefficient
+            };
+        }
+
+        output
+    }
+
+    pub fn decompose_automorphism(
+        &self,
+        layout: &BoundedGadgetLayout,
+        exponent: usize,
+    ) -> BoundedGadgetDecomposition {
+        assert_eq!(
+            layout.full_basis(),
+            &self.basis,
+            "prepared canonical source basis mismatch"
+        );
+
+        layout.decompose_canonical(&self.automorphism_canonical(exponent))
     }
 }
 
@@ -238,6 +328,95 @@ mod tests {
             Modulus::new(40_961),
             Modulus::new(65_537),
         ])
+    }
+
+    #[test]
+    fn r36_4b_prepared_source_matches_rotated_rns_digits_exactly() {
+        use crate::ckks::apply_automorphism;
+
+        let basis = basis();
+        let layout = BoundedGadgetLayout::new(basis.clone(), 8);
+
+        let coefficients = vec![0_u128, 1, 2, 127, 128, 255, 65_535, 1_000_000];
+
+        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
+
+        assert_eq!(prepared.basis(), &basis);
+        assert_eq!(prepared.degree(), polynomial.degree());
+
+        for exponent in (1..16).step_by(2) {
+            let rotated_residues = polynomial
+                .residues()
+                .iter()
+                .map(|residue| apply_automorphism(residue, exponent))
+                .collect();
+
+            let rotated = RnsPolynomial::from_residues(rotated_residues);
+
+            assert_eq!(
+                prepared.decompose_automorphism(&layout, exponent),
+                layout.decompose(&rotated),
+                "R36.4B exact digit mismatch at exponent {exponent}",
+            );
+        }
+
+        println!("R36_4B_EXACT_DIGIT_EQUIVALENCE=PASS");
+    }
+
+    #[test]
+    fn r36_4a_canonical_decomposition_matches_rns_exactly() {
+        use crate::ckks::apply_automorphism;
+        use crate::ring::reconstruct_coefficients_big;
+
+        let basis = basis();
+        let layout = BoundedGadgetLayout::new(basis.clone(), 8);
+        let degree = 8;
+
+        let coefficients = vec![0_u128, 1, 2, 127, 128, 255, 65_535, 1_000_000];
+
+        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        let canonical = reconstruct_coefficients_big(&polynomial);
+        assert_eq!(
+            layout.decompose(&polynomial),
+            layout.decompose_canonical(&canonical),
+        );
+
+        let modulus = composite_modulus_big(&basis);
+        let two_n = 2 * degree;
+
+        for exponent in (1..two_n).step_by(2) {
+            let mut rotated = vec![BigUint::zero(); degree];
+
+            for (index, coefficient) in canonical.iter().enumerate() {
+                let mapped = (index * exponent) % two_n;
+                let target = mapped % degree;
+
+                rotated[target] = if mapped < degree || coefficient.is_zero() {
+                    coefficient.clone()
+                } else {
+                    &modulus - coefficient
+                };
+            }
+
+            let rotated_residues = polynomial
+                .residues()
+                .iter()
+                .map(|residue| apply_automorphism(residue, exponent))
+                .collect();
+
+            let rotated_rns = RnsPolynomial::from_residues(rotated_residues);
+
+            assert_eq!(
+                layout.decompose(&rotated_rns),
+                layout.decompose_canonical(&rotated),
+                "R36.4A exact digit mismatch at exponent {exponent}",
+            );
+        }
+
+        println!("R36_4A_EXACT_DIGIT_EQUIVALENCE=PASS");
     }
 
     #[test]
@@ -430,5 +609,220 @@ mod wide_modulus_tests {
         for digit_index in 0..layout.digit_count() {
             assert_eq!(decomposition.lift_digit(digit_index).basis(), &basis);
         }
+    }
+}
+
+// R36_5C3_PRODUCTION_DECOMPOSITION_BENCHMARK
+#[cfg(test)]
+mod r36_5c3_benchmark {
+    use super::*;
+    use crate::ckks::research_profile_65536_for_levels;
+    use crate::ring::{ModulusChain, Polynomial};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "production-scale performance characterization"]
+    fn r36_5c3_production_canonical_decomposition_benchmark() {
+        let degree = 65_536usize;
+        let profile = research_profile_65536_for_levels(13, 3);
+
+        assert_eq!(profile.degree(), degree);
+
+        let chain = ModulusChain::from_top_basis(profile.modulus_chain().top().clone());
+
+        assert_eq!(chain.top().moduli().len(), 16);
+
+        let q = chain.level(3).clone();
+        assert_eq!(q.moduli().len(), 13);
+
+        let layout = BoundedGadgetLayout::new(q.clone(), 32);
+
+        let polynomial = RnsPolynomial::from_residues(
+            q.moduli()
+                .iter()
+                .map(|&modulus| {
+                    Polynomial::new(
+                        modulus,
+                        (0..degree)
+                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+
+        let exponents: Vec<usize> = (0..32).map(|i| 2 * i + 3).collect();
+
+        let started = Instant::now();
+        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
+        let preparation_seconds = started.elapsed().as_secs_f64();
+
+        let mut legacy_total = 0.0f64;
+        let mut canonical_total = 0.0f64;
+
+        for (index, &exponent) in exponents.iter().enumerate() {
+            let transformed = RnsPolynomial::from_residues(
+                polynomial
+                    .residues()
+                    .iter()
+                    .map(|residue| {
+                        let modulus = residue.modulus();
+                        let mut output = vec![0_u64; degree];
+
+                        for (i, &value) in residue.coefficients().iter().enumerate() {
+                            let mapped = (i * exponent) % (2 * degree);
+                            let target = mapped % degree;
+
+                            output[target] = if mapped < degree || value == 0 {
+                                value
+                            } else {
+                                modulus.value() - value
+                            };
+                        }
+
+                        Polynomial::new(modulus, output)
+                    })
+                    .collect(),
+            );
+
+            let started = Instant::now();
+            let legacy = layout.decompose(&transformed);
+            legacy_total += started.elapsed().as_secs_f64();
+
+            let started = Instant::now();
+            let canonical = prepared.decompose_automorphism(&layout, exponent);
+            canonical_total += started.elapsed().as_secs_f64();
+
+            assert_eq!(legacy, canonical, "R36.5C.3 mismatch exponent={exponent}");
+
+            let rotations = index + 1;
+
+            if [1, 2, 4, 8, 16, 32].contains(&rotations) {
+                let amortized = preparation_seconds + canonical_total;
+
+                println!(
+                    "R36_5C3_RESULT degree={} q_limbs={} base_log=32 rotations={} preparation_seconds={:.6} legacy_seconds={:.6} canonical_seconds={:.6} amortized_canonical_seconds={:.6} speedup={:.6}",
+                    degree,
+                    q.moduli().len(),
+                    rotations,
+                    preparation_seconds,
+                    legacy_total,
+                    canonical_total,
+                    amortized,
+                    legacy_total / amortized,
+                );
+            }
+        }
+
+        println!("R36_5C3_EXACT_DECOMPOSITION_STATUS=PASS");
+    }
+}
+
+// R36_5C2_CANONICAL_DECOMPOSITION_BENCHMARK
+#[cfg(test)]
+mod r36_5c2_benchmark {
+    use super::*;
+    use crate::ring::{Modulus, Polynomial};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "opt-in performance characterization"]
+    fn r36_5c2_canonical_decomposition_benchmark() {
+        let degree: usize = std::env::var("FHE_R36_5C2_DEGREE")
+            .ok()
+            .map(|value| value.parse().expect("invalid degree"))
+            .unwrap_or(1024);
+
+        assert!(degree >= 16 && degree.is_power_of_two());
+
+        let q = ModulusBasis::new(
+            [12_289_u64, 40_961, 65_537]
+                .into_iter()
+                .map(Modulus::new)
+                .collect(),
+        );
+
+        let polynomial = RnsPolynomial::from_residues(
+            q.moduli()
+                .iter()
+                .map(|&modulus| {
+                    Polynomial::new(
+                        modulus,
+                        (0..degree)
+                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+
+        let layout = BoundedGadgetLayout::new(q, 32);
+
+        let started = Instant::now();
+        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
+        let preparation_seconds = started.elapsed().as_secs_f64();
+
+        let exponents = [3_usize, 5, 7, 11, 15, 19, 23, 27];
+
+        for count in [1_usize, 2, 4, 8] {
+            let mut legacy_seconds = 0.0;
+            let mut canonical_seconds = 0.0;
+
+            for &exponent in exponents.iter().take(count) {
+                let transformed = RnsPolynomial::from_residues(
+                    polynomial
+                        .residues()
+                        .iter()
+                        .map(|residue| {
+                            let modulus = residue.modulus();
+                            let coefficients = residue.coefficients();
+                            let mut output = vec![0_u64; degree];
+
+                            for (i, &value) in coefficients.iter().enumerate() {
+                                let mapped = (i * exponent) % (2 * degree);
+                                let target = mapped % degree;
+
+                                output[target] = if mapped < degree || value == 0 {
+                                    value
+                                } else {
+                                    modulus.value() - value
+                                };
+                            }
+
+                            Polynomial::new(modulus, output)
+                        })
+                        .collect(),
+                );
+
+                let started = Instant::now();
+                let legacy = layout.decompose(&transformed);
+                legacy_seconds += started.elapsed().as_secs_f64();
+
+                let started = Instant::now();
+                let canonical = prepared.decompose_automorphism(&layout, exponent);
+                canonical_seconds += started.elapsed().as_secs_f64();
+
+                assert_eq!(
+                    legacy, canonical,
+                    "R36.5C.2 gadget mismatch exponent={exponent}"
+                );
+            }
+
+            let amortized_canonical_seconds = preparation_seconds + canonical_seconds;
+
+            println!(
+                "R36_5C2_RESULT degree={} q_limbs={} rotations={} preparation_seconds={:.9} legacy_seconds={:.9} canonical_seconds={:.9} amortized_canonical_seconds={:.9} speedup={:.6}",
+                degree,
+                layout.full_basis().moduli().len(),
+                count,
+                preparation_seconds,
+                legacy_seconds,
+                canonical_seconds,
+                amortized_canonical_seconds,
+                legacy_seconds / amortized_canonical_seconds,
+            );
+        }
+
+        println!("R36_5C2_EXACT_DECOMPOSITION_STATUS=PASS");
     }
 }

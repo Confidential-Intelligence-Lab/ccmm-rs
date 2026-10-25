@@ -1,649 +1,194 @@
 # FHE-rs
 
-**A native-Rust research platform for encrypted computing and
-privacy-aware linear algebra.**
+**Encrypted computing in native Rust — from RNS arithmetic to application-facing eBLAS.**
 
-FHE-rs is an experimental full-stack platform for expressing, executing,
-validating, and studying computation over encrypted data. Its current
-cryptographic foundation is leveled RNS-CKKS, while its software
-architecture is designed to separate **what an application computes**
-from **how encrypted execution is represented and realized**.
+FHE-rs is an open-source research platform for homomorphic encrypted computation, privacy-aware linear algebra, and structured signal processing. Its implemented cryptographic foundation is **leveled RNS-CKKS**, while the architecture separates application semantics, operand privacy, execution mechanisms, representation, and physical residue arithmetic. The repository and Cargo package remain named **`ccmm-rs`** to preserve their history.
 
-The repository remains named **`ccmm-rs`** to preserve development
-history and reproducibility. **FHE-rs** is the broader platform
-identity.
+> **Research software, not a production cryptographic security certification.** Numerical correctness, a successful encrypted evaluation, or a named research profile does not establish a production-security parameter set. Read [Security and parameters](docs/SECURITY_AND_PARAMETERS.md) and [Security policy](SECURITY.md) before use.
 
-> **Project status:** active research software. APIs, parameter sets,
-> and execution mechanisms may evolve. Functional and research parameter
-> profiles are not automatically production-security recommendations.
+## Contents
 
-------------------------------------------------------------------------
+- [Getting started](#getting-started)
+- [Architecture](#architecture)
+- [Implemented capabilities](#implemented-capabilities)
+- [Algorithms and optimizations](#algorithms-and-optimizations)
+- [Examples and experiments](#examples-and-experiments)
+- [Documentation and research references](#documentation-and-research-references)
+- [Development, security, and contribution](#development-security-and-contribution)
 
-## Why FHE-rs?
+## Getting started
 
-Fully homomorphic encryption makes it possible to compute on encrypted
-data without first decrypting it, but useful encrypted applications
-require more than individual cryptographic primitives. They require a
-software stack that can connect application semantics to encrypted
-linear algebra, representations, cryptographic state, execution
-mechanisms, and eventually heterogeneous hardware.
+Requires a Rust toolchain compatible with the checked-in `rust-toolchain` configuration (when present) and the locked dependencies.
 
-FHE-rs explores that stack.
+```bash
+git clone https://github.com/Confidential-Intelligence-Lab/ccmm-rs.git
+cd ccmm-rs
+cargo build --locked --release
+cargo test --locked --release --lib
+```
 
-The central design principle is:
+A small application-oriented starting point:
 
-> **Applications express what computation they need through eBLAS.
-> FHE-rs determines how that computation is represented and executed
-> using privacy-aware and structure-aware mechanisms.**
+```bash
+cargo run --locked --release --bin private_linear_inference
+cargo run --locked --release --bin private_two_party_matrix_product
+```
 
-This separation makes it possible to study encrypted algorithms without
-binding the application interface to a single matrix-multiplication
-mechanism, data layout, or future hardware backend.
-
-------------------------------------------------------------------------
+These binaries are research examples, not production application recipes. See [Getting started](docs/GETTING_STARTED.md) for application design and CKKS-state conventions.
 
 ## Architecture
 
-``` text
-Applications / security services
-              |
-            eBLAS
-              |
-   +----------+-----------+
-   |          |           |
-  GEMM      CPMM        CCMM
-   |          |           |
-   +---- structured ------+
-        encrypted ops
-   correlation / FFT / ...
-              |
-     execution profiles
-     representations
-     decomposition
-     scheduling
-              |
-         RNS-CKKS
-              |
-   NTT / RNS / keys / RNG
-              |
-        CPU today
-              |
- GPU / FPGA / PIM / photonics
-       research roadmap
+```text
+  Applications / privacy-aware security services
+                     |
+             eBLAS semantics
+       (ADD, AXPY, DOT, GEMV, GEMM,
+         batch/tensor, FFT, correlation)
+                     |
+   privacy modes + execution policy + plans
+          PP | CP | PC | CC
+                     |
+   direct / CPMM / structured CCMM /
+       packed and decomposed FFT2
+                     |
+    ciphertext representation, tiling,
+     scheduling, rotation/key planning
+                     |
+            leveled RNS-CKKS
+      encode, encrypt, evaluate, decode
+                     |
+      RNS / NTT / modular arithmetic
+                     |
+            multicore CPU today
+       other accelerators: research roadmap
 ```
 
-FHE-rs deliberately separates several concerns that are often conflated:
+The architectural contract is **operation semantics != operand privacy != execution mechanism != representation**. CKKS logical levels are distinct from physical RNS limbs; Grafting-managed auxiliary modulus material is also distinct from the ordinary level chain. See [eBLAS](docs/EBLAS.md) and [RNS architecture](docs/RNS_ARCHITECTURE.md).
 
-1.  **Mathematical operation** --- GEMM, GEMV, DOT, AXPY, correlation,
-    FFT, and related operations.
-2.  **Privacy mode** --- which operands are public, private, or
-    encrypted.
-3.  **Execution mechanism** --- direct encrypted execution, CPMM, CCMM,
-    structured transforms, and future mechanisms.
-4.  **Representation** --- scalar, packed-slot, tensor, batch, or
-    structure-aware layouts.
-5.  **Execution policy** --- decomposition, scheduling, backend
-    selection, and characterization.
-6.  **Cryptographic realization** --- RNS-CKKS arithmetic, NTT, modulus
-    switching, rescaling, relinearization, rotations, and evaluation
-    keys.
+## Implemented capabilities
 
-------------------------------------------------------------------------
+| Area | Current research implementation |
+|---|---|
+| Cryptographic foundation | Leveled RNS-CKKS, canonical encoding/decoding, encryption/decryption, rescaling, modulus switching, rotations, relinearization, evaluation keys |
+| eBLAS | Level-1 arithmetic, DOT, GEMV, GEMM; batch and tensor mappings |
+| Privacy modes | PP, CP, PC, and CC on applicable linear-algebra paths |
+| Matrix mechanisms | Direct CP/CC, CPMM-equivalent accumulation, structured CCMM, tiling and K-reduction |
+| Structured transforms | Correlation, FFT1/iFFT1, packed FFT2/iFFT2, transpose-free packed DIF stages |
+| Large FFT2 evidence | Decomposed 1024 x 1024 and hierarchical 4096 x 4096 grayscale input, with encrypted FFT and decrypted numerical-oracle validation |
+| Validation | Numerical error, ciphertext and level/scale invariants, structural operation accounting, reproducible evidence captures |
 
-## eBLAS: encrypted linear algebra
+**Not claimed:** bootstrapping, production-secure large-FFT parameter sets, or validated GPU/FPGA/photonic execution backends. Current large FFT2 experiments use research parameters.
 
-The eBLAS layer provides a disciplined interface for encrypted numerical
-computation.
+## Algorithms and optimizations
 
-The current hierarchy includes:
+FHE-rs retains reference paths and explicit execution mechanisms to make correctness and performance changes attributable and reproducible.
 
-``` text
-Level 1
-  DOT
-  AXPY
-  SCALE
-  ADD
+| Technique | Purpose / scope | Primary reading |
+|---|---|---|
+| Residue number system (RNS) and NTT | Execute polynomial arithmetic over physical residue limbs while tracking CKKS modulus levels | [RNS architecture](docs/RNS_ARCHITECTURE.md) |
+| Composite levels, Grafting and bounded key switching | Separate CKKS logical modulus consumption, auxiliary basis material, and evaluation-key arithmetic | [RNS architecture](docs/RNS_ARCHITECTURE.md) |
+| CP accumulation / CPMM and structured CCMM | Reuse output-level postprocessing instead of relinearizing/rescaling every scalar product | [eBLAS](docs/EBLAS.md) |
+| Packing, decomposition and provenance | Represent larger logical matrices and images with multiple ciphertexts; preserve tile and reduction semantics | [eBLAS](docs/EBLAS.md), [Reproducibility](docs/REPRODUCIBILITY.md) |
+| Transpose-free 2D DIF FFT | Row- and column-stage execution with rotations and public diagonal masks, avoiding encrypted transpose | [FFT experiments](docs/FFT_EXPERIMENTS_V3.md) |
+| Prepared public operands | Amortize ciphertext-public multiplication setup across repeated uses; exact ciphertext equivalence tested | [FFT experiments](docs/FFT_EXPERIMENTS_V3.md) |
+| NTT-resident execution | Reduce unnecessary representation conversions through prepared CP/rotation sequences | [FFT experiments](docs/FFT_EXPERIMENTS_V3.md) |
+| Prepared modular arithmetic / butterfly alternatives | Differentially tested arithmetic candidates; presence of code does not imply every path uses each candidate | [FFT experiments](docs/FFT_EXPERIMENTS_V3.md) |
 
-Level 2
-  GEMV
+**Attribution rule:** An end-to-end speedup of the integrated FFT2 implementation is not evidence of an isolated speedup for any one technique. Likewise, a passing numerical test is not a cryptographic security proof.
 
-Level 3
-  GEMM
-  Batched GEMM
+## Examples and experiments
 
-Structured eBLAS extensions
-  CORRELATE1D
-  CORRELATE2D
-  FFT1 / iFFT1
-  FFT2 / iFFT2
+All commands below run from the repository root. The 1K/4K scripts and validation binaries are part of the **v3.0 release candidate** and must be committed together with this documentation; they are not guaranteed to exist on earlier branches or tags. The large experiments require the benchmark input file and substantial host resources. **This README intentionally omits runtimes and resident-memory measurements.**
+
+| Example | Command | What it exercises |
+|---|---|---|
+| Application: private linear inference | `cargo run --locked --release --bin private_linear_inference` | Application-level encrypted linear inference |
+| Application: two-party matrix product | `cargo run --locked --release --bin private_two_party_matrix_product` | Privacy-aware encrypted matrix multiplication |
+| Matrix and eBLAS validators | `cargo run --locked --release --bin eblas_gemm_validation` | GEMM semantics and encrypted validation |
+| FFT1 and packed FFT2 evidence | `bash scripts/run_eblas_fft_evidence.sh` | Scalar FFT1, packed FFT1, FFT2 stages, complete packed FFT2, oracle and structural evidence |
+| 4K hierarchical FFT2 | `bash scripts/run_fft2_4k.sh` | Verify the original input, then execute a full 4096 x 4096 FFT2 using 16 macrotiles and 512 ciphertexts |
+
+The 4K runner **must reject** a missing or hash-mismatched input, partial-macrotile mode, and optional equivalence-only modes. See [FFT experiments and evidence](docs/FFT_EXPERIMENTS_V3.md) for setup, flags, artifacts, and the distinction between the dedicated 1K validator and hierarchical 4K executor.
+
+The 1K runner is an existing local research script whose reproducibility and revision contract must be checked before final publication; its absence from the currently published repository is a release gate.
+
+## FFT experiment ladder (v3.0)
+
+The public scripts below distinguish **preflight** (interface checks) from **run** (encrypted execution and validation). Run from the repository root. Research parameter profiles are not security certifications. See [FFT experiment guide](docs/FFT_EXPERIMENTS_V3.md) for packing, numerical checks, and evidence policy.
+
+| Workload | Command | Release readiness |
+|---|---|---|
+| FFT1 | `bash scripts/run_fft1.sh run` | Validator-backed; verify emitted PASS markers |
+| 16 x 16 FFT2 | `bash scripts/run_fft2_16.sh preflight` | Discovery only; encrypted run blocked |
+| 64 x 64 FFT2 | `bash scripts/run_fft2_64.sh run` | Encrypted multi-tile validator; PASS required |
+| 128 x 128 FFT2 | `bash scripts/run_fft2_128.sh preflight` | Discovery only; encrypted run blocked |
+| 256 x 256 FFT2 | `bash scripts/run_fft2_256.sh preflight` | Factored FFT2 implementation identified; command contract pending |
+| 1024 x 1024 FFT2 | `bash scripts/run_fft2_1k.sh run` | Encrypted decomposed FFT2; PASS required |
+| 4096 x 4096 FFT2 | `bash scripts/run_fft2_4k.sh run` | Encrypted hierarchical FFT2; PASS required and verified image required |
+
+No benchmark runtimes or peak resident-memory values are reported here. Existing experiment evidence is preserved without modification.
+
+### Multithreaded encrypted FFT execution
+
+FHE-rs supports parallel execution of encrypted FFT workloads through
+configurable worker settings:
+
+- **Local parallelism:** concurrent execution of supported FFT-stage operations.
+- **Inter-ciphertext parallelism:** concurrent processing of independent ciphertexts.
+
+The following configurations have been exercised in the research experiments.
+
+**1024×1024 encrypted FFT2**
+
+```bash
+R17_1K_LOCAL_PARALLELISM=2 \
+R17_1K_INTER_CT_PARALLELISM=4 \
+bash scripts/run_fft2_1k.sh run
 ```
 
-Correlation and FFT are not standardized BLAS operations. FHE-rs treats
-them as **structured eBLAS extensions** with the same engineering
-discipline: explicit shapes, privacy modes, deterministic lowering or
-execution plans, representation-aware execution, numerical validation,
-and reproducible characterization.
+**4096×4096 hierarchical encrypted FFT2**
 
-### Privacy modes
-
-FHE-rs distinguishes operand privacy from the mechanism used to execute
-an operation:
-
-  Mode   Left operand       Right operand
-  ------ ------------------ ------------------
-  PP     plaintext/public   plaintext/public
-  CP     ciphertext         plaintext/public
-  PC     plaintext/public   ciphertext
-  CC     ciphertext         ciphertext
-
-Packed mechanisms such as CPMM and CCMM are execution mechanisms, not
-privacy modes themselves.
-
-------------------------------------------------------------------------
-
-## Matrix multiplication
-
-FHE-rs supports native and decomposed encrypted matrix multiplication,
-including arbitrary logical dimensions through tiling and reduction.
-
-Current coverage includes:
-
-  Capability                      PP   CP / CPMM   CC / CCMM
-  ---------------------------- ----- ----------- -----------
-  Native GEMM                      ✓           ✓           ✓
-  M/N decomposition                ✓           ✓           ✓
-  K reduction                      ✓           ✓           ✓
-  M/K/N decomposition              ✓           ✓           ✓
-  Tile/product provenance          ✓           ✓           ✓
-  Packed encrypted execution     ---           ✓           ✓
-
-The packed matrix core has been validated for GEMM, GEMV, and DOT using
-CPMM/CP and CCMM/CC paths.
-
-FHE-rs also includes characterization infrastructure for comparison with
-the reference research artifact on comparable dimension sets.
-Performance comparisons should be interpreted as research
-characterization rather than parity claims.
-
-------------------------------------------------------------------------
-
-## Correlation
-
-FHE-rs implements structure-aware correlation by lowering correlation
-semantics onto the encrypted matrix substrate.
-
-### 1D correlation
-
-The current valid 1D correlation semantics are:
-
-``` text
-y[i] = sum_j x[i + j] * h[j]
+```bash
+R21_UHD_LOCAL_PARALLELISM=8 \
+R21_UHD_INTER_CT_PARALLELISM=4 \
+bash scripts/run_fft2_4k.sh run
 ```
 
-The kernel is not reversed.
+These configurations are not necessarily optimal on other systems.
+Performance depends on processor topology, memory bandwidth, ciphertext
+representation, and key-switching workload.
 
-Supported execution includes:
+For reproducibility, record worker settings, hardware configuration,
+CKKS parameters, Git revision, and numerical validation results.
 
--   PP reference/lowered execution;
--   CP through decomposed encrypted GEMM;
--   CC through decomposed encrypted GEMM;
--   arbitrary logical dimensions through decomposition;
--   numerical comparison against cleartext reference results.
+The experiment wrappers must honor the supplied environment variables
+for these commands to select the requested worker configurations.
 
-### 2D correlation
+See [FFT experiments and reproducibility](docs/FFT_EXPERIMENTS_V3.md)
+for additional details.
 
-The current 2D representation uses:
+## Documentation and research references
 
-``` text
-input:   [B, H, W, C]
-filter:  [Kh, Kw, C, F]
-output:  [B, OH, OW, F]
-```
+- [Getting started](docs/GETTING_STARTED.md) — build, applications, and CKKS state.
+- [eBLAS](docs/EBLAS.md) — privacy modes, operations, and backends.
+- [RNS architecture](docs/RNS_ARCHITECTURE.md) — physical limbs, composite levels, and Grafting.
+- [FFT experiments](docs/FFT_EXPERIMENTS_V3.md) — validated workload interfaces, reproducibility and evidence.
+- [Reproducibility](docs/REPRODUCIBILITY.md) — historical checkpoints and measurement discipline.
+- [Research references](docs/RESEARCH_REFERENCES.md) — foundational papers, implementation context and attribution boundaries.
+- [Assurance](docs/ASSURANCE.md), [secure development](docs/SECURE_DEVELOPMENT.md), [security parameters](docs/SECURITY_AND_PARAMETERS.md).
 
-with the logical matrix lowering:
+FHE-rs is independent research software. References to Microsoft SEAL, OpenFHE, HEaaN, HElib and research algorithms are for scientific context, not claims of code reuse or compatibility.
 
-``` text
-M = B * OH * OW
-K = Kh * Kw * C
-N = F
-```
+## Development, security, and contribution
 
-The current implementation covers PP and CP execution. Reproducible
-evidence is available through:
-
-``` bash
-scripts/run_eblas_correlation_evidence.sh
-```
-
-------------------------------------------------------------------------
-
-## FFT
-
-FHE-rs includes cleartext, scalar-encrypted, and packed-encrypted FFT
-execution.
-
-### FFT1 / iFFT1
-
-Implemented capabilities include:
-
--   radix-2 FFT semantics and explicit execution plans;
--   cleartext FFT1/iFFT1;
--   scalar encrypted FFT1 execution;
--   packed CKKS FFT1/iFFT1;
--   public complex slot-vector multiplication;
--   packed rotations;
--   encrypted DIF stages;
--   bit-reversed physical output representation;
--   explicit level/depth accounting.
-
-The packed DIF representation avoids an encrypted bit-reversal
-permutation by interpreting the physical output layout directly.
-
-### FFT2 / iFFT2
-
-FHE-rs implements separable packed 2D FFT execution without an encrypted
-matrix transpose.
-
-The packed representation uses natural row-major input followed by:
-
-``` text
-row DIF stages
-      |
-column DIF stages using strided rotations
-      |
-bit-reversed row/column physical layout
-```
-
-Row stages use contiguous rotations. Column stages operate directly on
-the same row-major ciphertext using strided rotations and public
-diagonal masks.
-
-The result is a **transpose-free encrypted FFT2 execution path**.
-
-For a packed `R x C` FFT2 with
-
-``` text
-S = log2(R) + log2(C)
-```
-
-the current generic execution structure is:
-
-``` text
-ciphertexts          = 1
-rotations            = 2 * S
-public multiplies    = 3 * S
-CC multiplies        = 0
-relinearizations     = 0
-encrypted transposes = 0
-forward depth        = S
-inverse depth        = S + 1
-```
-
-The inverse transform uses one additional public multiplication for
-global normalization.
-
-Functional packed FFT validation profiles are explicitly marked:
-
-``` text
-SECURITY_BEARING=false
-```
-
-They establish encrypted execution semantics, layout, numerical
-behavior, and depth; they are not production-security parameter
-recommendations.
-
-------------------------------------------------------------------------
-
-## Reproducible FFT evidence
-
-Run:
-
-``` bash
-scripts/run_eblas_fft_evidence.sh
-```
-
-The runner exercises scalar and packed encrypted FFT paths and produces:
-
-``` text
-results/eblas_fft_evidence/
-    raw.log
-    summary.csv
-    metadata.txt
-```
-
-The evidence format deliberately distinguishes:
-
--   **MEASURED** numerical and cryptographic-state observations; and
--   **STRUCTURAL** implementation-derived operation counts.
-
-This prevents modeled operation counts from being presented as
-instrumented runtime measurements.
-
-Current evidence covers scalar FFT1 characterization, packed FFT1/iFFT1,
-packed FFT2 row/column stages, and complete packed FFT2/iFFT2 execution.
-
-------------------------------------------------------------------------
-
-## RNS-CKKS foundation
-
-The current FHE-rs cryptographic implementation includes the components
-required by the implemented encrypted-computing paths, including:
-
--   CKKS encoding and decoding;
--   encryption and decryption;
--   RNS modulus bases;
--   NTT-domain arithmetic;
--   ciphertext addition and subtraction;
--   public real and complex scaling;
--   packed public slot-vector multiplication;
--   rotations;
--   modulus switching;
--   CKKS rescaling;
--   bounded RNS relinearization;
--   evaluation-key handling;
--   level, scale, and basis tracking.
-
-The platform is currently centered on leveled RNS-CKKS, but the
-higher-level architecture is intentionally not designed as a CKKS-only
-application interface.
-
-------------------------------------------------------------------------
-
-## Decomposition and representation
-
-Large logical operations are separated from native encrypted execution
-dimensions.
-
-The decomposition layer records and preserves execution provenance such
-as:
-
--   logical matrix dimensions;
--   tile coordinates;
--   K-reduction structure;
--   product provenance;
--   packed-lane provenance where applicable;
--   representation and execution profile.
-
-This enables application-level dimensions to be expressed independently
-of a particular native encrypted matrix mechanism.
-
-------------------------------------------------------------------------
-
-## Engineering assurance
-
-FHE-rs is developed as a reproducible research platform. Cryptographic
-state, numerical semantics, representation, and dependency provenance
-are treated as part of correctness.
-
-The automated quality baseline includes:
-
--   a pinned Rust toolchain;
--   tracked `Cargo.lock`;
--   locked dependency resolution;
--   formatting checks;
--   release-mode compilation across all targets;
--   Clippy with warnings denied;
--   release-mode library tests;
--   selected NTT, RNS, CKKS, eBLAS, FFT1, and FFT2 validation paths;
--   RustSec dependency auditing;
--   `cargo-deny` advisory, license, dependency, and source policy;
--   a crate-wide safe-Rust baseline.
-
-The core crate currently uses:
-
-``` rust
-#![forbid(unsafe_code)]
-```
-
-Future accelerator or FFI integration should isolate any required unsafe
-boundary rather than weakening the core crate globally.
-
-### Local assurance baseline
-
-``` bash
+```bash
 cargo fmt --all -- --check
 cargo metadata --locked --format-version 1 > /dev/null
 cargo check --locked --release --all-targets
 cargo clippy --locked --release --all-targets -- -D warnings
 cargo test --locked --release --lib
-cargo audit
-cargo deny check
 ```
 
-Changes to numerical or cryptographic subsystems should additionally
-execute the relevant validation and evidence binaries.
+Security-sensitive findings should follow [SECURITY.md](SECURITY.md). Changes should preserve cleartext oracles, parameter classification, CKKS state invariants, and representation contracts. Consult [secure development](docs/SECURE_DEVELOPMENT.md) and [extending FHE-rs](docs/EXTENDING_FHE_RS.md).
 
-See:
-
--   [`SECURITY.md`](SECURITY.md) --- vulnerability reporting and
-    security scope;
--   [`docs/SECURE_DEVELOPMENT.md`](docs/SECURE_DEVELOPMENT.md) ---
-    secure-development contract;
--   [`deny.toml`](deny.toml) --- dependency, advisory, license, and
-    source policy;
--   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) --- automated
-    assurance gates.
-
-------------------------------------------------------------------------
-
-## Security and parameter interpretation
-
-FHE-rs is research software.
-
-The repository distinguishes:
-
--   **functional validation parameters** --- used to establish semantics
-    and exercise execution paths;
--   **research parameters** --- used for research experiments and
-    characterization;
--   **security-bearing parameters** --- parameters for which a specific
-    security claim is intended and supported.
-
-Do not infer a production security claim merely because an operation
-executes over ciphertext.
-
-Profiles explicitly reporting:
-
-``` text
-SECURITY_BEARING=false
-```
-
-must not be presented as production cryptographic parameter sets.
-
-Parameter changes affecting ring degree, modulus chain, error
-distribution, secret distribution, gadget decomposition, auxiliary
-moduli, or evaluation-key construction are security-sensitive changes.
-
-------------------------------------------------------------------------
-
-## Repository layout
-
-The exact tree evolves with the research program, but the principal
-organization is:
-
-``` text
-src/
-  eblas/              encrypted linear-algebra semantics and execution
-  bin/                validation, characterization, and research binaries
-  ...                 CKKS, RNS, NTT, CCMM/CPMM, and supporting components
-
-scripts/
-  reproducible characterization and evidence runners
-
-results/
-  generated research evidence and characterization output
-
-docs/
-  design and secure-development documentation
-
-.github/workflows/
-  continuous-integration assurance
-```
-
-Generated `results/` directories may contain local experimental evidence
-and are not necessarily part of the committed source baseline.
-
-------------------------------------------------------------------------
-
-## Validation philosophy
-
-For encrypted numerical software, "the program ran" is not a sufficient
-correctness criterion.
-
-Where applicable, FHE-rs validation checks:
-
-``` text
-cleartext semantic oracle
-        |
-encrypted implementation
-        |
-decoded numerical error
-        |
-level / scale / RNS basis
-        |
-physical representation
-        |
-structural operation cost
-```
-
-Typical evidence includes:
-
--   relative L2 error;
--   maximum absolute error;
--   inactive-slot error;
--   level consumption;
--   output scale;
--   representation/layout;
--   rotations;
--   ciphertext-public multiplications;
--   ciphertext-ciphertext multiplications;
--   relinearizations;
--   encrypted transposes.
-
-Measured quantities and implementation-derived structural quantities are
-kept distinguishable.
-
-------------------------------------------------------------------------
-
-## Current research direction
-
-FHE-rs is evolving from cryptographic mechanisms toward an
-application-facing encrypted-computing platform.
-
-Near-term work includes:
-
--   broader eBLAS coverage;
--   encrypted signal and image-processing applications;
--   decomposition of larger structured workloads;
--   stronger automated numerical regression;
--   property-based testing and fuzzing;
--   performance characterization;
--   security-parameter analysis;
--   compiler/runtime interfaces for backend selection.
-
-A representative application direction is encrypted image filtering:
-
-``` text
-private image
-    |
-tile / overlap decomposition
-    |
-encrypted FFT2
-    |
-public spectral filter
-    |
-encrypted iFFT2
-    |
-reassembly
-    |
-private filtered image
-```
-
-Correct convolution requires overlap-aware decomposition such as
-overlap-save or overlap-add rather than independent non-overlapping
-tiles.
-
-------------------------------------------------------------------------
-
-## Heterogeneous execution roadmap
-
-The semantic and execution layers are intended to support future
-heterogeneous encrypted-computing research.
-
-Potential backend directions include:
-
--   multicore CPU;
--   GPU;
--   FPGA;
--   processing-in-memory;
--   silicon photonics;
--   heterogeneous combinations of these mechanisms.
-
-These are roadmap directions unless explicitly identified elsewhere as
-implemented and validated.
-
-The objective is to preserve the application/eBLAS interface while
-allowing execution mechanisms and hardware mappings to evolve underneath
-it.
-
-------------------------------------------------------------------------
-
-## Research reproducibility
-
-Characterization and evidence runners should record enough information
-to identify:
-
--   source commit;
--   execution profile;
--   parameter classification;
--   logical shape;
--   representation;
--   privacy mode;
--   numerical error;
--   cryptographic-state transitions;
--   structural operation counts;
--   measured runtime when explicitly instrumented.
-
-Do not substitute modeled structural counts for measured timing or
-instrumentation.
-
-------------------------------------------------------------------------
-
-## Project identity
-
-**Platform:** FHE-rs\
-**Repository:** `ccmm-rs`\
-**Organization:** Confidential Intelligence Lab\
-**Primary language:** Rust\
-**Current HE foundation:** leveled RNS-CKKS\
-**License:** see [`LICENSE`](LICENSE)
-
-The repository name is intentionally retained for history and
-reproducibility while the software evolves into the broader FHE-rs
-platform.
-
-------------------------------------------------------------------------
-
-## Contributing
-
-FHE-rs is an active research codebase. Contributions should preserve:
-
--   mathematical semantics;
--   privacy-mode distinctions;
--   cryptographic state invariants;
--   explicit representation contracts;
--   reproducible validation;
--   dependency and security policy;
--   portability unless a backend is explicitly architecture-specific.
-
-Before proposing a change, run the local assurance baseline and the
-validators relevant to the modified subsystem.
-
-Security-sensitive findings should follow [`SECURITY.md`](SECURITY.md)
-rather than being disclosed through a public issue.
-
-------------------------------------------------------------------------
-
-## License
-
-See [`LICENSE`](LICENSE).
+**License:** MIT ([LICENSE](LICENSE)). **Platform:** FHE-rs. **Repository / Cargo package:** `ccmm-rs`. **Organization:** Confidential Intelligence Lab.

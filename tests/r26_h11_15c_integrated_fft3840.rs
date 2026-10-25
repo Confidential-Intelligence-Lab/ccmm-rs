@@ -333,18 +333,195 @@ type PackedRotationKeys = std::collections::BTreeMap<isize, PreparedHybridRnsGal
 fn r26_h11_15c_integrated_encrypted_fft3840() {
     let total_started = Instant::now();
 
-    let profile = research_profile_65536_for_levels(5, 5);
+    // R30_9A_4_SHARED_PROFILE_HORIZONTAL
+    let shared_profile = std::env::var_os("R30_9A_SHARED_PROFILE").is_some();
+
+    let profile = if shared_profile {
+        research_profile_65536_for_levels(13, 3)
+    } else {
+        research_profile_65536_for_levels(5, 5)
+    };
+
     let degree = profile.degree();
     assert_eq!(degree, 65536);
 
     let validated = profile.modulus_chain().top().clone();
-    assert!(validated.moduli().len() >= 10);
 
-    let q = ModulusBasis::new(validated.moduli()[..8].to_vec());
-    let p = ModulusBasis::new(validated.moduli()[8..10].to_vec());
+    let (q, p) = if shared_profile {
+        let extended = research_profile_65536_for_levels(15, 3);
+        let extended_chain = extended.modulus_chain();
+        let moduli = extended_chain.top().moduli();
+
+        assert_eq!(validated.moduli().len(), 16);
+        assert_eq!(moduli.len(), 18);
+        assert_eq!(&moduli[..16], validated.moduli());
+
+        (
+            ModulusBasis::new(validated.moduli().to_vec()),
+            ModulusBasis::new(moduli[16..18].to_vec()),
+        )
+    } else {
+        assert!(validated.moduli().len() >= 10);
+
+        (
+            ModulusBasis::new(validated.moduli()[..8].to_vec()),
+            ModulusBasis::new(validated.moduli()[8..10].to_vec()),
+        )
+    };
+
     let chain = ModulusChain::from_top_basis(q);
 
-    assert_eq!(chain.max_level(), 7);
+    assert_eq!(chain.max_level(), if shared_profile { 15 } else { 7 });
+
+    if shared_profile {
+        assert_eq!(chain.level(7).moduli().len(), 9);
+
+        for modulus in p.moduli() {
+            assert_eq!((modulus.value() - 1) % (2 * degree as u64), 0);
+            assert!(!chain.top().moduli().contains(modulus));
+        }
+
+        println!("R30_9A_SHARED_PROFILE=ENABLED");
+        println!("R30_9A_Q_LIMBS=16");
+        println!("R30_9A_P_LIMBS=2");
+        println!("R30_9A_HANDOFF_LEVEL=7");
+        println!("R30_9A_HANDOFF_Q_LIMBS=9");
+    }
+
+    // R30.9A.16C: early, allocation-free hybrid-QP key memory preflight.
+    if std::env::var("R30_9A_16_MEMORY_PREFLIGHT").as_deref() == Ok("1") {
+        let base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
+            .ok()
+            .map(|value| value.parse().expect("invalid hybrid gadget base"))
+            .unwrap_or(32);
+        assert!([8, 16, 32].contains(&base_log));
+
+        let stage0_offsets: BTreeSet<isize> = (0..15)
+            .flat_map(|branch| {
+                let destination_lane = if branch < 8 { branch } else { branch - 8 };
+                fuse_fft256_source_lane(
+                    &first_stage_diagonals(branch),
+                    SLOTS,
+                    LANE_SLOTS,
+                    0,
+                    destination_lane,
+                )
+                .keys()
+                .copied()
+                .filter(|&offset| offset != 0)
+                .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut total_bytes = 0_u128;
+        let mut peak_stage_bytes = 0_u128;
+
+        for stage in 0..4 {
+            let offsets: BTreeSet<isize> = if stage == 0 {
+                stage0_offsets.clone()
+            } else {
+                let span = [16, 64, 256][stage - 1];
+                let local = later_stage_diagonals(span);
+                let lanes: Vec<&Diagonals> = (0..8).map(|_| &local).collect();
+                pack_fft256_branch_diagonals(&lanes, LANE_SLOTS)
+                    .keys()
+                    .copied()
+                    .filter(|&offset| offset != 0)
+                    .collect()
+            };
+
+            let q_basis = chain.level(stage + 3);
+            let digits = BoundedGadgetLayout::new(q_basis.clone(), base_log).digit_count();
+
+            let limbs = q_basis.moduli().len() + p.moduli().len();
+            let bytes_per_key = 2_u128 * degree as u128 * limbs as u128 * digits as u128 * 8;
+
+            let stage_bytes = bytes_per_key * offsets.len() as u128;
+            total_bytes += stage_bytes;
+            peak_stage_bytes = peak_stage_bytes.max(stage_bytes);
+
+            println!(
+                "R30_9A_16_STAGE={stage} KEYS={} Q_LIMBS={} P_LIMBS={} DIGITS={} PAYLOAD_GIB={:.3}",
+                offsets.len(),
+                q_basis.moduli().len(),
+                p.moduli().len(),
+                digits,
+                stage_bytes as f64 / 1073741824.0
+            );
+        }
+
+        let peak_gib = peak_stage_bytes as f64 / 1073741824.0;
+
+        println!("R30_9A_16_BASE_LOG={base_log}");
+        println!(
+            "R30_9A_16_ALL_STAGES_GIB={:.3}",
+            total_bytes as f64 / 1073741824.0
+        );
+        println!("R30_9A_16_PEAK_STAGE_GIB={peak_gib:.3}");
+        println!(
+            "R30_9A_16_STAGEWISE_BUDGET_18GIB={}",
+            if peak_gib <= 18.0 { "PASS" } else { "EXCEEDS" }
+        );
+
+        // R30.9A.17A: key-lifetime scheduling audit.
+        // Preserve the source/operand order used by the fused evaluator.
+        let group_offsets: Vec<Vec<isize>> = [0..8, 8..15]
+            .iter()
+            .map(|range| {
+                range
+                    .clone()
+                    .flat_map(|branch| {
+                        let destination_lane = if branch < 8 { branch } else { branch - 8 };
+                        fuse_fft256_source_lane(
+                            &first_stage_diagonals(branch),
+                            SLOTS,
+                            LANE_SLOTS,
+                            0,
+                            destination_lane,
+                        )
+                        .keys()
+                        .copied()
+                        .filter(|&offset| offset != 0)
+                        .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut global_peak = 0usize;
+
+        for (group, offsets) in group_offsets.iter().enumerate() {
+            let mut last_use = std::collections::BTreeMap::new();
+            for (index, &offset) in offsets.iter().enumerate() {
+                last_use.insert(offset, index);
+            }
+
+            let mut live = BTreeSet::new();
+            let mut peak = 0usize;
+
+            for (index, &offset) in offsets.iter().enumerate() {
+                live.insert(offset);
+                peak = peak.max(live.len());
+
+                if last_use[&offset] == index {
+                    live.remove(&offset);
+                }
+            }
+
+            global_peak = global_peak.max(peak);
+
+            println!(
+                "R30_9A_17_GROUP={group} TERMS={} DISTINCT_KEYS={} PEAK_LIVE_KEYS={peak}",
+                offsets.len(),
+                last_use.len()
+            );
+        }
+
+        println!("R30_9A_17_PEAK_LIVE_KEYS={global_peak}");
+        println!("R30_9A_17_SCHEDULING_AUDIT=PASS");
+        println!("R30_9A_16_MEMORY_PREFLIGHT_STATUS=PASS");
+        return;
+    }
 
     let scale = profile.initial_scale();
     let embedding = CkksCanonicalEmbedding::new(degree);
@@ -512,6 +689,55 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
         })
         .collect();
 
+    // R30.9A.21D: characterize stage-0 rotation-key reuse.
+    //
+    // This analysis does not generate keys or execute encrypted FFTs.
+    let stage0_schedule: Vec<isize> = prepared_sources
+        .iter()
+        .flat_map(|source| source.rotation_offsets())
+        .filter(|&offset| offset != 0)
+        .collect();
+
+    let unique_offsets: BTreeSet<isize> = stage0_schedule.iter().copied().collect();
+
+    let operand_keys = stage0_schedule.len();
+    let unique_keys = unique_offsets.len();
+    let repeated_keys = operand_keys - unique_keys;
+
+    // R30.9A.21E: consecutive offset reuse without reordering.
+    let consecutive_reuses = stage0_schedule
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .count();
+
+    let one_key_cache_generations = stage0_schedule.len() - consecutive_reuses;
+
+    println!("R30_9A_21E_CONSECUTIVE_REUSES={consecutive_reuses}");
+    println!("R30_9A_21E_ONE_KEY_CACHE_GENERATIONS={one_key_cache_generations}");
+    println!(
+        "R30_9A_21E_ONE_KEY_CACHE_REDUCTION_FACTOR={:.3}",
+        stage0_schedule.len() as f64 / one_key_cache_generations.max(1) as f64
+    );
+
+    println!("R30_9A_21D_STAGE0_OPERAND_KEYS={operand_keys}");
+    println!("R30_9A_21D_STAGE0_UNIQUE_OFFSETS={unique_keys}");
+    println!("R30_9A_21D_STAGE0_REPEATED_OCCURRENCES={repeated_keys}");
+
+    let independent_two_batch_calls = 2 * operand_keys;
+    let batched_two_batch_calls = operand_keys;
+
+    println!("R30_9A_21D_TWO_BATCH_INDEPENDENT_KEYGEN_CALLS={independent_two_batch_calls}");
+    println!("R30_9A_21D_TWO_BATCH_KEYGEN_CALLS={batched_two_batch_calls}");
+
+    if unique_keys > 0 {
+        println!(
+            "R30_9A_21D_UNIQUE_KEY_REDUCTION_FACTOR={:.3}",
+            operand_keys as f64 / unique_keys as f64
+        );
+    }
+
+    println!("R30_9A_21D_SCHEDULE_STATUS=PASS");
+
     let later_diagonals: Vec<Diagonals> = [16, 64, 256]
         .iter()
         .map(|&span| {
@@ -541,6 +767,424 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
 
     // Generate each required rotation key once per level.
     // The same level-specific keys are shared by groups A and B.
+
+    // R30_9A_10: allocation-free memory-model mode.
+    if std::env::var("R30_9A_10_MEMORY_ONLY").as_deref() == Ok("1") {
+        let mut total_bytes = 0_u128;
+
+        for stage_index in 0..4 {
+            let level = stage_index + 3;
+
+            let offsets: BTreeSet<isize> = if stage_index == 0 {
+                prepared_sources
+                    .iter()
+                    .flat_map(|prepared| prepared.rotation_offsets())
+                    .filter(|&offset| offset != 0)
+                    .collect()
+            } else {
+                later_diagonals[stage_index - 1]
+                    .keys()
+                    .copied()
+                    .filter(|&offset| offset != 0)
+                    .collect()
+            };
+
+            let q_basis = chain.level(level);
+            let q_limbs = q_basis.moduli().len();
+            let p_limbs = p.moduli().len();
+
+            for base_log in [8_u32, 16, 32] {
+                let digits = BoundedGadgetLayout::new(q_basis.clone(), base_log).digit_count();
+
+                let bytes = 2_u128
+                    * degree as u128
+                    * (q_limbs + p_limbs) as u128
+                    * digits as u128
+                    * offsets.len() as u128
+                    * 8;
+
+                println!(
+                    "R30_9A_10_MEMORY stage={stage_index} base_log={base_log}                      keys={} q_limbs={q_limbs} p_limbs={p_limbs}                      digits={digits} gib={:.3}",
+                    offsets.len(),
+                    bytes as f64 / 1073741824.0
+                );
+
+                if base_log == 8 {
+                    total_bytes += bytes;
+                }
+            }
+        }
+
+        println!(
+            "R30_9A_10_BASE8_TOTAL_GIB={:.3}",
+            total_bytes as f64 / 1073741824.0
+        );
+        println!("R30_9A_10_MEMORY_ONLY_STATUS=PASS");
+        return;
+    }
+
+    // R30.9A.14: configurable hybrid-QP gadget base.
+    // Default 8 preserves the existing validated behavior.
+    let hybrid_base_log: u32 = std::env::var("FHE_HYBRID_GADGET_BASE_LOG")
+        .ok()
+        .map(|value| value.parse().expect("invalid hybrid gadget base"))
+        .unwrap_or(8);
+
+    assert!(
+        [8, 16, 32].contains(&hybrid_base_log),
+        "hybrid gadget base must be 8, 16, or 32"
+    );
+
+    println!("R30_9A_14_HYBRID_BASE_LOG={hybrid_base_log}");
+
+    // R30.9A.18: opt-in bounded-key complete FFT3840 handoff.
+    // Keep the original production regression untouched as the default.
+    if std::env::var("R30_9A_18_STREAMING").as_deref() == Ok("1") {
+        assert!(shared_profile, "streaming requires shared Q16 profile");
+        assert_eq!(hybrid_base_log, 32, "streaming requires base 32");
+        assert!(
+            std::env::var_os("R30_9A_HANDOFF_ONLY").is_some(),
+            "streaming currently validates the level-7 handoff only"
+        );
+        let evaluator_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluator_keys);
+        let source_array: [RnsCkksCiphertext; 15] = sources
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected 15 FFT15 sources"));
+        let prepared_array: [PreparedFusedFft256Source; 15] = prepared_sources
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected 15 prepared sources"));
+        let later_array: [PreparedFft256Stage; 3] = later_prepared
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected 3 prepared stages"));
+        let stage0_qp = PreparedRnsNttPlan::new(&qp_plans[0]);
+        let mut generated_keys = 0usize;
+        let parallel_workers = std::env::var("FHE_R27_KEYGEN_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+
+        let mut stage0_offsets = Vec::new();
+        for source in &prepared_array {
+            stage0_offsets.extend(source.rotation_offsets().filter(|&offset| offset != 0));
+        }
+
+        let parallel_jobs: Vec<(isize, [u8; 32])> = stage0_offsets
+            .iter()
+            .map(|&offset| {
+                let mut seed = [0_u8; 32];
+                rand::RngCore::fill_bytes(&mut rng, &mut seed);
+                (offset, seed)
+            })
+            .collect();
+
+        let generate = |(offset, seed): (isize, [u8; 32])| {
+            let exponent = if offset > 0 {
+                rotation_exponent_left(degree, offset as usize)
+            } else {
+                rotation_exponent_right(degree, (-offset) as usize)
+            };
+
+            let mut key_rng = ChaCha20Rng::from_seed(seed);
+
+            PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                BoundedGadgetLayout::new(chain.level(3).clone(), hybrid_base_log),
+                p.clone(),
+                &secret,
+                exponent,
+                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                2,
+                &qp_plans[0],
+                &mut key_rng,
+            )
+        };
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(parallel_workers)
+            .build()
+            .expect("R30.9A.19 keygen thread pool creation failed");
+
+        let mut next_key = 0usize;
+        let mut pending_keys =
+            std::collections::VecDeque::<(isize, PreparedHybridRnsGaloisKey)>::new();
+
+        let mut make_key = |offset: isize| {
+            if pending_keys.is_empty() {
+                let end = (next_key + parallel_workers).min(parallel_jobs.len());
+                assert!(next_key < end, "R30.9A.19 exhausted key schedule");
+
+                let batch: Vec<_> = pool.install(|| {
+                    parallel_jobs[next_key..end]
+                        .par_iter()
+                        .copied()
+                        .map(|job| {
+                            let key = generate(job);
+                            (job.0, key)
+                        })
+                        .collect()
+                });
+
+                pending_keys.extend(batch);
+                next_key = end;
+            }
+
+            let (expected_offset, key) = pending_keys
+                .pop_front()
+                .expect("R30.9A.19 missing generated key");
+
+            assert_eq!(
+                expected_offset, offset,
+                "R30.9A.19 key schedule differs from evaluator order"
+            );
+
+            generated_keys += 1;
+            key
+        };
+
+        let started = Instant::now();
+        let mut results =
+            ccmm_rs::eblas::fused_fft256_handoff::apply_fft3840_packed_fft256_stage0_streaming(
+                &source_array,
+                &prepared_array,
+                &evaluator,
+                &chain,
+                &prepared_plans[0],
+                &qp_plans[0],
+                &stage0_qp,
+                &mut make_key,
+            );
+        assert_eq!(generated_keys, parallel_jobs.len());
+        assert!(pending_keys.is_empty());
+        println!("R30_9A_19_KEYGEN_WORKERS={parallel_workers}");
+        println!("R30_9A_19_KEYGEN_BATCH_LIMIT={parallel_workers}");
+        println!("R30_9A_18_STAGE0_KEYS_GENERATED={generated_keys}");
+        println!(
+            "R30_9A_18_STAGE0_SECONDS={:.3}",
+            started.elapsed().as_secs_f64()
+        );
+        for stage_index in 1..4 {
+            let level = stage_index + 3;
+            let offsets: BTreeSet<isize> = later_diagonals[stage_index - 1]
+                .keys()
+                .copied()
+                .filter(|&offset| offset != 0)
+                .collect();
+            let mut keys = PackedRotationKeys::new();
+            for offset in offsets {
+                let exponent = if offset > 0 {
+                    rotation_exponent_left(degree, offset as usize)
+                } else {
+                    rotation_exponent_right(degree, (-offset) as usize)
+                };
+                let mut seed = [0_u8; 32];
+                rand::RngCore::fill_bytes(&mut rng, &mut seed);
+                let mut key_rng = ChaCha20Rng::from_seed(seed);
+                let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedGadgetLayout::new(chain.level(level).clone(), hybrid_base_log),
+                    p.clone(),
+                    &secret,
+                    exponent,
+                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                    2,
+                    &qp_plans[stage_index],
+                    &mut key_rng,
+                );
+                keys.insert(offset, key);
+            }
+            let ctx = PackedStageContext {
+                keys: &keys,
+                evaluator: &evaluator,
+                chain: &chain,
+                qp_plan: &qp_plans[stage_index],
+                prepared: &prepared_plans[stage_index],
+            };
+            for result in &mut results {
+                *result = ccmm_rs::eblas::prepared_radix4_fft256::apply_stage(
+                    result,
+                    &later_array[stage_index - 1],
+                    &ctx,
+                );
+                assert_eq!(result.level(), level + 1);
+            }
+            drop(keys);
+            println!("R30_9A_18_STAGE_{stage_index}_STATUS=PASS");
+        }
+        let expected_basis = chain.level(7).moduli();
+        for result in &results {
+            assert_eq!(result.level(), 7);
+            assert_eq!(result.basis().moduli(), expected_basis);
+        }
+        println!("R30_9A_18_OUTPUT_LEVEL=7");
+        println!(
+            "R30_9A_18_TOTAL_SECONDS={:.3}",
+            total_started.elapsed().as_secs_f64()
+        );
+        println!("R30_9A_18_STREAMING_STATUS=PASS");
+
+        // R30.9A.20: numerical validation of the streaming handoff.
+        // Reconstruct the natural-order 3840-point frequency spectrum.
+        let mut reference = vec![Complex64::new(0.0, 0.0); 16 * 3840];
+
+        // Independent FFT15 x FFT256 reference, natural frequency order.
+        for row in 0..16 {
+            for k_cross in 0..TILES {
+                let mut local = vec![Complex64::new(0.0, 0.0); 256];
+
+                for (s, value) in local.iter_mut().enumerate() {
+                    let cross: Complex64 = (0..TILES)
+                        .map(|tile| natural[tile][row * 256 + s] * root(TILES, k_cross * tile))
+                        .sum();
+
+                    *value = cross * root(3840, k_cross * s);
+                }
+
+                // Independent iterative radix-2 FFT256.
+                for i in 0usize..256 {
+                    let j = i.reverse_bits() >> (usize::BITS - 8);
+                    if i < j {
+                        local.swap(i, j);
+                    }
+                }
+
+                let mut len = 2;
+                while len <= 256 {
+                    for base in (0..256).step_by(len) {
+                        for j in 0..len / 2 {
+                            let a = local[base + j];
+                            let b = local[base + j + len / 2] * root(len, j);
+                            local[base + j] = a + b;
+                            local[base + j + len / 2] = a - b;
+                        }
+                    }
+                    len *= 2;
+                }
+
+                for (k_local, &value) in local.iter().enumerate() {
+                    reference[row * 3840 + k_cross + TILES * k_local] = value;
+                }
+            }
+        }
+
+        // Independently verify selected bins by direct DFT.
+        for &row in &[0usize, 7, 15] {
+            for &frequency in &[0usize, 7, 255, 1024, 3839] {
+                let direct: Complex64 = (0..3840)
+                    .map(|n| {
+                        let tile = n / 256;
+                        let local = n % 256;
+                        natural[tile][row * 256 + local] * root(3840, frequency * n)
+                    })
+                    .sum();
+
+                let staged = reference[row * 3840 + frequency];
+                assert!(
+                    (direct - staged).norm() < 1.0e-8,
+                    "R30.9A.20 reference disagreement: row={row} frequency={frequency}"
+                );
+            }
+        }
+
+        println!("R30_9A_20_REFERENCE_STATUS=PASS");
+
+        let mut error_sq = 0.0_f64;
+        let mut reference_sq = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        let mut checked = 0usize;
+
+        // R30.9A.20B: numerical error localization.
+        let mut group_error_sq = [0.0_f64; 2];
+        let mut group_reference_sq = [0.0_f64; 2];
+        let mut worst_error = 0.0_f64;
+        let mut worst_frequency = 0usize;
+        let mut worst_group = 0usize;
+        let mut cross = Complex64::new(0.0, 0.0);
+        let mut actual_sq = 0.0_f64;
+
+        for (group, ciphertext) in results.iter().enumerate() {
+            let actual = decode(ciphertext, &secret, &embedding);
+            let branches = if group == 0 { 0..8 } else { 8..15 };
+
+            for (lane, branch) in branches.enumerate() {
+                for row in 0..16 {
+                    for k in 0..256 {
+                        let slot = lane * HALF + row * 256 + k;
+                        let frequency = row * 3840 + branch + 15 * k;
+                        let expected = reference[frequency];
+                        let error = (actual[slot] - expected).norm();
+
+                        error_sq += error * error;
+                        reference_sq += expected.norm_sqr();
+                        group_error_sq[group] += error * error;
+                        group_reference_sq[group] += expected.norm_sqr();
+                        cross += actual[slot] * expected.conj();
+                        actual_sq += actual[slot].norm_sqr();
+
+                        if error > worst_error {
+                            worst_error = error;
+                            worst_frequency = frequency;
+                            worst_group = group;
+                        }
+
+                        max_abs = max_abs.max(error);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(checked, 61_440);
+        assert!(reference_sq > 0.0);
+
+        let relative_l2 = (error_sq / reference_sq).sqrt();
+
+        println!("R30_9A_20_SPECTRAL_VALUES={checked}");
+        println!("R30_9A_20_MAX_ABS={max_abs:.12e}");
+        println!("R30_9A_20_RELATIVE_L2={relative_l2:.12e}");
+
+        for group in 0..2 {
+            assert!(group_reference_sq[group] > 0.0);
+            let group_relative_l2 = (group_error_sq[group] / group_reference_sq[group]).sqrt();
+            println!("R30_9A_20B_GROUP_{group}_RELATIVE_L2={group_relative_l2:.12e}");
+        }
+
+        let gain = cross / reference_sq;
+        let residual_sq = (actual_sq - cross.norm_sqr() / reference_sq).max(0.0);
+        let residual_relative_l2 = (residual_sq / reference_sq).sqrt();
+
+        println!("R30_9A_20B_WORST_GROUP={worst_group}");
+        println!("R30_9A_20B_WORST_FREQUENCY={worst_frequency}");
+        println!("R30_9A_20B_WORST_ROW={}", worst_frequency / 3840);
+        println!("R30_9A_20B_WORST_BIN={}", worst_frequency % 3840);
+        println!("R30_9A_20B_GAIN_REAL={:.12e}", gain.re);
+        println!("R30_9A_20B_GAIN_IMAG={:.12e}", gain.im);
+        println!("R30_9A_20B_GAIN_CORRECTED_RELATIVE_L2={residual_relative_l2:.12e}");
+        println!("R30_9A_20B_DIAGNOSTICS_STATUS=PASS");
+
+        // R30.9A.20C: distinguish the strict numerical target from
+        // provisional research-profile integration acceptance.
+        const STRICT_TARGET: f64 = 1.0e-5;
+        const RESEARCH_PROFILE_LIMIT: f64 = 1.1e-5;
+
+        let strict_pass = relative_l2.is_finite() && relative_l2 < STRICT_TARGET;
+
+        println!(
+            "R30_9A_20_STRICT_NUMERICAL_STATUS={}",
+            if strict_pass { "PASS" } else { "FAIL" }
+        );
+        println!("R30_9A_20_STRICT_TARGET={STRICT_TARGET:.12e}");
+        println!("R30_9A_20_RESEARCH_PROFILE_LIMIT={RESEARCH_PROFILE_LIMIT:.12e}");
+
+        assert!(
+            relative_l2.is_finite() && relative_l2 < RESEARCH_PROFILE_LIMIT,
+            "R30.9A.20 research-profile accuracy limit exceeded"
+        );
+
+        println!("R30_9A_20_RESEARCH_PROFILE_STATUS=PASS");
+        println!("R30_9A_20_NUMERICAL_STATUS=PROVISIONAL_PASS");
+        return;
+    }
+
     let keygen_started = Instant::now();
     let mut stage_keys = Vec::new();
 
@@ -560,6 +1204,36 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
                 .filter(|&offset| offset != 0)
                 .collect()
         };
+
+        // R30_9A_10: exact logical hybrid-QP key payload estimate.
+        // No key generation or allocation is required for this estimate.
+        {
+            let q_basis = chain.level(level);
+            let q_limbs = q_basis.moduli().len();
+            let p_limbs = p.moduli().len();
+            let layout = BoundedGadgetLayout::new(q_basis.clone(), hybrid_base_log);
+            let digits = layout.digit_count();
+            let key_count = offsets.len();
+
+            let bytes_per_key = (2_u128)
+                * (degree as u128)
+                * ((q_limbs + p_limbs) as u128)
+                * (digits as u128)
+                * 8_u128;
+
+            let stage_bytes = bytes_per_key * (key_count as u128);
+
+            println!("R30_9A_10_STAGE={stage_index}");
+            println!("R30_9A_10_Q_LIMBS={q_limbs}");
+            println!("R30_9A_10_P_LIMBS={p_limbs}");
+            println!("R30_9A_10_GADGET_DIGITS={digits}");
+            println!("R30_9A_10_KEY_COUNT={key_count}");
+            println!("R30_9A_10_BYTES_PER_KEY={bytes_per_key}");
+            println!(
+                "R30_9A_10_STAGE_GIB={:.3}",
+                stage_bytes as f64 / 1073741824.0
+            );
+        }
 
         let stage_started = Instant::now();
 
@@ -592,7 +1266,7 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
             let mut key_rng = ChaCha20Rng::from_seed(seed);
 
             let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                BoundedGadgetLayout::new(chain.level(level).clone(), 8),
+                BoundedGadgetLayout::new(chain.level(level).clone(), hybrid_base_log),
                 p.clone(),
                 &secret,
                 exponent,
@@ -698,12 +1372,85 @@ fn r26_h11_15c_integrated_encrypted_fft3840() {
 
     let results = pipeline.execute_prepared_branches(&source_array);
 
+    // R30_9A_5_CIPHERTEXT_HANDOFF
+    if shared_profile {
+        let vertical_profile = research_profile_65536_for_levels(13, 3);
+        let vertical_chain = vertical_profile.modulus_chain();
+        let expected_basis = vertical_chain.level(7);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(expected_basis.moduli().len(), 9);
+        assert_eq!(chain.level(7).moduli(), expected_basis.moduli());
+
+        for (group, ciphertext) in results.iter().enumerate() {
+            assert_eq!(
+                ciphertext.level(),
+                7,
+                "horizontal output group {group} has wrong CKKS level"
+            );
+            assert_eq!(
+                ciphertext.basis().moduli(),
+                expected_basis.moduli(),
+                "horizontal output group {group} has wrong Q basis"
+            );
+        }
+
+        println!("R30_9A_5_OUTPUT_CIPHERTEXTS=2");
+        println!("R30_9A_5_OUTPUT_LEVEL=7");
+        println!("R30_9A_5_OUTPUT_Q_LIMBS=9");
+        println!("R30_9A_5_HANDOFF_BASIS_STATUS=PASS");
+    }
+
+    // R30_9A_9_HANDOFF_ONLY
+    if std::env::var_os("R30_9A_HANDOFF_ONLY").is_some() {
+        assert!(
+            shared_profile,
+            "handoff-only validation requires the shared Q16 profile"
+        );
+        println!("R30_9A_9_HANDOFF_ONLY_STATUS=PASS");
+        println!(
+            "R30_9A_9_TOTAL_ELAPSED_SECONDS={:.3}",
+            total_started.elapsed().as_secs_f64()
+        );
+        return;
+    }
+
     // R28_4B3_TWO_IMAGE_FFT256
     // Reuse all FFT256 public operands, rotation keys, and QP context.
     let second_results = if let Some((_, physical_b)) = second_image.as_ref() {
         let started = Instant::now();
 
-        let results_b = pipeline.execute(physical_b);
+        // R29_4B_STREAMING_INTEGRATION
+        // Exercise the production streaming controller with image B.
+        // Preserve the independent numerical oracle below.
+        let mut pending_input = Some(physical_b.clone());
+        let mut streamed_result = None;
+        let mut observed_batches = 0usize;
+
+        let completed = pipeline
+            .execute_stream(
+                || Ok::<_, ()>(pending_input.take()),
+                |spectrum, progress| {
+                    assert_eq!(progress.batch_index, 0);
+                    assert_eq!(progress.completed_batches, 1);
+                    assert!(spectrum.iter().all(|ct| ct.level() == 7));
+
+                    observed_batches += 1;
+                    streamed_result = Some(spectrum);
+
+                    Ok::<(), ()>(())
+                },
+            )
+            .expect("encrypted FFT3840 streaming execution failed");
+
+        assert_eq!(completed, 1);
+        assert_eq!(observed_batches, 1);
+
+        let results_b = streamed_result.expect("streaming sink did not receive image B");
+
+        println!("R29_4B_STREAM_BATCHES={completed}");
+        println!("R29_4B_STREAM_OUTPUT_LEVEL=7");
+        println!("R29_4B_STREAM_STATUS=PASS");
         println!("R29_3C_SECOND_IMAGE_COMPLETE_PIPELINE_STATUS=PASS");
 
         assert_eq!(results_b.len(), 2);

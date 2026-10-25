@@ -46,7 +46,10 @@ pub use galois_key::{
 pub use hybrid_ciphertext::HybridCkksCiphertext;
 pub use hybrid_multiply::{multiply_transition_relinearize_hybrid_ckks, HybridCkksMultiplyConfig};
 // R16_7C2B1_PROFILE_EXPORT
-pub use hybrid_rns_galois_key::apply_hybrid_rns_galois_automorphism_prepared_qp;
+pub use hybrid_rns_galois_key::{
+    apply_hybrid_rns_galois_automorphism_prepared_canonical_qp,
+    apply_hybrid_rns_galois_automorphism_prepared_qp,
+};
 pub use hybrid_rns_galois_key::{profile_hybrid_rns_galois_rotation, HybridRotationTiming};
 
 pub use hybrid_rns_galois_key::{
@@ -86,7 +89,8 @@ pub use rns_multiply::{
     multiply_relinearize_rescale_rns_ckks_with_ntt,
 };
 pub use rns_plain_multiply::{
-    multiply_ntt_resident_rlwe_with_prepared_plaintext, multiply_plain_rns_ckks_with_ntt,
+    multiply_ntt_resident_rlwe_with_prepared_plaintext,
+    multiply_ntt_resident_rlwe_with_prepared_plaintext_resident, multiply_plain_rns_ckks_with_ntt,
     multiply_plain_rns_ckks_with_prepared_ntt, PreparedRnsPlaintextNtt,
 };
 pub use rns_rescale::{rescale_rns_ckks_to_next, rescale_rns_ckks_to_next_observed};

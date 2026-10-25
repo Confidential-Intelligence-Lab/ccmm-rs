@@ -73,6 +73,37 @@ use crate::eblas::mixed_radix_ckks::{
 use crate::ring::{ModulusBasis, ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
 use num_complex::Complex64;
 
+// R29_5_PARALLEL_FFT3840
+use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::sync::OnceLock;
+
+pub(crate) fn fft3840_workers() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let requested = std::env::var("FHE_R29_FFT_WORKERS")
+        .or_else(|_| std::env::var("FHE_RS_WORKERS"))
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid FFT worker count"))
+        .unwrap_or(available);
+
+    assert!(requested > 0, "FFT worker count must be positive");
+    requested.min(available)
+}
+
+pub(crate) fn fft3840_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+    POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(fft3840_workers())
+            .build()
+            .expect("FFT3840 pool initialization failed")
+    })
+}
+
 /// Evaluate the encrypted FFT15 front end on eight packed ciphertexts.
 ///
 /// The caller performs encoding and encryption. Each ciphertext contains
@@ -278,23 +309,30 @@ impl PreparedEncryptedFft15 {
     ) -> [RnsCkksCiphertext; 15] {
         const HALF: usize = 4096;
 
-        let aligned = std::array::from_fn(|tile| {
-            let source = &physical[tile / 2];
+        let aligned: [RnsCkksCiphertext; 15] = fft3840_pool().install(|| {
+            (0..15)
+                .into_par_iter()
+                .map(|tile| {
+                    let source = &physical[tile / 2];
 
-            if tile % 2 == 0 {
-                multiply_complex_slots_cp_prepared(source, mask, chain, prepared0)
-            } else {
-                let shifted = rotate_left_bounded_rns_ckks_with_prepared_execution(
-                    source,
-                    HALF,
-                    prepared_left,
-                    chain,
-                    plan0,
-                    prepared0,
-                );
+                    if tile % 2 == 0 {
+                        multiply_complex_slots_cp_prepared(source, mask, chain, prepared0)
+                    } else {
+                        let shifted = rotate_left_bounded_rns_ckks_with_prepared_execution(
+                            source,
+                            HALF,
+                            prepared_left,
+                            chain,
+                            plan0,
+                            prepared0,
+                        );
 
-                multiply_complex_slots_cp_prepared(&shifted, mask, chain, prepared0)
-            }
+                        multiply_complex_slots_cp_prepared(&shifted, mask, chain, prepared0)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_else(|_| panic!("FFT15 extraction length mismatch"))
         });
 
         assert!(aligned.iter().all(|ct: &RnsCkksCiphertext| ct.level() == 1));
@@ -310,20 +348,27 @@ impl PreparedEncryptedFft15 {
         let keys = RnsCkksEvaluationKeys::new();
         let evaluator = RnsCkksEvaluator::new(chain, &keys);
 
-        let branches = std::array::from_fn(|j| {
-            packed_radix5_dft_cp_prepared(
-                &evaluator,
-                [
-                    &aligned[j],
-                    &aligned[j + 3],
-                    &aligned[j + 6],
-                    &aligned[j + 9],
-                    &aligned[j + 12],
-                ],
-                radix5,
-                chain,
-                prepared1,
-            )
+        let branches: [[RnsCkksCiphertext; 5]; 3] = fft3840_pool().install(|| {
+            (0..3)
+                .into_par_iter()
+                .map(|j| {
+                    packed_radix5_dft_cp_prepared(
+                        &evaluator,
+                        [
+                            &aligned[j],
+                            &aligned[j + 3],
+                            &aligned[j + 6],
+                            &aligned[j + 9],
+                            &aligned[j + 12],
+                        ],
+                        radix5,
+                        chain,
+                        prepared1,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_else(|_| panic!("FFT15 radix5 group count mismatch"))
         });
 
         assert!(branches
@@ -342,15 +387,22 @@ impl PreparedEncryptedFft15 {
         let keys = RnsCkksEvaluationKeys::new();
         let evaluator = RnsCkksEvaluator::new(chain, &keys);
 
-        let groups: [[RnsCkksCiphertext; 3]; 5] = std::array::from_fn(|k| {
-            packed_fft15_twiddled_radix3_cp_prepared(
-                &evaluator,
-                [&branches[0][k], &branches[1][k], &branches[2][k]],
-                k,
-                radix3,
-                chain,
-                prepared2,
-            )
+        let groups: [[RnsCkksCiphertext; 3]; 5] = fft3840_pool().install(|| {
+            (0..5)
+                .into_par_iter()
+                .map(|k| {
+                    packed_fft15_twiddled_radix3_cp_prepared(
+                        &evaluator,
+                        [&branches[0][k], &branches[1][k], &branches[2][k]],
+                        k,
+                        radix3,
+                        chain,
+                        prepared2,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_else(|_| panic!("FFT15 radix3 group count mismatch"))
         });
 
         let sources: [RnsCkksCiphertext; 15] =
@@ -457,6 +509,181 @@ impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
     }
 }
 
+// R29_4A_MEMORY_BOUNDED_STREAMING
+
+/// Progress information for one completed encrypted FFT3840 batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedFft3840BatchProgress {
+    /// Zero-based index of the completed batch.
+    pub batch_index: usize,
+
+    /// Number of batches completed, including this batch.
+    pub completed_batches: usize,
+
+    /// Time spent executing the encrypted FFT3840 pipeline.
+    pub execution_duration: std::time::Duration,
+}
+
+/// Failure reported by an encrypted FFT3840 streaming source or sink.
+#[derive(Debug)]
+pub enum EncryptedFft3840StreamError<E> {
+    Source(E),
+    Sink(E),
+}
+
+impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+    /// Execute successive encrypted FFT3840 batches.
+    ///
+    /// Each source invocation returns one batch of eight level-0
+    /// ciphertexts, or None when the stream is exhausted.
+    ///
+    /// Each completed transform produces two level-7 ciphertexts,
+    /// which are transferred immediately to the output sink.
+    ///
+    /// The controller does not retain ciphertexts from previous
+    /// batches, and reuses the pipeline's prepared operands.
+    ///
+    /// The caller is responsible for compatible ciphertext
+    /// parameters and for enforcing any expected image geometry.
+    pub fn execute_stream<E, Source, Sink>(
+        &self,
+        mut source: Source,
+        mut sink: Sink,
+    ) -> Result<usize, EncryptedFft3840StreamError<E>>
+    where
+        Source: FnMut() -> Result<Option<[RnsCkksCiphertext; 8]>, E>,
+        Sink: FnMut([RnsCkksCiphertext; 2], EncryptedFft3840BatchProgress) -> Result<(), E>,
+    {
+        let mut completed_batches = 0usize;
+
+        loop {
+            let Some(physical) = source().map_err(EncryptedFft3840StreamError::Source)? else {
+                break;
+            };
+
+            let started = std::time::Instant::now();
+
+            let spectrum = self.execute(&physical);
+
+            let execution_duration = started.elapsed();
+
+            let next_completed = completed_batches
+                .checked_add(1)
+                .expect("FFT3840 batch count overflow");
+
+            let progress = EncryptedFft3840BatchProgress {
+                batch_index: completed_batches,
+                completed_batches: next_completed,
+                execution_duration,
+            };
+
+            sink(spectrum, progress).map_err(EncryptedFft3840StreamError::Sink)?;
+
+            completed_batches = next_completed;
+        }
+
+        Ok(completed_batches)
+    }
+}
+
+// R29_10B_TESTABLE_BOUNDED_SCHEDULER
+fn execute_stream_bounded_with<I, O, E, Source, Sink, Execute>(
+    mut source: Source,
+    mut sink: Sink,
+    execute: Execute,
+) -> Result<usize, EncryptedFft3840StreamError<E>>
+where
+    I: Send + Sync,
+    O: Send,
+    Source: FnMut() -> Result<Option<I>, E>,
+    Sink: FnMut(O, EncryptedFft3840BatchProgress) -> Result<(), E>,
+    Execute: Fn(&I) -> O + Sync,
+{
+    let mut completed = 0usize;
+
+    loop {
+        let Some(first) = source().map_err(EncryptedFft3840StreamError::Source)? else {
+            break;
+        };
+
+        // Both inputs are acquired before either evaluation begins.
+        // A failure here leaves the first input consumed but undelivered.
+        let second = source().map_err(EncryptedFft3840StreamError::Source)?;
+
+        let run = |input: &I| {
+            let started = std::time::Instant::now();
+            let output = execute(input);
+            (output, started.elapsed())
+        };
+
+        let (first_result, second_result) = if let Some(second) = second {
+            let (a, b) = fft3840_pool().install(|| rayon::join(|| run(&first), || run(&second)));
+            (a, Some(b))
+        } else {
+            (run(&first), None)
+        };
+
+        let next = completed
+            .checked_add(1)
+            .expect("FFT3840 batch count overflow");
+
+        sink(
+            first_result.0,
+            EncryptedFft3840BatchProgress {
+                batch_index: completed,
+                completed_batches: next,
+                execution_duration: first_result.1,
+            },
+        )
+        .map_err(EncryptedFft3840StreamError::Sink)?;
+
+        completed = next;
+
+        if let Some((output, duration)) = second_result {
+            let next = completed
+                .checked_add(1)
+                .expect("FFT3840 batch count overflow");
+
+            sink(
+                output,
+                EncryptedFft3840BatchProgress {
+                    batch_index: completed,
+                    completed_batches: next,
+                    execution_duration: duration,
+                },
+            )
+            .map_err(EncryptedFft3840StreamError::Sink)?;
+
+            completed = next;
+        } else {
+            break;
+        }
+    }
+
+    Ok(completed)
+}
+
+impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
+    /// Execute at most two encrypted FFT3840 batches concurrently.
+    ///
+    /// Inputs are acquired and outputs delivered sequentially.
+    /// Output order matches input order. Prepared operands are reused.
+    ///
+    /// Source failures during a two-batch fetch can leave an earlier
+    /// input consumed without producing an output.
+    pub fn execute_stream_bounded<E, Source, Sink>(
+        &self,
+        source: Source,
+        sink: Sink,
+    ) -> Result<usize, EncryptedFft3840StreamError<E>>
+    where
+        Source: FnMut() -> Result<Option<[RnsCkksCiphertext; 8]>, E>,
+        Sink: FnMut([RnsCkksCiphertext; 2], EncryptedFft3840BatchProgress) -> Result<(), E>,
+    {
+        execute_stream_bounded_with(source, sink, |physical| self.execute(physical))
+    }
+}
+
 // R29_3B2A_UNIFIED_PIPELINE_MIGRATION
 impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
     /// Execute already-computed FFT15 branches through FFT256.
@@ -467,5 +694,215 @@ impl<'a, 'ctx> EncryptedFft3840Pipeline<'a, 'ctx> {
         branches: &[RnsCkksCiphertext; 15],
     ) -> [RnsCkksCiphertext; 2] {
         self.fft256.execute(branches)
+    }
+}
+
+// R29_9B_PIPELINE_SYNC_PROBE
+#[allow(dead_code)]
+fn r29_9b_assert_pipeline_sync<'a, 'ctx>()
+where
+    'ctx: 'a,
+{
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<EncryptedFft3840Pipeline<'a, 'ctx>>();
+}
+
+// R29_10C_BOUNDED_SCHEDULER_TESTS
+
+// R31_2B_BATCHED_HORIZONTAL_EXECUTOR
+
+/// Execute multiple encrypted FFT3840 horizontal batches.
+///
+/// Each batch contains 15 FFT15 ciphertexts at level 3.
+/// Each output contains two packed FFT3840 ciphertexts at level 7.
+///
+/// Stage zero uses operand-major streaming key generation.
+/// Later stages reuse the caller's level-specific rotation keys.
+///
+/// The caller controls batch-window size and resource lifetimes.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_encrypted_fft3840_batched<F>(
+    batches: &[[RnsCkksCiphertext; 15]],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    later_stages: &[PreparedFft256Stage; 3],
+    evaluator: &RnsCkksEvaluator<'_>,
+    chain: &ModulusChain,
+    prepared_stage0: &PreparedRnsNttPlan,
+    qp_stage0: &RnsNttPlan,
+    prepared_qp_stage0: &PreparedRnsNttPlan,
+    later_contexts: [&StageContext<'_>; 3],
+    make_stage0_key: &mut F,
+) -> Vec<[RnsCkksCiphertext; 2]>
+where
+    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
+{
+    assert!(!batches.is_empty(), "FFT3840 batch window is empty");
+    assert!(batches
+        .iter()
+        .all(|batch| { batch.iter().all(|ct| ct.level() == 3) }));
+
+    let mut outputs =
+        crate::eblas::fused_fft256_handoff::apply_fft3840_packed_fft256_stage0_batched_streaming(
+            batches,
+            prepared_sources,
+            evaluator,
+            chain,
+            prepared_stage0,
+            qp_stage0,
+            prepared_qp_stage0,
+            make_stage0_key,
+        );
+
+    assert_eq!(outputs.len(), batches.len());
+
+    for (stage_index, context) in later_contexts.iter().enumerate() {
+        let expected_input_level = stage_index + 4;
+
+        for pair in &mut outputs {
+            for ciphertext in pair {
+                assert_eq!(ciphertext.level(), expected_input_level);
+
+                *ciphertext = crate::eblas::prepared_radix4_fft256::apply_stage(
+                    ciphertext,
+                    &later_stages[stage_index],
+                    context,
+                );
+
+                assert_eq!(ciphertext.level(), expected_input_level + 1);
+            }
+        }
+    }
+
+    assert!(outputs
+        .iter()
+        .all(|pair| { pair.iter().all(|ct| ct.level() == 7) }));
+
+    outputs
+}
+
+#[cfg(test)]
+mod r29_10c_bounded_scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn zero_through_four_batches_preserve_order() {
+        for count in 0usize..=4 {
+            let mut inputs = 0usize..count;
+            let mut outputs = Vec::new();
+
+            let completed = execute_stream_bounded_with(
+                || Ok::<_, ()>(inputs.next()),
+                |output, progress| {
+                    outputs.push((output, progress.batch_index, progress.completed_batches));
+                    Ok::<(), ()>(())
+                },
+                |input: &usize| input * 7,
+            )
+            .expect("bounded execution failed");
+
+            assert_eq!(completed, count);
+            assert_eq!(outputs.len(), count);
+
+            for (index, (value, batch_index, completed_batches)) in outputs.into_iter().enumerate()
+            {
+                assert_eq!(value, index * 7);
+                assert_eq!(batch_index, index);
+                assert_eq!(completed_batches, index + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn second_source_failure_does_not_execute_first() {
+        let mut calls = 0usize;
+        let executions = AtomicUsize::new(0);
+
+        let result = execute_stream_bounded_with(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Ok::<_, &'static str>(Some(10usize)),
+                    2 => Err("source failure"),
+                    _ => panic!("unexpected source call"),
+                }
+            },
+            |_: usize, _| Ok::<(), &'static str>(()),
+            |input: &usize| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                *input
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(EncryptedFft3840StreamError::Source("source failure"))
+        ));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn first_source_failure_is_propagated() {
+        let result = execute_stream_bounded_with(
+            || Err::<Option<usize>, _>("first source failure"),
+            |_: usize, _| Ok::<(), &'static str>(()),
+            |input: &usize| *input,
+        );
+
+        assert!(matches!(
+            result,
+            Err(EncryptedFft3840StreamError::Source("first source failure"))
+        ));
+    }
+
+    #[test]
+    fn sink_failure_stops_delivery() {
+        let mut inputs = 0usize..4;
+        let mut deliveries = 0usize;
+
+        let result = execute_stream_bounded_with(
+            || Ok::<_, &'static str>(inputs.next()),
+            |_: usize, _| {
+                deliveries += 1;
+                Err::<(), _>("sink failure")
+            },
+            |input: &usize| *input,
+        );
+
+        assert!(matches!(
+            result,
+            Err(EncryptedFft3840StreamError::Sink("sink failure"))
+        ));
+        assert_eq!(deliveries, 1);
+    }
+
+    #[test]
+    fn two_batches_can_overlap() {
+        if fft3840_pool().current_num_threads() < 2 {
+            return;
+        }
+
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut inputs = 0usize..2;
+
+        let completed = execute_stream_bounded_with(
+            || Ok::<_, ()>(inputs.next()),
+            |_: usize, _| Ok::<(), ()>(()),
+            |input: &usize| {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+
+                std::thread::sleep(Duration::from_millis(100));
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                *input
+            },
+        )
+        .expect("parallel execution failed");
+
+        assert_eq!(completed, 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 }

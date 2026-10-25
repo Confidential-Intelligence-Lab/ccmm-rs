@@ -142,12 +142,44 @@ pub fn multiply_ntt_resident_rlwe_with_prepared_plaintext(
         "resident CP plaintext basis mismatch"
     );
 
+    multiply_ntt_resident_rlwe_with_prepared_plaintext_resident(ciphertext, plaintext, plan)
+        .to_coefficient(plan)
+}
+
+/// Multiplies an NTT-resident RLWE ciphertext by a prepared plaintext,
+/// preserving NTT-domain residency in the output.
+///
+/// This operation does not rescale or modify CKKS chain metadata.
+pub fn multiply_ntt_resident_rlwe_with_prepared_plaintext_resident(
+    ciphertext: &crate::grafting::RnsNttRlweCiphertext,
+    plaintext: &PreparedRnsPlaintextNtt,
+    plan: &PreparedRnsNttPlan,
+) -> crate::grafting::RnsNttRlweCiphertext {
+    assert_eq!(
+        ciphertext.degree(),
+        plan.degree(),
+        "resident CP ciphertext degree must match prepared NTT plan"
+    );
+    assert_eq!(
+        ciphertext.moduli(),
+        plan.moduli(),
+        "resident CP ciphertext basis must match prepared NTT plan"
+    );
+    assert_eq!(
+        plaintext.degree(),
+        ciphertext.degree(),
+        "resident CP plaintext degree mismatch"
+    );
+    assert_eq!(
+        plaintext.moduli(),
+        ciphertext.moduli(),
+        "resident CP plaintext basis mismatch"
+    );
+
     let b_product = ciphertext.b().pointwise_mul(plaintext.polynomial());
     let a_product = ciphertext.a().pointwise_mul(plaintext.polynomial());
 
-    let product = crate::grafting::RnsNttRlweCiphertext::new(b_product, a_product);
-
-    product.to_coefficient(plan)
+    crate::grafting::RnsNttRlweCiphertext::new(b_product, a_product)
 }
 
 /// Multiplies an RNS CKKS ciphertext by a reusable NTT-prepared plaintext.
@@ -236,6 +268,88 @@ mod tests {
     use crate::rlwe::RlweCiphertext;
 
     use super::*;
+
+    #[test]
+    fn r30_16b_two_cp_operations_preserve_exact_ciphertext() {
+        use crate::grafting::{RnsNttRlweCiphertext, RnsRlweCiphertext};
+        use crate::rlwe::RlweCiphertext;
+
+        let degree = 8;
+        let basis = ModulusBasis::new(vec![Modulus::new(12_289), Modulus::new(40_961)]);
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
+
+        let ciphertext = RnsRlweCiphertext::from_limbs(
+            basis
+                .moduli()
+                .iter()
+                .copied()
+                .map(|modulus| {
+                    let b = Polynomial::new(modulus, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+                    let a = Polynomial::new(modulus, vec![8, 7, 6, 5, 4, 3, 2, 1]);
+                    RlweCiphertext::new(b, a)
+                })
+                .collect(),
+        );
+
+        let make_plaintext = |coefficients: Vec<u64>| {
+            RnsPolynomial::from_residues(
+                basis
+                    .moduli()
+                    .iter()
+                    .copied()
+                    .map(|modulus| Polynomial::new(modulus, coefficients.clone()))
+                    .collect(),
+            )
+        };
+
+        let plaintext1 = make_plaintext(vec![1, 2, 0, 1, 0, 0, 0, 0]);
+        let plaintext2 = make_plaintext(vec![2, 0, 1, 0, 1, 0, 0, 0]);
+
+        let prepared1 = PreparedRnsPlaintextNtt::new(&plaintext1, &prepared_plan);
+        let prepared2 = PreparedRnsPlaintextNtt::new(&plaintext2, &prepared_plan);
+
+        let input_ntt = RnsNttRlweCiphertext::from_coefficient(&ciphertext, &prepared_plan);
+
+        // Reference: return to coefficient form after the first CP.
+        let reference_intermediate = multiply_ntt_resident_rlwe_with_prepared_plaintext(
+            &input_ntt,
+            &prepared1,
+            &prepared_plan,
+        );
+
+        let reference_intermediate_ntt =
+            RnsNttRlweCiphertext::from_coefficient(&reference_intermediate, &prepared_plan);
+
+        let reference = multiply_ntt_resident_rlwe_with_prepared_plaintext(
+            &reference_intermediate_ntt,
+            &prepared2,
+            &prepared_plan,
+        );
+
+        // Optimized: remain in the NTT domain between CP operations.
+        let resident_intermediate = multiply_ntt_resident_rlwe_with_prepared_plaintext_resident(
+            &input_ntt,
+            &prepared1,
+            &prepared_plan,
+        );
+
+        let resident_final = multiply_ntt_resident_rlwe_with_prepared_plaintext_resident(
+            &resident_intermediate,
+            &prepared2,
+            &prepared_plan,
+        );
+
+        let optimized = resident_final.to_coefficient(&prepared_plan);
+
+        assert_eq!(reference, optimized);
+        assert_eq!(resident_final.degree(), degree);
+        assert_eq!(resident_final.moduli(), basis.moduli());
+
+        println!("R30_16B_EXACT_CIPHERTEXT_EQUALITY=PASS");
+        println!("R30_16B_RESIDENT_CP_CHAIN=PASS");
+    }
 
     #[test]
     fn prepared_plain_multiply_matches_legacy_exactly() {

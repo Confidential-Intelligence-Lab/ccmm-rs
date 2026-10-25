@@ -1311,6 +1311,93 @@ mod tests {
     }
 
     #[test]
+    fn r30_15_nonzero_evaluator_multiply_rotate_contract() {
+        use num_complex::Complex64;
+
+        let chain = ckks_chain();
+        let secret = secret();
+        let degree = secret.len();
+        let scale = 65_537.0;
+
+        let lhs_slots = [
+            Complex64::new(0.25, 0.125),
+            Complex64::new(-0.50, 0.25),
+            Complex64::new(0.75, -0.125),
+            Complex64::new(0.125, 0.50),
+        ];
+        let rhs_slots = [
+            Complex64::new(0.50, -0.25),
+            Complex64::new(0.25, 0.50),
+            Complex64::new(-0.125, 0.25),
+            Complex64::new(0.75, -0.125),
+        ];
+
+        let lhs = encrypt_ckks_slots(&chain, 0, &lhs_slots, scale, &secret, 0x301500);
+        let rhs = encrypt_ckks_slots(&chain, 0, &rhs_slots, scale, &secret, 0x301501);
+
+        let mut keys = crate::ckks::RnsCkksEvaluationKeys::new();
+
+        let mut level0 = crate::ckks::RnsCkksLevelKeys::new(0, chain.level(0).clone());
+        level0.set_multiplication_key(multiplication_key_for_level(&chain, 0, &secret, 0x301502));
+        keys.insert_level(level0);
+
+        let mut level1 = crate::ckks::RnsCkksLevelKeys::new(1, chain.level(1).clone());
+
+        let exponent = crate::ckks::rotation_exponent_left(degree, 1);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x301503);
+        let rotation_key = RnsGaloisKey::generate_with_rng(
+            degree,
+            2,
+            0,
+            &secret,
+            exponent,
+            RnsGadgetLayout::new(chain.level(1).clone(), vec![1, 1]),
+            &mut rng,
+        );
+        level1.insert_galois_key(rotation_key);
+        keys.insert_level(level1);
+
+        let evaluator = crate::ckks::RnsCkksEvaluator::new(&chain, &keys);
+
+        let product = evaluator.multiply(&lhs, &rhs);
+
+        assert_eq!(product.level(), 1);
+        assert_eq!(product.basis(), chain.level(1));
+        assert!(
+            (product.scale() - scale).abs() < 1.0e-9,
+            "unexpected product scale: {}",
+            product.scale()
+        );
+
+        let rotated = evaluator.rotate_left(&product, 1);
+
+        assert_eq!(rotated.level(), 1);
+        assert_eq!(rotated.basis(), chain.level(1));
+        assert_eq!(rotated.scale(), product.scale());
+
+        let actual = decrypt_ckks_slots(&rotated, &secret);
+
+        let product_slots: Vec<_> = lhs_slots
+            .iter()
+            .zip(&rhs_slots)
+            .map(|(&a, &b)| a * b)
+            .collect();
+
+        let expected = [
+            product_slots[1],
+            product_slots[2],
+            product_slots[3],
+            product_slots[0],
+        ];
+
+        assert_complex_vectors_close(&actual, &expected, 0.001);
+
+        println!("R30_15_NONZERO_EVALUATOR_STATUS=PASS");
+        println!("R30_15_LEVEL_TRANSITION=0_TO_1");
+        println!("R30_15_MULTIPLY_ROTATE_STATUS=PASS");
+    }
+
+    #[test]
     fn level_zero_rns_ckks_left_rotation_matches_logical_slots() {
         use num_complex::Complex64;
 

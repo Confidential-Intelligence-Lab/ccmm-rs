@@ -1,4 +1,5 @@
 pub mod batch;
+mod batch_resident;
 pub mod cpmm;
 pub mod multiply;
 pub mod park;

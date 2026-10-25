@@ -261,6 +261,136 @@ mod tests {
         println!("MODULUS_CANONICAL_MUL_EQUIVALENCE=PASS");
     }
 
+    // R36_5F1_PRODUCTION_MODULUS_EQUIVALENCE
+
+    // R36_5F5_COMPLETE_QP_MODULUS_EQUIVALENCE
+    #[test]
+    fn r36_5f5_complete_qp_modulus_equivalence() {
+        use crate::ckks::research_profile_65536_for_levels;
+
+        let profile = research_profile_65536_for_levels(13, 3);
+        let extended = research_profile_65536_for_levels(15, 3);
+
+        let top = profile.modulus_chain().top().clone();
+        let extended_moduli = extended.modulus_chain().top().moduli().to_vec();
+
+        assert_eq!(top.moduli().len(), 16);
+        assert_eq!(extended_moduli.len(), 18);
+        assert_eq!(&extended_moduli[..16], top.moduli());
+
+        // The rotation fixture uses level 3: Q13 + P2.
+        let q = &top.moduli()[..13];
+        let p = &extended_moduli[16..18];
+
+        let mut qp = q.to_vec();
+        qp.extend_from_slice(p);
+
+        assert_eq!(qp.len(), 15);
+
+        for modulus in qp {
+            let prepared = PreparedModulus::new(modulus);
+            let prime = modulus.value();
+
+            let edges = [
+                0,
+                1,
+                2,
+                prime / 3,
+                prime / 2,
+                prime - 3,
+                prime - 2,
+                prime - 1,
+            ];
+
+            for &a in &edges {
+                for &b in &edges {
+                    assert_eq!(
+                        prepared.mul_canonical(a, b),
+                        modulus.mul(a, b),
+                        "QP edge mismatch q={prime} a={a} b={b}"
+                    );
+                }
+            }
+
+            let mut state = 0x365f_5000_1234_5678_u64 ^ prime;
+
+            for _ in 0..50_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let a = state % prime;
+
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let b = state % prime;
+
+                assert_eq!(
+                    prepared.mul_canonical(a, b),
+                    modulus.mul(a, b),
+                    "QP random mismatch q={prime} a={a} b={b}"
+                );
+            }
+
+            println!("R36_5F5_QP_MODULUS={} status=PASS", prime);
+        }
+
+        println!("R36_5F5_QP_MODULUS_COUNT=15");
+        println!("R36_5F5_QP_ARITHMETIC_STATUS=PASS");
+    }
+
+    #[test]
+    fn r36_5f1_prepared_modulus_production_range_equivalence() {
+        let profile = crate::ckks::research_profile_65536_for_levels(13, 3);
+
+        let mut moduli: Vec<u64> = profile.modulus_values().to_vec();
+
+        // Include representative auxiliary-prime and boundary cases.
+        moduli.extend([268_238_849, 68_712_923_137]);
+
+        moduli.sort_unstable();
+        moduli.dedup();
+
+        for q in moduli {
+            let modulus = Modulus::new(q);
+            let prepared = PreparedModulus::new(modulus);
+
+            let edges = [0, 1, 2, q / 4, q / 2, q - 3, q - 2, q - 1];
+
+            for &a in &edges {
+                for &b in &edges {
+                    assert_eq!(
+                        prepared.mul_canonical(a, b),
+                        modulus.mul(a, b),
+                        "edge mismatch q={q} a={a} b={b}"
+                    );
+                }
+            }
+
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ q;
+
+            for _ in 0..20_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let a = state % q;
+
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let b = state % q;
+
+                assert_eq!(
+                    prepared.mul_canonical(a, b),
+                    modulus.mul(a, b),
+                    "random mismatch q={q} a={a} b={b}"
+                );
+            }
+        }
+
+        println!("R36_5F1_PREPARED_MODULUS_EQUIVALENCE=PASS");
+    }
+
     #[test]
     fn prepared_modulus_multiplication_matches_general_multiplication() {
         let moduli = [Modulus::new(268_238_849), Modulus::new(68_712_923_137)];
