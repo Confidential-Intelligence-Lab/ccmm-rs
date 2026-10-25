@@ -12,6 +12,9 @@ therefore separated into:
 
 Evidence in one category does not automatically establish the others.
 
+
+> **FHE-rs v3.0 scope.** FHE-rs is the platform identity; `ccmm-rs` remains the repository and Rust package name. This document separates security-oriented small-parameter CKKS evidence from correctness/performance experiments using large, research-only FFT2 parameters. A numerically successful encrypted computation is not, by itself, a security qualification.
+
 ## Research Parameter Profiles
 
 The realistic CKKS profiles are:
@@ -328,6 +331,65 @@ This result does not weaken the separately characterized bounded-base
 multiplication/relinearization path. A security-bearing PRE service requires an
 appropriate bounded or otherwise noise-controlled generic source-to-target
 key-switch construction, followed by its own security analysis and validation.
+
+
+<!-- FHE_RS_V3_SECURITY_EXTENSION_BEGIN -->
+## FHE-rs v3.0 Large-Scale FFT2 Parameter and Claim Boundary
+
+The encrypted FFT2 research program evaluates **encrypted input data with a public Fourier transform**. Public material includes the transform dimensions, FFT stage schedule, twiddle factors, public masks, and declared packing/layout decisions. The ciphertexts protect the input values under the applicable cryptographic assumptions; the execution does **not** claim to hide the transform, its control flow, ciphertext counts, or observable runtime/memory-access patterns. Secret transforms or private filters are different threat models and require separate designs and analyses.
+
+### Large FFT2 research configurations
+
+The following are *experimental execution configurations*, **not 128-bit-secure parameter profiles**. The smaller `research-4096` security estimate above must not be transferred to them merely because they use CKKS or RNS arithmetic.
+
+| Encrypted FFT2 workload | Ring degree | CKKS slots / ciphertext | Active RNS limbs at top level | FFT levels consumed | Security claim |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 256 x 256 (R30.20K) | 65,536 | 32,768 | 18 | 16 | Research only; `FFT_SECURITY_BEARING=false` |
+| 1024 x 1024 (R17 1K) | 65,536 | 32,768 | 22 | 20 | Research only; no 128-bit claim |
+| 4096 x 4096 (R21/R31.5 hierarchical) | 65,536 | 32,768 | 26 | 24 | Research only; no 128-bit claim |
+
+The 256 x 256 R30.20K configuration reports an approximately 990-bit top-level modulus and a baseline zero-noise evaluation-key mode. The 26-limb 4K parameter pool has approximately 1,430 aggregate modulus bits. These bit counts are **not security estimates**. The exact prime sequence, secret distribution, encryption and evaluation-key error distributions, key-switch gadget, auxiliary moduli (if any), and evaluation-key exposure must be recorded for each future security-bearing profile and submitted to a separate estimator analysis.
+
+A successful FFT2 numerical test establishes functional correctness to its stated tolerance. It does not validate IND-CPA security, evaluation-key circular/KDM assumptions, side-channel resistance, or an overall 128-bit classical-security target. In particular, zero-noise evaluation keys are research fixtures and **must not** be described as equivalent to the R3.1 bounded-base Gaussian reference.
+
+### Evaluation-key families and security inheritance
+
+- **Baseline/CRT and zero-noise evaluation-key paths:** retained for correctness, regression, and differential benchmarking. Their numerical PASS results are not security-bearing claims.
+- **R3.1 bounded-base Gaussian reference:** a distinct, characterized N=4096 construction with the conditional underlying-RLWE estimator result documented above. Its numerical and parameter-security evidence does not automatically extend to the large FFT2 configurations.
+- **Hybrid or alternative key-switch paths:** optimization candidates whose security status depends on the exact deployed implementation and parameters. Each requires explicit accounting for gadget digits, all exposed RLWE samples, any special modulus, ciphertext and evaluation-key error, and estimator inputs before a security claim can be made.
+
+### Parallel execution, working sets, and timing
+
+Worker counts, thread-pool settings, inter-ciphertext concurrency, and local FFT concurrency are **performance configuration metadata**, not cryptographic security parameters. Benchmark reports should distinguish configured concurrency from the measured peak number of simultaneously running threads.
+
+Memory reporting must distinguish (i) serialized or logical ciphertext payload, (ii) live cryptographic working set including evaluation keys and temporary RNS/NTT buffers, (iii) operating-system peak resident set size (RSS), and (iv) platform-specific process memory footprint. These measurements are not interchangeable. Where a measurement is missing, it must remain explicitly unreported rather than be inferred from ciphertext count.
+
+For the v3.0 encrypted FFT2 evidence, report separately: key generation, encode/encrypt, FFT evaluation, decrypt/decode, and total application time; relative L2 and maximum absolute error against the corresponding plaintext oracle; exact thread configuration; and peak RSS. Comparison across R17, R21, R30, and R31.5 requires matching workload, input, parameter profile, timing boundary, and software revision. A kernel microbenchmark speedup is not an end-to-end FFT speedup.
+
+### Security qualification checklist for future large FFT profiles
+
+Before changing any `SECURITY_BEARING=false` marker or making a 128-bit claim, document and validate:
+
+1. The exact ring dimension, RNS primes and total modulus, scale/level schedule, and any auxiliary key-switch modulus.
+2. Secret and error distributions for encryption **and every evaluation-key family**, including a non-degenerate noise model.
+3. Gadget decomposition, key-switch/relinearization/rotation key counts, and the exposure model used for the lattice estimate.
+4. A reproducible Lattice Estimator revision, attack and reduction-cost models, estimated binding security, and margin to the stated target.
+5. The additional circular/KDM assumptions for secret-dependent evaluation keys, and the implementation-level limits of samplers, constant-time behavior, and side channels.
+6. End-to-end numerical validation under the same security-oriented parameter and error configuration, rather than substituting zero-noise correctness fixtures.
+
+### v3.0 FFT evidence locations
+
+Relevant frozen or campaign artifacts include:
+
+```text
+results/icpp_r21_campaign/
+results/fft_milestones/
+results/eblas_fft_evidence/icpp_4k_baseline_r21/
+results/eblas_fft_evidence/r31_5_frozen/
+```
+
+These locations contain historical and optimized runs with different configurations. Their contents must be checked before selecting a publication table row; the paths themselves do not certify that all metrics are complete or directly comparable. Preserve frozen evidence and its original security markers without rewriting it retroactively.
+<!-- FHE_RS_V3_SECURITY_EXTENSION_END -->
 
 ## What Is Not Claimed
 
