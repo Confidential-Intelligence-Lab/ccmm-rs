@@ -18,12 +18,12 @@ env:
 jobs:
   deep-regression:
     name: Deep Regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Toolchain
         run: |
@@ -60,12 +60,12 @@ jobs:
 
   deep-fuzz:
     name: Deep Fuzz
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install nightly
         run: |
@@ -111,12 +111,12 @@ jobs:
 
   supply-chain:
     name: Deep Supply Chain
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
