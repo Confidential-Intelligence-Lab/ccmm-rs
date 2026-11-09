@@ -1031,6 +1031,550 @@ where
     )
 }
 
+// R39_1_GLOBAL_ROTATION_MAJOR_SCHEDULE_ANALYZER
+//
+// Metadata-only analysis. No encryption, key generation, or FFT evaluation.
+// Uses the same global offset ordering as the R38.1 evaluator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct R39RotationScheduleMetrics {
+    pub key_generations: usize,
+    pub terms: usize,
+    pub peak_buffered_terms: usize,
+    pub peak_live_ciphertexts: usize,
+    pub early_consumed_terms: usize,
+}
+
+pub fn analyze_r39_rotation_schedule(
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+) -> R39RotationScheduleMetrics {
+    use std::collections::BTreeMap;
+
+    let mut schedule: BTreeMap<isize, Vec<(usize, usize)>> = BTreeMap::new();
+
+    let mut positions = Vec::with_capacity(15);
+    let mut group_lengths = [0usize; 2];
+
+    for (branch, source) in prepared_sources.iter().enumerate() {
+        let group = usize::from(branch >= 8);
+        positions.push(group_lengths[group]);
+
+        for (operand_index, (offset, _)) in source.operands.iter().enumerate() {
+            schedule
+                .entry(*offset)
+                .or_default()
+                .push((branch, operand_index));
+            group_lengths[group] += 1;
+        }
+    }
+
+    let mut ready = [vec![false; group_lengths[0]], vec![false; group_lengths[1]]];
+    let mut cursors = [0usize; 2];
+    let mut accumulators = [false; 2];
+
+    let mut buffered = 0usize;
+    let mut peak_buffered = 0usize;
+    let mut peak_live = 0usize;
+    let mut consumed = 0usize;
+    let mut early_consumed = 0usize;
+
+    let total_terms = group_lengths.iter().sum::<usize>();
+    let total_offsets = schedule.len();
+
+    for (offset_index, (&offset, work)) in schedule.iter().enumerate() {
+        for &(branch, operand_index) in work {
+            let group = usize::from(branch >= 8);
+            let position = positions[branch] + operand_index;
+
+            assert!(!ready[group][position], "duplicate R39 term");
+            ready[group][position] = true;
+            buffered += 1;
+
+            peak_buffered = peak_buffered.max(buffered);
+            peak_live =
+                peak_live.max(buffered + accumulators.iter().filter(|&&active| active).count());
+
+            while cursors[group] < group_lengths[group] && ready[group][cursors[group]] {
+                ready[group][cursors[group]] = false;
+                cursors[group] += 1;
+                buffered -= 1;
+                consumed += 1;
+                accumulators[group] = true;
+
+                if offset_index + 1 < total_offsets {
+                    early_consumed += 1;
+                }
+
+                peak_live =
+                    peak_live.max(buffered + accumulators.iter().filter(|&&active| active).count());
+            }
+        }
+
+        let _ = offset;
+    }
+
+    assert_eq!(cursors, group_lengths);
+    assert_eq!(consumed, total_terms);
+    assert_eq!(buffered, 0);
+
+    R39RotationScheduleMetrics {
+        key_generations: schedule.keys().filter(|&&offset| offset != 0).count(),
+        terms: total_terms,
+        peak_buffered_terms: peak_buffered,
+        peak_live_ciphertexts: peak_live,
+        early_consumed_terms: early_consumed,
+    }
+}
+
+// R38_1_ROTATION_MAJOR_EXACT_ORDER_CANDIDATE
+//
+// Experimental only. This evaluator is deliberately not wired into
+// production UHD execution.
+//
+// Compute terms in rotation-major order, then accumulate in the exact
+// original branch-major, operand-major order.
+//
+// Memory cost: all encrypted terms for the selected batch window.
+// Key residency: one transient generated rotation key at a time.
+//
+// This is an exact-order-preserving prototype, not a bounded-memory
+// production implementation.
+
+fn r38_1_rotation_schedule(
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+) -> BTreeMap<isize, Vec<(usize, usize)>> {
+    let mut schedule = BTreeMap::<isize, Vec<(usize, usize)>>::new();
+
+    for (branch, source) in prepared_sources.iter().enumerate() {
+        for (operand_index, (offset, _)) in source.operands.iter().enumerate() {
+            schedule
+                .entry(*offset)
+                .or_default()
+                .push((branch, operand_index));
+        }
+    }
+
+    schedule
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_fft3840_packed_fft256_stage0_rotation_major_r38_1<F>(
+    batches: &[[RnsCkksCiphertext; 15]],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
+    chain: &ModulusChain,
+    prepared: &PreparedRnsNttPlan,
+    qp_plan: &crate::ring::RnsNttPlan,
+    prepared_qp: &PreparedRnsNttPlan,
+    make_key: &mut F,
+) -> Vec<[RnsCkksCiphertext; 2]>
+where
+    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
+{
+    assert!(!batches.is_empty(), "R38.1 requires at least one batch");
+    assert!(
+        batches.len() <= 2,
+        "R38.1 prototype is restricted to two batches"
+    );
+
+    for batch in batches {
+        assert!(batch.iter().all(|ct| ct.level() == 3));
+    }
+
+    assert_eq!(chain.level(3).moduli(), prepared.moduli());
+
+    for source in prepared_sources {
+        assert_eq!(source.level, 3);
+    }
+
+    let schedule = r38_1_rotation_schedule(prepared_sources);
+
+    let unique_nonzero = schedule.keys().filter(|&&offset| offset != 0).count();
+
+    // [batch][branch][operand] stores encrypted terms.
+    // Each term is written exactly once and later consumed in
+    // the original reference evaluator's accumulation order.
+    let mut terms: Vec<Vec<Vec<Option<RnsCkksCiphertext>>>> = batches
+        .iter()
+        .map(|_| {
+            prepared_sources
+                .iter()
+                .map(|source| {
+                    std::iter::repeat_with(|| None)
+                        .take(source.operands.len())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    // R38_2A_CANONICAL_SOURCE_HOISTING
+    // Prepare each canonical source once per batch and branch.
+    let canonical_sources: Vec<Vec<crate::grafting::PreparedCanonicalGaloisSource>> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|input| {
+                    let original_a = crate::ring::RnsPolynomial::from_residues(
+                        input
+                            .rlwe()
+                            .limbs()
+                            .iter()
+                            .map(|limb| limb.a().clone())
+                            .collect(),
+                    );
+                    crate::grafting::PreparedCanonicalGaloisSource::new(&original_a)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut key_generations = 0usize;
+    let mut term_count = 0usize;
+
+    for (&offset, work) in &schedule {
+        let key = if offset == 0 {
+            None
+        } else {
+            key_generations += 1;
+            Some(make_key(offset))
+        };
+
+        for &(branch, operand_index) in work {
+            let source = &prepared_sources[branch];
+            let (expected_offset, plaintext) = &source.operands[operand_index];
+
+            assert_eq!(*expected_offset, offset);
+
+            for (batch_index, batch) in batches.iter().enumerate() {
+                let input = &batch[branch];
+
+                input.assert_matches_chain(chain);
+                assert_eq!(input.basis().moduli(), prepared.moduli());
+
+                let rotated = key.as_ref().map(|key| {
+                    let rlwe =
+                        crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
+                            input.rlwe(),
+                            key,
+                            qp_plan,
+                            prepared_qp,
+                            &canonical_sources[batch_index][branch],
+                        );
+
+                    RnsCkksCiphertext::new(rlwe, input.state().clone(), chain)
+                });
+
+                let operand = rotated.as_ref().unwrap_or(input);
+
+                let term = multiply_plain_rns_ckks_with_prepared_ntt(
+                    operand,
+                    plaintext,
+                    source.plain_scale,
+                    chain,
+                    prepared,
+                );
+
+                assert!(
+                    terms[batch_index][branch][operand_index]
+                        .replace(term)
+                        .is_none(),
+                    "R38.1 duplicate term"
+                );
+
+                term_count += 1;
+            }
+        }
+
+        // The generated key is dropped here before the next offset.
+    }
+
+    assert_eq!(key_generations, unique_nonzero);
+
+    let mut outputs = Vec::with_capacity(batches.len());
+
+    for batch_terms in &mut terms {
+        let mut group_outputs = Vec::with_capacity(2);
+
+        for group in 0..2 {
+            let range = if group == 0 { 0..8 } else { 8..15 };
+
+            let mut accumulator: Option<RnsCkksCiphertext> = None;
+
+            for branch in range {
+                for operand_index in 0..prepared_sources[branch].operands.len() {
+                    let term = batch_terms[branch][operand_index]
+                        .take()
+                        .expect("R38.1 missing encrypted term");
+
+                    accumulator = Some(match accumulator.take() {
+                        Some(previous) => evaluator.add(&previous, &term),
+                        None => term,
+                    });
+                }
+            }
+
+            let result = rescale_rns_ckks_to_next(
+                &accumulator.expect("R38.1 empty group accumulator"),
+                chain,
+            );
+
+            assert_eq!(result.level(), 4);
+            group_outputs.push(result);
+        }
+
+        let second = group_outputs.pop().expect("missing group 1");
+        let first = group_outputs.pop().expect("missing group 0");
+
+        outputs.push([first, second]);
+    }
+
+    println!("R38_1_UNIQUE_NONZERO_ROTATIONS={unique_nonzero}");
+    println!("R38_1_KEY_GENERATIONS={key_generations}");
+    println!("R38_1_ENCRYPTED_TERMS={term_count}");
+    println!("R38_1_BATCHES={}", batches.len());
+    println!("R38_1_STATUS=COMPLETED_UNVALIDATED");
+
+    outputs
+}
+
+// R39_3B_FIRST_USE_BOUNDED_MEMORY_EVALUATOR
+//
+// First-use rotation scheduling with exact-order progressive accumulation.
+// Preserves the R38.4 arithmetic and canonical-source preparation.
+// The caller owns key generation; one transient rotation key is live at a time.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_fft3840_packed_fft256_stage0_first_use_r39_3b<F>(
+    batches: &[[RnsCkksCiphertext; 15]],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
+    chain: &ModulusChain,
+    prepared: &PreparedRnsNttPlan,
+    qp_plan: &crate::ring::RnsNttPlan,
+    prepared_qp: &PreparedRnsNttPlan,
+    make_key: &mut F,
+) -> Vec<[RnsCkksCiphertext; 2]>
+where
+    F: FnMut(isize) -> crate::ckks::PreparedHybridRnsGaloisKey,
+{
+    let mut provider =
+        |offset: isize, consume: &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)| {
+            let key = make_key(offset);
+            consume(&key);
+        };
+
+    apply_fft3840_packed_fft256_stage0_first_use_with_provider(
+        batches,
+        prepared_sources,
+        evaluator,
+        chain,
+        prepared,
+        qp_plan,
+        prepared_qp,
+        &mut provider,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_fft3840_packed_fft256_stage0_first_use_with_provider<F>(
+    batches: &[[RnsCkksCiphertext; 15]],
+    prepared_sources: &[PreparedFusedFft256Source; 15],
+    evaluator: &crate::ckks::RnsCkksEvaluator<'_>,
+    chain: &ModulusChain,
+    prepared: &PreparedRnsNttPlan,
+    qp_plan: &crate::ring::RnsNttPlan,
+    prepared_qp: &PreparedRnsNttPlan,
+    provider: &mut F,
+) -> Vec<[RnsCkksCiphertext; 2]>
+where
+    F: FnMut(isize, &mut dyn FnMut(&crate::ckks::PreparedHybridRnsGaloisKey)),
+{
+    assert!(!batches.is_empty(), "R39.3b requires at least one batch");
+    assert!(batches.len() <= 2, "R39.3b supports at most two batches");
+
+    for batch in batches {
+        assert!(batch.iter().all(|ct| ct.level() == 3));
+    }
+    assert_eq!(chain.level(3).moduli(), prepared.moduli());
+    for source in prepared_sources {
+        assert_eq!(source.level, 3);
+    }
+
+    let schedule = r38_1_rotation_schedule(prepared_sources);
+    let mut offsets: Vec<isize> = schedule.keys().copied().collect();
+
+    // The first occurrence is defined in the reference accumulation order.
+    let mut positions = [0usize; 15];
+    let mut group_lengths = [0usize; 2];
+    for (branch, source) in prepared_sources.iter().enumerate() {
+        let group = usize::from(branch >= 8);
+        positions[branch] = group_lengths[group];
+        group_lengths[group] += source.operands.len();
+    }
+
+    offsets.sort_by_key(|offset| {
+        let first = schedule[offset]
+            .iter()
+            .map(|&(branch, operand_index)| {
+                let group = usize::from(branch >= 8);
+                (positions[branch] + operand_index, group)
+            })
+            .min()
+            .expect("empty rotation work");
+        (first, *offset)
+    });
+
+    // [batch][group][position]: term buffering.
+    let mut pending: Vec<[Vec<Option<RnsCkksCiphertext>>; 2]> = batches
+        .iter()
+        .map(|_| {
+            [
+                std::iter::repeat_with(|| None)
+                    .take(group_lengths[0])
+                    .collect(),
+                std::iter::repeat_with(|| None)
+                    .take(group_lengths[1])
+                    .collect(),
+            ]
+        })
+        .collect();
+
+    let mut cursors = vec![[0usize; 2]; batches.len()];
+    let mut accumulators: Vec<[Option<RnsCkksCiphertext>; 2]> =
+        batches.iter().map(|_| [None, None]).collect();
+
+    // Canonical-source hoisting is identical to R38.4.
+    let canonical_sources: Vec<Vec<crate::grafting::PreparedCanonicalGaloisSource>> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|input| {
+                    let original_a = crate::ring::RnsPolynomial::from_residues(
+                        input
+                            .rlwe()
+                            .limbs()
+                            .iter()
+                            .map(|limb| limb.a().clone())
+                            .collect(),
+                    );
+                    crate::grafting::PreparedCanonicalGaloisSource::new(&original_a)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut key_generations = 0usize;
+    let mut term_count = 0usize;
+    let mut buffered = 0usize;
+    let mut peak_buffered = 0usize;
+
+    for offset in offsets {
+        let mut process_offset = |key: Option<&crate::ckks::PreparedHybridRnsGaloisKey>| {
+            for &(branch, operand_index) in &schedule[&offset] {
+                let source = &prepared_sources[branch];
+                let (expected_offset, plaintext) = &source.operands[operand_index];
+                assert_eq!(*expected_offset, offset);
+
+                let group = usize::from(branch >= 8);
+                let position = positions[branch] + operand_index;
+
+                for (batch_index, batch) in batches.iter().enumerate() {
+                    let input = &batch[branch];
+                    input.assert_matches_chain(chain);
+                    assert_eq!(input.basis().moduli(), prepared.moduli());
+
+                    let rotated = key.map(|key| {
+                        let rlwe =
+                            crate::ckks::apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
+                                input.rlwe(),
+                                key,
+                                qp_plan,
+                                prepared_qp,
+                                &canonical_sources[batch_index][branch],
+                            );
+                        RnsCkksCiphertext::new(rlwe, input.state().clone(), chain)
+                    });
+
+                    let operand = rotated.as_ref().unwrap_or(input);
+                    let term = multiply_plain_rns_ckks_with_prepared_ntt(
+                        operand,
+                        plaintext,
+                        source.plain_scale,
+                        chain,
+                        prepared,
+                    );
+
+                    assert!(
+                        pending[batch_index][group][position]
+                            .replace(term)
+                            .is_none(),
+                        "R39.3b duplicate encrypted term"
+                    );
+
+                    buffered += 1;
+                    peak_buffered = peak_buffered.max(buffered);
+                    term_count += 1;
+
+                    while cursors[batch_index][group] < group_lengths[group] {
+                        let cursor = cursors[batch_index][group];
+                        let Some(next_term) = pending[batch_index][group][cursor].take() else {
+                            break;
+                        };
+
+                        let previous = accumulators[batch_index][group].take();
+                        accumulators[batch_index][group] = Some(match previous {
+                            Some(previous) => evaluator.add(&previous, &next_term),
+                            None => next_term,
+                        });
+
+                        cursors[batch_index][group] += 1;
+                        buffered -= 1;
+                    }
+                }
+            }
+        };
+
+        if offset == 0 {
+            process_offset(None);
+        } else {
+            key_generations += 1;
+            let mut consume = |key: &crate::ckks::PreparedHybridRnsGaloisKey| {
+                process_offset(Some(key));
+            };
+            provider(offset, &mut consume);
+        }
+    }
+
+    assert_eq!(
+        key_generations,
+        schedule.keys().filter(|&&o| o != 0).count()
+    );
+    assert_eq!(buffered, 0);
+
+    let mut outputs = Vec::with_capacity(batches.len());
+    for (batch_index, group_accumulators) in accumulators.into_iter().enumerate() {
+        assert_eq!(cursors[batch_index], group_lengths);
+        let [first, second] = group_accumulators;
+
+        let first = rescale_rns_ckks_to_next(&first.expect("R39.3b empty group 0"), chain);
+        let second = rescale_rns_ckks_to_next(&second.expect("R39.3b empty group 1"), chain);
+
+        assert_eq!(first.level(), 4);
+        assert_eq!(second.level(), 4);
+        outputs.push([first, second]);
+    }
+
+    println!("R39_3B_KEY_GENERATIONS={key_generations}");
+    println!("R39_3B_ENCRYPTED_TERMS={term_count}");
+    println!("R39_3B_BATCHES={}", batches.len());
+    println!("R39_3B_PEAK_BUFFERED_TERMS={peak_buffered}");
+    println!("R39_3B_STATUS=COMPLETED_UNVALIDATED");
+
+    outputs
+}
+
 /// Streaming first-stage FFT3840 evaluation. Groups are evaluated sequentially
 /// to guarantee at most one hybrid rotation key is resident at a time.
 #[allow(clippy::too_many_arguments)]
@@ -1591,5 +2135,60 @@ mod r36_8e_2_cache_tests {
         assert!(cache.should_retain(3));
         assert!(cache.should_retain(7));
         assert!(!cache.should_retain(5));
+    }
+}
+
+// R38_1_ROTATION_SCHEDULE_TESTS
+#[cfg(test)]
+mod r38_1_rotation_schedule_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn rotation_major_replay_preserves_original_term_order() {
+        let branches: Vec<Vec<isize>> = vec![vec![0, 4, 8, 4], vec![8, 0, 4], vec![-4, 8, 0]];
+
+        let original: Vec<(usize, usize)> = branches
+            .iter()
+            .enumerate()
+            .flat_map(|(branch, offsets)| {
+                offsets
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, _)| (branch, index))
+            })
+            .collect();
+
+        let mut rotation_major = BTreeMap::<isize, Vec<(usize, usize)>>::new();
+
+        for (branch, offsets) in branches.iter().enumerate() {
+            for (index, &offset) in offsets.iter().enumerate() {
+                rotation_major
+                    .entry(offset)
+                    .or_default()
+                    .push((branch, index));
+            }
+        }
+
+        let mut produced = BTreeSet::new();
+
+        for work in rotation_major.values() {
+            for &position in work {
+                assert!(produced.insert(position));
+            }
+        }
+
+        assert_eq!(produced.len(), original.len());
+
+        let replay: Vec<_> = original
+            .iter()
+            .copied()
+            .filter(|position| produced.contains(position))
+            .collect();
+
+        assert_eq!(replay, original);
+
+        let nonzero_keys = rotation_major.keys().filter(|&&offset| offset != 0).count();
+
+        assert_eq!(nonzero_keys, 3);
     }
 }

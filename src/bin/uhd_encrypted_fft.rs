@@ -24,7 +24,9 @@ use ccmm_rs::eblas::fused_fft256_handoff::{
     apply_fft3840_packed_fft256_stage0_batched_streaming_cached,
     apply_fft3840_packed_fft256_stage0_batched_streaming_configured,
     apply_fft3840_packed_fft256_stage0_batched_streaming_with_provider,
-    Fft3840PersistentStage0KeyCache,
+    apply_fft3840_packed_fft256_stage0_first_use_r39_3b,
+    apply_fft3840_packed_fft256_stage0_first_use_with_provider,
+    apply_fft3840_packed_fft256_stage0_rotation_major_r38_1, Fft3840PersistentStage0KeyCache,
 };
 use ccmm_rs::eblas::prepared_radix4_fft256::RotationKeys as UhdRotationKeys;
 use ccmm_rs::grafting::{
@@ -507,6 +509,378 @@ fn main() {
         println!("R30_9A_HANDOFF_Q_LIMBS=9");
     }
 
+    // R39_3A_FIRST_USE_TRACE_EQUIVALENCE
+    // Metadata-only validation; no encryption or key generation.
+    if std::env::var("FHE_R39_3A_VERIFY_TRACE").as_deref() == Ok("1") {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut schedule: BTreeMap<isize, Vec<(usize, usize, usize)>> = BTreeMap::new();
+        let mut lengths = [0usize; 2];
+
+        for branch in 0..15 {
+            let destination_lane = if branch < 8 { branch } else { branch - 8 };
+            let diagonals = fuse_fft256_source_lane(
+                &first_stage_diagonals(branch),
+                SLOTS,
+                LANE_SLOTS,
+                0,
+                destination_lane,
+            );
+
+            let group = usize::from(branch >= 8);
+
+            for (operand_index, offset) in diagonals.keys().copied().enumerate() {
+                schedule.entry(offset).or_default().push((
+                    group,
+                    lengths[group],
+                    branch * 1000 + operand_index,
+                ));
+                lengths[group] += 1;
+            }
+        }
+
+        let mut offsets: Vec<isize> = schedule.keys().copied().collect();
+
+        offsets.sort_by_key(|offset| {
+            let first = schedule[offset]
+                .iter()
+                .map(|&(group, position, _)| (position, group))
+                .min()
+                .expect("empty rotation work");
+            (first, *offset)
+        });
+
+        let mut ready = [vec![None; lengths[0]], vec![None; lengths[1]]];
+        let mut next = [0usize; 2];
+        let mut consumed = [Vec::new(), Vec::new()];
+        let mut seen = BTreeSet::new();
+
+        let mut buffered = 0usize;
+        let mut peak_buffered = 0usize;
+        let mut peak_live = 0usize;
+        let mut active = [false; 2];
+
+        for offset in &offsets {
+            for &(group, position, term_id) in &schedule[offset] {
+                assert!(seen.insert((group, position, term_id)));
+                assert!(ready[group][position].is_none());
+
+                ready[group][position] = Some(term_id);
+                buffered += 1;
+
+                peak_buffered = peak_buffered.max(buffered);
+                peak_live = peak_live.max(buffered + active.iter().filter(|&&value| value).count());
+
+                while next[group] < lengths[group] {
+                    let Some(id) = ready[group][next[group]].take() else {
+                        break;
+                    };
+
+                    consumed[group].push(id);
+                    next[group] += 1;
+                    buffered -= 1;
+                    active[group] = true;
+
+                    peak_live =
+                        peak_live.max(buffered + active.iter().filter(|&&value| value).count());
+                }
+            }
+        }
+
+        let expected = |group: usize| {
+            let mut result = Vec::new();
+            let range = if group == 0 { 0..8 } else { 8..15 };
+
+            for branch in range {
+                let destination_lane = if branch < 8 { branch } else { branch - 8 };
+                let diagonals = fuse_fft256_source_lane(
+                    &first_stage_diagonals(branch),
+                    SLOTS,
+                    LANE_SLOTS,
+                    0,
+                    destination_lane,
+                );
+
+                for operand_index in 0..diagonals.len() {
+                    result.push(branch * 1000 + operand_index);
+                }
+            }
+            result
+        };
+
+        assert_eq!(consumed[0], expected(0));
+        assert_eq!(consumed[1], expected(1));
+        assert_eq!(next, lengths);
+        assert_eq!(buffered, 0);
+        assert_eq!(seen.len(), 105);
+        assert_eq!(offsets.len(), 56);
+        assert_eq!(offsets.iter().filter(|&&o| o != 0).count(), 55);
+        assert_eq!(peak_buffered, 1);
+        assert_eq!(peak_live, 3);
+
+        println!("R39_3A_TERMS_VERIFIED={}", seen.len());
+        println!("R39_3A_ROTATION_KEYS=55");
+        println!("R39_3A_GROUP0_TERMS={}", consumed[0].len());
+        println!("R39_3A_GROUP1_TERMS={}", consumed[1].len());
+        println!("R39_3A_PEAK_BUFFERED={peak_buffered}");
+        println!("R39_3A_PEAK_LIVE={peak_live}");
+        println!("R39_3A_TRACE_EQUIVALENCE=PASS");
+        println!("R39_3A_STATUS=PASS");
+        return;
+    }
+
+    // R39_2_ROTATION_ORDER_OPTIMIZATION
+    // Structural scheduling only: no encryption or key generation.
+    if std::env::var("FHE_R39_2_ANALYZE_ORDER").as_deref() == Ok("1") {
+        use std::collections::BTreeMap;
+
+        let mut schedule: BTreeMap<isize, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut lengths = [0usize; 2];
+
+        for branch in 0..15 {
+            let destination_lane = if branch < 8 { branch } else { branch - 8 };
+            let diagonals = fuse_fft256_source_lane(
+                &first_stage_diagonals(branch),
+                SLOTS,
+                LANE_SLOTS,
+                0,
+                destination_lane,
+            );
+            let group = usize::from(branch >= 8);
+            for offset in diagonals.keys().copied() {
+                schedule
+                    .entry(offset)
+                    .or_default()
+                    .push((group, lengths[group]));
+                lengths[group] += 1;
+            }
+        }
+
+        #[derive(Clone)]
+        struct State {
+            ready: [Vec<bool>; 2],
+            next: [usize; 2],
+            active: [bool; 2],
+            buffered: usize,
+            peak_buffered: usize,
+            peak_live: usize,
+            consumed: usize,
+        }
+
+        impl State {
+            fn new(lengths: [usize; 2]) -> Self {
+                Self {
+                    ready: [vec![false; lengths[0]], vec![false; lengths[1]]],
+                    next: [0; 2],
+                    active: [false; 2],
+                    buffered: 0,
+                    peak_buffered: 0,
+                    peak_live: 0,
+                    consumed: 0,
+                }
+            }
+
+            fn apply(&mut self, work: &[(usize, usize)]) {
+                for &(group, position) in work {
+                    assert!(!self.ready[group][position]);
+                    self.ready[group][position] = true;
+                    self.buffered += 1;
+
+                    self.peak_buffered = self.peak_buffered.max(self.buffered);
+                    self.peak_live = self
+                        .peak_live
+                        .max(self.buffered + self.active.iter().filter(|&&v| v).count());
+
+                    while self.next[group] < self.ready[group].len()
+                        && self.ready[group][self.next[group]]
+                    {
+                        self.ready[group][self.next[group]] = false;
+                        self.next[group] += 1;
+                        self.buffered -= 1;
+                        self.consumed += 1;
+                        self.active[group] = true;
+
+                        self.peak_live = self
+                            .peak_live
+                            .max(self.buffered + self.active.iter().filter(|&&v| v).count());
+                    }
+                }
+            }
+        }
+
+        let offsets: Vec<isize> = schedule.keys().copied().collect();
+
+        let simulate = |order: &[isize]| {
+            let mut state = State::new(lengths);
+            for offset in order {
+                state.apply(&schedule[offset]);
+            }
+            assert_eq!(state.next, lengths);
+            assert_eq!(state.buffered, 0);
+            assert_eq!(state.consumed, lengths.iter().sum::<usize>());
+            state
+        };
+
+        let ascending = offsets.clone();
+
+        let mut first_use = offsets.clone();
+        first_use.sort_by_key(|offset| {
+            let earliest = schedule[offset]
+                .iter()
+                .map(|&(group, position)| (position, group))
+                .min()
+                .expect("empty rotation work");
+            (earliest, *offset)
+        });
+
+        let mut greedy = Vec::with_capacity(offsets.len());
+        let mut remaining = offsets.clone();
+        let mut state = State::new(lengths);
+
+        while !remaining.is_empty() {
+            let mut best_index = 0usize;
+            let mut best_score = None;
+
+            for (index, offset) in remaining.iter().enumerate() {
+                let mut trial = state.clone();
+                trial.apply(&schedule[offset]);
+
+                let score = (
+                    trial.peak_live,
+                    trial.peak_buffered,
+                    std::cmp::Reverse(trial.consumed - state.consumed),
+                    trial.buffered,
+                    *offset,
+                );
+
+                if best_score.as_ref().is_none_or(|best| score < *best) {
+                    best_score = Some(score);
+                    best_index = index;
+                }
+            }
+
+            let selected = remaining.remove(best_index);
+            state.apply(&schedule[&selected]);
+            greedy.push(selected);
+        }
+
+        let baseline = simulate(&ascending);
+        let first = simulate(&first_use);
+        let optimized = simulate(&greedy);
+
+        assert_eq!(offsets.len(), 56, "unexpected total rotation offsets");
+        assert_eq!(
+            offsets.iter().filter(|&&offset| offset != 0).count(),
+            55,
+            "unexpected key count"
+        );
+        assert_eq!(lengths.iter().sum::<usize>(), 105);
+        assert_eq!(baseline.peak_buffered, 92);
+        assert_eq!(baseline.peak_live, 94);
+
+        for (name, result) in [
+            ("ASCENDING", &baseline),
+            ("FIRST_USE", &first),
+            ("GREEDY", &optimized),
+        ] {
+            println!("R39_2_{name}_PEAK_BUFFERED={}", result.peak_buffered);
+            println!("R39_2_{name}_PEAK_LIVE={}", result.peak_live);
+        }
+
+        println!("R39_2_ROTATIONS={}", offsets.len());
+        println!("R39_2_KEY_GENERATIONS=55");
+        println!("R39_2_TERMS=105");
+        println!("R39_2_GREEDY_ORDER={greedy:?}");
+        println!("R39_2_STATUS=PASS");
+        return;
+    }
+
+    // R39_1C_GLOBAL_ROTATION_SCHEDULE_ANALYSIS
+    // Metadata only: no ciphertexts, NTT preparation, or key generation.
+    if std::env::var("FHE_R39_1C_ANALYZE_SCHEDULE").as_deref() == Ok("1") {
+        use std::collections::BTreeMap;
+
+        let mut schedule: BTreeMap<isize, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut lengths = [0usize; 2];
+
+        for branch in 0..15 {
+            let destination_lane = if branch < 8 { branch } else { branch - 8 };
+            let diagonals = fuse_fft256_source_lane(
+                &first_stage_diagonals(branch),
+                SLOTS,
+                LANE_SLOTS,
+                0,
+                destination_lane,
+            );
+
+            let group = usize::from(branch >= 8);
+
+            for offset in diagonals.keys().copied() {
+                schedule
+                    .entry(offset)
+                    .or_default()
+                    .push((group, lengths[group]));
+                lengths[group] += 1;
+            }
+        }
+
+        let mut ready = [vec![false; lengths[0]], vec![false; lengths[1]]];
+        let mut next = [0usize; 2];
+        let mut active = [false; 2];
+
+        let mut buffered = 0usize;
+        let mut peak_buffered = 0usize;
+        let mut peak_live = 0usize;
+        let mut consumed = 0usize;
+        let mut early_consumed = 0usize;
+
+        for (offset_index, work) in schedule.values().enumerate() {
+            for &(group, position) in work {
+                assert!(!ready[group][position]);
+                ready[group][position] = true;
+                buffered += 1;
+
+                peak_buffered = peak_buffered.max(buffered);
+                peak_live = peak_live.max(buffered + active.iter().filter(|&&value| value).count());
+
+                while next[group] < lengths[group] && ready[group][next[group]] {
+                    ready[group][next[group]] = false;
+                    next[group] += 1;
+                    buffered -= 1;
+                    consumed += 1;
+                    active[group] = true;
+
+                    if offset_index + 1 < schedule.len() {
+                        early_consumed += 1;
+                    }
+
+                    peak_live =
+                        peak_live.max(buffered + active.iter().filter(|&&value| value).count());
+                }
+            }
+        }
+
+        let total_terms = lengths.iter().sum::<usize>();
+        let key_generations = schedule.keys().filter(|&&offset| offset != 0).count();
+
+        assert_eq!(next, lengths);
+        assert_eq!(consumed, total_terms);
+        assert_eq!(buffered, 0);
+        assert_eq!(key_generations, 55, "unexpected rotation schedule");
+        assert_eq!(total_terms, 105, "unexpected term schedule");
+
+        println!("R39_1_KEY_GENERATIONS={key_generations}");
+        println!("R39_1_TERMS={total_terms}");
+        println!("R39_1_GROUP0_TERMS={}", lengths[0]);
+        println!("R39_1_GROUP1_TERMS={}", lengths[1]);
+        println!("R39_1_PEAK_BUFFERED_TERMS={peak_buffered}");
+        println!("R39_1_PEAK_LIVE_CIPHERTEXTS={peak_live}");
+        println!("R39_1_EARLY_CONSUMED_TERMS={early_consumed}");
+        println!("R39_1_ORDER_STATUS=PASS");
+        println!("R39_1_STATUS=PASS");
+        return;
+    }
+
     // R36_7B_EARLY_ROTATION_MAJOR_ANALYSIS
     // Structural scheduling only: no ciphertexts, prepared operands,
     // encryption, Galois-key generation, or encrypted FFT evaluation.
@@ -956,6 +1330,88 @@ fn main() {
         })
         .collect();
 
+    // R39_3D_EARLY_AUTHORIZATION
+    if std::env::var("FHE_R39_3C_VALIDATE").as_deref() == Ok("1")
+        || std::env::var("FHE_R39_4E_VALIDATE").as_deref() == Ok("1")
+    {
+        assert_eq!(
+            std::env::var("FHE_R38_2B_VALIDATE").as_deref(),
+            Ok("1"),
+            "R39.3c requires the guarded R38 encrypted validation mode"
+        );
+        assert_eq!(
+            std::env::var("FHE_R38_MEMORY_AUTHORIZED").as_deref(),
+            Ok("1"),
+            "R39.3c requires explicit memory authorization"
+        );
+        assert_eq!(
+            std::env::var("FHE_R27_KEYGEN_THREADS").as_deref(),
+            Ok("1"),
+            "R39.3c requires one key-generation worker"
+        );
+        assert_eq!(
+            std::env::var("FHE_R29_FFT_WORKERS").as_deref(),
+            Ok("1"),
+            "R39.3c requires one FFT worker"
+        );
+        assert_eq!(
+            std::env::var("FHE_HYBRID_GADGET_BASE_LOG").as_deref(),
+            Ok("32"),
+            "R39.3c requires gadget base-log 32"
+        );
+        println!("R39_3D_EARLY_AUTHORIZATION_STATUS=PASS");
+    }
+
+    // R38_3F_EARLY_AUTHORIZATION
+    if std::env::var("FHE_R38_2B_VALIDATE").as_deref() == Ok("1") {
+        assert_eq!(
+            std::env::var("FHE_R38_MEMORY_AUTHORIZED").as_deref(),
+            Ok("1"),
+            "R38.2b requires memory authorization before UHD preparation"
+        );
+        assert_eq!(
+            std::env::var("FHE_R27_KEYGEN_THREADS").as_deref(),
+            Ok("1"),
+            "R38.2b requires one key-generation worker"
+        );
+        assert_eq!(
+            std::env::var("FHE_R29_FFT_WORKERS").as_deref(),
+            Ok("1"),
+            "R38.2b requires one FFT worker"
+        );
+        println!("R38_3F_EARLY_AUTHORIZATION_STATUS=PASS");
+    }
+
+    // R38_3_UHD_VALIDATION_ADMISSION
+    // Reject an incorrectly configured experiment before key generation.
+    if std::env::var("FHE_R38_2B_VALIDATE").as_deref() == Ok("1") {
+        assert_eq!(
+            std::env::var("FHE_UHD_FULL_FFT2").as_deref(),
+            Ok("1"),
+            "R38.2b requires FHE_UHD_FULL_FFT2=1"
+        );
+        assert!(
+            std::env::var_os("FHE_UHD_IMAGE_PGM").is_some(),
+            "R38.2b requires FHE_UHD_IMAGE_PGM; refusing legacy fallback"
+        );
+        assert_eq!(
+            std::env::var("FHE_HYBRID_GADGET_BASE_LOG").as_deref(),
+            Ok("32"),
+            "R38.2b requires explicit base-log 32"
+        );
+        assert_eq!(
+            std::env::var("FHE_UHD_BATCH_WINDOW").as_deref(),
+            Ok("1"),
+            "R38.2b requires one batch"
+        );
+        assert_eq!(
+            std::env::var("FHE_UHD_MAX_WINDOWS").as_deref(),
+            Ok("1"),
+            "R38.2b requires one window"
+        );
+        println!("R38_3_UHD_ADMISSION_STATUS=PASS");
+    }
+
     let secure_randomness = secure_fft_randomness();
     println!(
         "FFT_RANDOMNESS_MODE={}",
@@ -1219,6 +1675,27 @@ fn main() {
         })
         .collect();
 
+    // R39.7B.2: source-aware rotation-result reuse inventory.
+    // Diagnostic only: no ciphertext operations or key generation.
+    let mut source_rotation_pairs = std::collections::BTreeSet::new();
+    let mut source_rotation_occurrences = 0usize;
+    for (branch, source) in prepared_sources.iter().enumerate() {
+        for offset in source.rotation_offsets() {
+            if offset != 0 {
+                source_rotation_occurrences += 1;
+                source_rotation_pairs.insert((branch, offset));
+            }
+        }
+    }
+    let reusable_rotations = source_rotation_occurrences - source_rotation_pairs.len();
+    println!("R39_7B_ROTATION_OCCURRENCES={source_rotation_occurrences}");
+    println!(
+        "R39_7B_UNIQUE_SOURCE_ROTATIONS={}",
+        source_rotation_pairs.len()
+    );
+    println!("R39_7B_REUSABLE_ROTATIONS={reusable_rotations}");
+    println!("R39_7B_INVENTORY_STATUS=PASS");
+
     // R30.9A.21D: characterize stage-0 rotation-key reuse.
     //
     // This analysis does not generate keys or execute encrypted FFTs.
@@ -1383,6 +1860,100 @@ fn main() {
     }
 
     println!("R30_9A_21D_SCHEDULE_STATUS=PASS");
+
+    // R38_3C_MEMORY_ADMISSION
+    // Allocation-free screening for the R38.2b stage-zero A/B experiment.
+    // This is not a proven peak-RSS bound.
+    if std::env::var("FHE_R38_3C_MEMORY_PREFLIGHT").as_deref() == Ok("1") {
+        assert!(shared_profile, "R38.3c requires the shared Q16 profile");
+        assert_eq!(
+            std::env::var("FHE_HYBRID_GADGET_BASE_LOG").as_deref(),
+            Ok("32"),
+            "R38.3c requires explicit base-log 32"
+        );
+        assert_eq!(
+            std::env::var("FHE_UHD_BATCH_WINDOW").as_deref(),
+            Ok("1"),
+            "R38.3c requires one batch"
+        );
+        assert_eq!(
+            std::env::var("FHE_R27_KEYGEN_THREADS").as_deref(),
+            Ok("1"),
+            "R38.3c requires one key-generation worker"
+        );
+        assert!(
+            std::env::var("FHE_R38_2B_VALIDATE").as_deref() != Ok("1"),
+            "Preflight-only mode must not enable encrypted A/B validation"
+        );
+
+        const GIB: u128 = 1024 * 1024 * 1024;
+        const BUDGET_GIB: u128 = 12;
+        const RESERVE_GIB: u128 = 8;
+        const BASE_LOG: u128 = 32;
+
+        let q_limbs = chain.level(3).moduli().len() as u128;
+        let p_limbs = p.moduli().len() as u128;
+        let degree_u128 = degree as u128;
+
+        // Each stage-zero group has one zero-offset contribution.
+        let nonzero_terms = operand_keys as u128;
+        let zero_terms = prepared_sources
+            .iter()
+            .flat_map(|source| source.rotation_offsets())
+            .filter(|&offset| offset == 0)
+            .count() as u128;
+
+        // Conservative bound: all nonzero terms plus two zero-offset
+        // contributions, whether or not the latter are materialized.
+        let buffered_terms = nonzero_terms + zero_terms.max(2);
+
+        let bytes_per_ct = 2_u128
+            .checked_mul(degree_u128)
+            .and_then(|x| x.checked_mul(q_limbs))
+            .and_then(|x| x.checked_mul(8))
+            .expect("ciphertext size overflow");
+
+        let digits =
+            BoundedGadgetLayout::new(chain.level(3).clone(), BASE_LOG as u32).digit_count() as u128;
+
+        let key_bytes = 2_u128
+            .checked_mul(degree_u128)
+            .and_then(|x| x.checked_mul(q_limbs + p_limbs))
+            .and_then(|x| x.checked_mul(digits))
+            .and_then(|x| x.checked_mul(8))
+            .expect("key size overflow");
+
+        let buffer_bytes = buffered_terms
+            .checked_mul(bytes_per_ct)
+            .expect("buffer size overflow");
+
+        let estimate = buffer_bytes
+            .checked_add(key_bytes)
+            .and_then(|x| x.checked_add(RESERVE_GIB * GIB))
+            .expect("memory estimate overflow");
+
+        println!("R38_3C_BASE_LOG=32");
+        println!("R38_3C_KEYGEN_THREADS=1");
+        println!("R38_3C_NONZERO_TERMS={nonzero_terms}");
+        println!("R38_3C_ZERO_TERMS={zero_terms}");
+        println!("R38_3C_BUFFERED_TERMS={buffered_terms}");
+        println!("R38_3C_GADGET_DIGITS={digits}");
+        println!("R38_3C_BYTES_PER_CIPHERTEXT={bytes_per_ct}");
+        println!("R38_3C_KEY_GIB={:.6}", key_bytes as f64 / GIB as f64);
+        println!("R38_3C_BUFFER_GIB={:.6}", buffer_bytes as f64 / GIB as f64);
+        println!("R38_3C_RESERVE_GIB={RESERVE_GIB}");
+        println!("R38_3C_ESTIMATED_GIB={:.6}", estimate as f64 / GIB as f64);
+        println!("R38_3C_BUDGET_GIB={BUDGET_GIB}");
+
+        if estimate > BUDGET_GIB * GIB {
+            println!("R38_3C_MEMORY_ADMISSION_STATUS=REJECTED");
+            return;
+        }
+
+        println!("R38_3C_MEMORY_ADMISSION_STATUS=PASS");
+        println!("R38_3C_PREFLIGHT_ONLY_STATUS=PASS");
+        return;
+    }
 
     let later_diagonals: Vec<Diagonals> = [16, 64, 256]
         .iter()
@@ -1629,6 +2200,31 @@ fn main() {
             .try_into()
             .unwrap_or_else(|_| panic!("expected 3 later stages"));
         let stage0_qp = PreparedRnsNttPlan::new(&qp_plans[0]);
+        // R39_4C_FIRST_USE_PRODUCTION_ADMISSION
+        let r39_4c_first_use = std::env::var("FHE_R39_4C_FIRST_USE").as_deref() == Ok("1");
+
+        if r39_4c_first_use {
+            assert!(
+                (1..=2).contains(&window),
+                "R39.4c requires window=1 or window=2"
+            );
+            assert!(
+                std::env::var_os("FHE_R36_8E_PARALLEL_KEYGEN").is_none(),
+                "R39.4c excludes legacy parallel key prefetch"
+            );
+            assert!(
+                std::env::var_os("FHE_R36_8G_SHARED_STAGE0").is_none(),
+                "R39.4c excludes the full shared-key registry"
+            );
+            assert!(
+                std::env::var_os("FHE_R36_8C_VALIDATE").is_none()
+                    && std::env::var_os("FHE_R36_8G_3E_VALIDATE").is_none()
+                    && std::env::var_os("FHE_R36_8G_3F_VALIDATE").is_none(),
+                "R39.4c excludes legacy stage-zero A/B validation modes"
+            );
+            println!("R39_4C_FIRST_USE=ENABLED");
+        }
+
         // R36_8C_2_PERSISTENT_CACHE_INITIALIZATION
         let r36_8g_3f_validate = std::env::var("FHE_R36_8G_3F_VALIDATE").as_deref() == Ok("1");
         let r36_8g_3e_validate = std::env::var("FHE_R36_8G_3E_VALIDATE").as_deref() == Ok("1");
@@ -2470,6 +3066,201 @@ fn main() {
                 return;
             }
 
+            // R38_2B_ENCRYPTED_AB_VALIDATION
+            if std::env::var("FHE_R38_2B_VALIDATE").as_deref() == Ok("1") {
+                // R38_3E_MANDATORY_ADMISSION
+                assert_eq!(
+                    std::env::var("FHE_R38_MEMORY_AUTHORIZED").as_deref(),
+                    Ok("1"),
+                    "R38.2b requires explicit memory authorization"
+                );
+                assert_eq!(
+                    std::env::var("FHE_HYBRID_GADGET_BASE_LOG").as_deref(),
+                    Ok("32"),
+                    "R38.2b requires base-log 32"
+                );
+                assert_eq!(
+                    std::env::var("FHE_R27_KEYGEN_THREADS").as_deref(),
+                    Ok("1"),
+                    "R38.2b requires one key-generation worker"
+                );
+                assert_eq!(
+                    std::env::var("FHE_R29_FFT_WORKERS").as_deref(),
+                    Ok("1"),
+                    "R38.2b requires one FFT worker"
+                );
+                println!("R38_3E_MEMORY_ADMISSION_STATUS=PASS");
+
+                assert_eq!(batches.len(), 1, "R38.2b requires FHE_UHD_BATCH_WINDOW=1");
+
+                let mut seeds = BTreeMap::new();
+                for &(offset, seed) in &jobs {
+                    seeds.entry(offset).or_insert(seed);
+                }
+                assert_eq!(seeds.len(), 55);
+
+                let generate_key = |offset: isize| {
+                    let seed = *seeds.get(&offset).expect("R38.2b missing seed");
+                    let exponent = if offset > 0 {
+                        rotation_exponent_left(degree, offset as usize)
+                    } else {
+                        rotation_exponent_right(degree, (-offset) as usize)
+                    };
+                    let mut local_rng = ChaCha20Rng::from_seed(seed);
+                    PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                        BoundedGadgetLayout::new(chain.level(3).clone(), hybrid_base_log),
+                        p.clone(),
+                        &secret,
+                        exponent,
+                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                        2,
+                        &qp_plans[0],
+                        &mut local_rng,
+                    )
+                };
+
+                let mut reference_generations = 0usize;
+                let reference_started = Instant::now();
+
+                let mut reference_provider =
+                    |offset: isize, consume: &mut dyn FnMut(&PreparedHybridRnsGaloisKey)| {
+                        reference_generations += 1;
+                        let key = generate_key(offset);
+                        consume(&key);
+                    };
+
+                let reference = apply_fft3840_packed_fft256_stage0_batched_streaming_with_provider(
+                    &batches,
+                    &prepared_array,
+                    &evaluator,
+                    &chain,
+                    &prepared_plans[0],
+                    &qp_plans[0],
+                    &stage0_qp,
+                    &mut reference_provider,
+                    "parallel",
+                    4,
+                );
+
+                let reference_seconds = reference_started.elapsed().as_secs_f64();
+
+                let mut candidate_generations = 0usize;
+                let candidate_started = Instant::now();
+
+                let mut make_candidate_key = |offset: isize| {
+                    candidate_generations += 1;
+                    generate_key(offset)
+                };
+
+                // R39_3C_BOUNDED_MEMORY_AB_SELECTION
+                let r39_mode = std::env::var("FHE_R39_3C_VALIDATE").as_deref() == Ok("1");
+                // R39_4E_PROVIDER_EXACT_VALIDATION
+                let r39_4e_mode = std::env::var("FHE_R39_4E_VALIDATE").as_deref() == Ok("1");
+                assert!(
+                    !(r39_mode && r39_4e_mode),
+                    "R39.3c and R39.4e validation modes are mutually exclusive"
+                );
+
+                let candidate = if r39_4e_mode {
+                    let mut provider =
+                        |offset: isize, consume: &mut dyn FnMut(&PreparedHybridRnsGaloisKey)| {
+                            let key = make_candidate_key(offset);
+                            consume(&key);
+                        };
+                    apply_fft3840_packed_fft256_stage0_first_use_with_provider(
+                        &batches,
+                        &prepared_array,
+                        &evaluator,
+                        &chain,
+                        &prepared_plans[0],
+                        &qp_plans[0],
+                        &stage0_qp,
+                        &mut provider,
+                    )
+                } else if r39_mode {
+                    apply_fft3840_packed_fft256_stage0_first_use_r39_3b(
+                        &batches,
+                        &prepared_array,
+                        &evaluator,
+                        &chain,
+                        &prepared_plans[0],
+                        &qp_plans[0],
+                        &stage0_qp,
+                        &mut make_candidate_key,
+                    )
+                } else {
+                    apply_fft3840_packed_fft256_stage0_rotation_major_r38_1(
+                        &batches,
+                        &prepared_array,
+                        &evaluator,
+                        &chain,
+                        &prepared_plans[0],
+                        &qp_plans[0],
+                        &stage0_qp,
+                        &mut make_candidate_key,
+                    )
+                };
+
+                let candidate_seconds = candidate_started.elapsed().as_secs_f64();
+
+                assert_eq!(reference.len(), candidate.len());
+
+                let mut compared = 0usize;
+                for (batch_index, (expected, actual)) in
+                    reference.iter().zip(candidate.iter()).enumerate()
+                {
+                    for group in 0..2 {
+                        assert_eq!(
+                            expected[group].rlwe(),
+                            actual[group].rlwe(),
+                            "R38.2b exact RLWE mismatch: batch={} group={}",
+                            batch_index,
+                            group
+                        );
+                        assert_eq!(expected[group].state(), actual[group].state());
+                        assert_eq!(expected[group].level(), actual[group].level());
+                        assert_eq!(expected[group].scale(), actual[group].scale());
+                        compared += 1;
+                    }
+                }
+
+                assert_eq!(reference_generations, 103);
+                assert_eq!(candidate_generations, 55);
+                assert_eq!(compared, 2);
+
+                println!("R38_2B_REFERENCE_GENERATIONS={reference_generations}");
+                println!("R38_2B_CANDIDATE_GENERATIONS={candidate_generations}");
+                println!("R38_2B_REFERENCE_SECONDS={reference_seconds:.6}");
+                println!("R38_2B_CANDIDATE_SECONDS={candidate_seconds:.6}");
+                println!("R38_2B_CIPHERTEXTS_COMPARED={compared}");
+                // R39_3E_EXACT_RESULT_MARKERS
+                if r39_mode {
+                    assert_eq!(candidate_generations, 55);
+                    assert_eq!(compared, 2);
+                    println!("R39_3E_REFERENCE_GENERATIONS={reference_generations}");
+                    println!("R39_3E_CANDIDATE_GENERATIONS={candidate_generations}");
+                    println!("R39_3E_REFERENCE_SECONDS={reference_seconds:.6}");
+                    println!("R39_3E_CANDIDATE_SECONDS={candidate_seconds:.6}");
+                    println!("R39_3E_CIPHERTEXTS_COMPARED={compared}");
+                    println!("R39_3E_EXACT_EQUIVALENCE_STATUS=PASS");
+                    println!("R39_3E_STATUS=PASS");
+                }
+                if r39_4e_mode {
+                    assert_eq!(reference_generations, 103);
+                    assert_eq!(candidate_generations, 55);
+                    assert_eq!(compared, 2);
+                    println!("R39_4E_REFERENCE_GENERATIONS={reference_generations}");
+                    println!("R39_4E_CANDIDATE_GENERATIONS={candidate_generations}");
+                    println!("R39_4E_REFERENCE_SECONDS={reference_seconds:.6}");
+                    println!("R39_4E_CANDIDATE_SECONDS={candidate_seconds:.6}");
+                    println!("R39_4E_CIPHERTEXTS_COMPARED={compared}");
+                    println!("R39_4E_EXACT_EQUIVALENCE_STATUS=PASS");
+                }
+                println!("R38_2B_EXACT_EQUIVALENCE_STATUS=PASS");
+                println!("R38_2B_STATUS=PASS");
+                return;
+            }
+
             // R36_8G_1C_SHARED_KEY_EXACT_VALIDATION
             if std::env::var("FHE_R36_8G_VALIDATE").as_deref() == Ok("1") {
                 use ccmm_rs::eblas::fused_fft256_handoff::Fft3840SharedKeyRegistry;
@@ -2825,7 +3616,98 @@ fn main() {
                 outputs
             } else {
                 // R36_8D_PRODUCTION_OFFSET_ADDRESSED_PROVIDER
-                let outputs = if let Some(cache) = r36_8d_cache.as_mut() {
+                // R39_4C_FIRST_USE_PRODUCTION_DISPATCH
+                let outputs = if r39_4c_first_use {
+                    let mut seeds = BTreeMap::new();
+                    for &(offset, seed) in &jobs {
+                        seeds.entry(offset).or_insert(seed);
+                    }
+                    assert_eq!(seeds.len(), 55, "R39.4c unique rotation offsets");
+
+                    let generated = std::cell::Cell::new(0usize);
+                    let keygen_seconds = std::cell::Cell::new(0.0_f64);
+                    let stage0_started = Instant::now();
+
+                    let mut generate_key = |offset: isize| {
+                        let keygen_started = Instant::now();
+                        let seed = *seeds.get(&offset).expect("R39.4c missing rotation seed");
+                        let exponent = if offset > 0 {
+                            rotation_exponent_left(degree, offset as usize)
+                        } else {
+                            rotation_exponent_right(degree, (-offset) as usize)
+                        };
+                        let mut local_rng = ChaCha20Rng::from_seed(seed);
+                        let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                            BoundedGadgetLayout::new(chain.level(3).clone(), hybrid_base_log),
+                            p.clone(),
+                            &secret,
+                            exponent,
+                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                            2,
+                            &qp_plans[0],
+                            &mut local_rng,
+                        );
+                        generated.set(generated.get() + 1);
+                        keygen_seconds
+                            .set(keygen_seconds.get() + keygen_started.elapsed().as_secs_f64());
+                        key
+                    };
+
+                    let outputs = if let Some(cache) = r36_8d_cache.as_mut() {
+                        let mut provider = |offset: isize,
+                                            consume: &mut dyn FnMut(
+                            &PreparedHybridRnsGaloisKey,
+                        )| {
+                            cache.with_key(offset, &mut generate_key, consume);
+                        };
+                        apply_fft3840_packed_fft256_stage0_first_use_with_provider(
+                            &batches,
+                            &prepared_array,
+                            &evaluator,
+                            &chain,
+                            &prepared_plans[0],
+                            &qp_plans[0],
+                            &stage0_qp,
+                            &mut provider,
+                        )
+                    } else {
+                        let mut provider = |offset: isize,
+                                            consume: &mut dyn FnMut(
+                            &PreparedHybridRnsGaloisKey,
+                        )| {
+                            let key = generate_key(offset);
+                            consume(&key);
+                        };
+                        apply_fft3840_packed_fft256_stage0_first_use_with_provider(
+                            &batches,
+                            &prepared_array,
+                            &evaluator,
+                            &chain,
+                            &prepared_plans[0],
+                            &qp_plans[0],
+                            &stage0_qp,
+                            &mut provider,
+                        )
+                    };
+
+                    let elapsed = stage0_started.elapsed().as_secs_f64();
+                    let keygen = keygen_seconds.get();
+                    assert!(elapsed + 1e-9 >= keygen);
+
+                    stage0_keygens += generated.get();
+                    r36_8f_stage0_keygen_seconds += keygen;
+                    r36_8f_stage0_nonkeygen_seconds += (elapsed - keygen).max(0.0);
+
+                    println!(
+                        "R39_4C_WINDOW={} BATCHES={} PHYSICAL_KEYGENS={} STAGE0_SECONDS={:.6} KEYGEN_SECONDS={:.6}",
+                        start / window + 1,
+                        batches.len(),
+                        generated.get(),
+                        elapsed,
+                        keygen
+                    );
+                    outputs
+                } else if let Some(cache) = r36_8d_cache.as_mut() {
                     // Seeds are generated by the existing production CSPRNG
                     // schedule; lookup is by rotation offset, not job position.
                     let mut seeds = BTreeMap::new();
