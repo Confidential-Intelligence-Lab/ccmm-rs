@@ -11,6 +11,7 @@ use ccmm_rs::rlwe::ErrorDistribution;
 use num_complex::Complex64;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use std::time::Instant;
 
 const SIGMA: f64 = 3.19;
 const DEGREE: usize = 4096;
@@ -127,6 +128,7 @@ fn error_metrics(actual_physical: &[Complex64], expected_logical: &[Complex64]) 
 }
 
 fn main() {
+    let setup_start = Instant::now();
     let chain = validation_chain();
     let degree = DEGREE;
     let scale = INITIAL_SCALE;
@@ -162,6 +164,8 @@ fn main() {
 
     let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x5041_434b_4646_5402);
 
+    let setup_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
+    let encrypt_start = Instant::now();
     let rlwe = encrypt_rns_raw_with_distribution_ntt_rng(
         &plaintext,
         2,
@@ -173,6 +177,8 @@ fn main() {
 
     let ciphertext = RnsCkksCiphertext::new(rlwe, CkksChainState::top(&chain, scale), &chain);
 
+    let encrypt_ms = encrypt_start.elapsed().as_secs_f64() * 1_000.0;
+    let keygen_start = Instant::now();
     let mut evaluation_keys = RnsCkksEvaluationKeys::new();
 
     let rotations = [N / 2, N / 4];
@@ -205,6 +211,7 @@ fn main() {
         evaluation_keys.insert_level(level_keys);
     }
 
+    let keygen_ms = keygen_start.elapsed().as_secs_f64() * 1_000.0;
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
     println!("PACKED_FFT1_CP_PROFILE=functional-4096-4x30");
@@ -219,6 +226,7 @@ fn main() {
     for direction in [FftDirection::Forward, FftDirection::Inverse] {
         let expected = fft1_pp(shape, direction, &logical_input);
 
+        let execute_start = Instant::now();
         let encrypted = execute_packed_fft1_dif_cp(
             shape,
             direction,
@@ -228,7 +236,10 @@ fn main() {
             &chain,
         );
 
+        let execute_ms = execute_start.elapsed().as_secs_f64() * 1_000.0;
+        let decrypt_start = Instant::now();
         let actual = decrypt_slots(&encrypted, &secret, &embedding);
+        let decrypt_ms = decrypt_start.elapsed().as_secs_f64() * 1_000.0;
 
         let (rel_l2, max_abs) = error_metrics(&actual, &expected);
 
@@ -250,6 +261,9 @@ fn main() {
         assert!(inactive_max_abs <= TOLERANCE);
 
         println!(
+            "PACKED_FFT1_CP_TIMING=DIRECTION={direction:?} EXECUTE_MS={execute_ms:.3} DECRYPT_MS={decrypt_ms:.3}"
+        );
+        println!(
             "PACKED_FFT1_CP_CASE=DIRECTION={direction:?} STAGES={} OUTPUT_LEVEL={} LEVELS_CONSUMED={} REL_L2={rel_l2:.12e} MAX_ABS={max_abs:.12e} INACTIVE_MAX_ABS={inactive_max_abs:.12e} STATUS=PASS",
             shape.stages(),
             encrypted.level(),
@@ -257,5 +271,8 @@ fn main() {
         );
     }
 
+    println!(
+        "PACKED_FFT1_CP_SETUP_TIMING=SETUP_MS={setup_ms:.3} ENCRYPT_MS={encrypt_ms:.3} KEYGEN_MS={keygen_ms:.3} GALOIS_KEYS=4"
+    );
     println!("PACKED_FFT1_CP_STATUS=PASS");
 }

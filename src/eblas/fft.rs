@@ -762,6 +762,9 @@ pub fn execute_packed_fft1_dif_stage_cp(
         "packed DIF FFT1 stage rotation must be smaller than logical length"
     );
 
+    let profile = std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1");
+    let profile_start = std::time::Instant::now();
+
     let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
     let mut left = vec![Complex64::new(0.0, 0.0); slot_count];
     let mut right = vec![Complex64::new(0.0, 0.0); slot_count];
@@ -770,15 +773,45 @@ pub fn execute_packed_fft1_dif_stage_cp(
     left[..logical_length].copy_from_slice(diagonals.rotate_left());
     right[..logical_length].copy_from_slice(diagonals.rotate_right());
 
+    let diagonal_ms = profile_start.elapsed().as_secs_f64() * 1000.0;
+
+    let t = std::time::Instant::now();
     let rotated_left = evaluator.rotate_left(input, rotation);
+    let rotate_left_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let rotated_right = evaluator.rotate_right(input, rotation);
+    let rotate_right_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    let t = std::time::Instant::now();
     let direct_term = multiply_complex_slots_cp(input, &direct, embedding, chain, plan);
+    let multiply_direct_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let left_term = multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan);
+    let multiply_left_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let right_term = multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan);
+    let multiply_right_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    let t = std::time::Instant::now();
     let partial = evaluator.add(&direct_term, &left_term);
-    evaluator.add(&partial, &right_term)
+    let result = evaluator.add(&partial, &right_term);
+    let addition_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    if profile {
+        println!(
+            "FHE_FFT1_STAGE_PROFILE=ROTATION={} DIAGONAL_MS={:.3} ROTATE_LEFT_MS={:.3} ROTATE_RIGHT_MS={:.3} MULTIPLY_DIRECT_MS={:.3} MULTIPLY_LEFT_MS={:.3} MULTIPLY_RIGHT_MS={:.3} ADD_MS={:.3}",
+            rotation,
+            diagonal_ms,
+            rotate_left_ms,
+            rotate_right_ms,
+            multiply_direct_ms,
+            multiply_left_ms,
+            multiply_right_ms,
+            addition_ms
+        );
+    }
+
+    result
 }
 
 /// Executes a complete packed radix-2 DIF FFT1 over encrypted CKKS slots.
@@ -822,8 +855,22 @@ pub fn execute_packed_fft1_dif_cp(
     let mut span = logical_length;
 
     while span >= 2 {
+        let profile = std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1");
+
+        let t = std::time::Instant::now();
         let diagonals = PackedFft1DifStageDiagonals::new(logical_length, span, direction);
+        let diagonal_build_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+        let plan_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        if profile {
+            println!(
+                "FHE_FFT1_PLAN_PROFILE=SPAN={} DIAGONAL_BUILD_MS={:.3} PLAN_MS={:.3}",
+                span, diagonal_build_ms, plan_ms
+            );
+        }
 
         value = execute_packed_fft1_dif_stage_cp(
             &value, &diagonals, evaluator, embedding, chain, &plan,
@@ -839,7 +886,14 @@ pub fn execute_packed_fft1_dif_cp(
 
         normalization[..logical_length].fill(Complex64::new(factor, 0.0));
 
+        let t = std::time::Instant::now();
         value = multiply_complex_slots_cp(&value, &normalization, embedding, chain, &plan);
+        if std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1") {
+            println!(
+                "FHE_FFT1_NORMALIZATION_PROFILE=MULTIPLY_MS={:.3}",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     value
