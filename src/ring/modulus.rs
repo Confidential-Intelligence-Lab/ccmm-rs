@@ -173,14 +173,23 @@ impl Modulus {
         debug_assert!(a < self.value, "lhs residue must be canonical");
         debug_assert!(b < self.value, "rhs residue must be canonical");
 
-        let (sum, overflow) = a.overflowing_add(b);
-
-        if overflow {
-            sum.wrapping_sub(self.value)
-        } else if sum >= self.value {
-            sum - self.value
+        if self.value <= (1_u64 << 63) {
+            let sum = a + b;
+            if sum >= self.value {
+                sum - self.value
+            } else {
+                sum
+            }
         } else {
-            sum
+            let (sum, overflow) = a.overflowing_add(b);
+
+            if overflow {
+                sum.wrapping_sub(self.value)
+            } else if sum >= self.value {
+                sum - self.value
+            } else {
+                sum
+            }
         }
     }
 
@@ -274,6 +283,24 @@ impl Modulus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_addition_fast_path_boundary() {
+        let moduli = [1_u64 << 63, (1_u64 << 63) + 1, u64::MAX];
+
+        for q in moduli {
+            let modulus = Modulus::new(q);
+            let values = [0, 1, q / 2, q - 2, q - 1];
+
+            for &a in &values {
+                for &b in &values {
+                    let expected = ((u128::from(a) + u128::from(b)) % u128::from(q)) as u64;
+
+                    assert_eq!(modulus.add_canonical(a, b), expected, "q={q}, a={a}, b={b}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn canonical_multiplication_matches_general_multiplication() {
