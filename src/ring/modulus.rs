@@ -87,6 +87,43 @@ impl PreparedModulus {
     }
 }
 
+/// Multiplication by a fixed canonical residue using Shoup reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShoupMultiplier {
+    operand: u64,
+    quotient: u64,
+}
+
+impl ShoupMultiplier {
+    pub fn new(modulus: Modulus, operand: u64) -> Self {
+        let q = modulus.value();
+        assert!(q >= 2 && q < (1_u64 << 63));
+        assert!(operand < q);
+
+        let quotient = ((u128::from(operand) << 64) / u128::from(q)) as u64;
+        Self { operand, quotient }
+    }
+
+    #[inline]
+    pub fn mul(self, value: u64, modulus: Modulus) -> u64 {
+        let q = modulus.value();
+        debug_assert!(q >= 2 && q < (1_u64 << 63));
+        debug_assert!(value < q);
+
+        let estimated = ((u128::from(value) * u128::from(self.quotient)) >> 64) as u64;
+
+        let reduced = value
+            .wrapping_mul(self.operand)
+            .wrapping_sub(estimated.wrapping_mul(q));
+
+        if reduced >= q {
+            reduced - q
+        } else {
+            reduced
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modulus {
     value: u64,
@@ -606,6 +643,70 @@ mod tests {
             assert_eq!(modulus.add(a, modulus.neg(a)), 0);
             assert_eq!(modulus.mul(a, 0), 0);
             assert_eq!(modulus.mul(a, 1), a);
+        }
+    }
+}
+
+#[cfg(test)]
+mod r25_8_n3b_shoup_tests {
+    use super::{Modulus, ShoupMultiplier};
+
+    #[test]
+    fn shoup_matches_exact_modular_multiplication() {
+        const MODULI: [u64; 9] = [
+            0x1ffffff18001,
+            0x1fffffee8001,
+            0x1fffffe58001,
+            0x1fffffe28001,
+            0x1fffffde8001,
+            0x1fffffcf0001,
+            0x1fffffc68001,
+            0x1fffffc20001,
+            0x1fffffbf0001,
+        ];
+
+        for q in MODULI {
+            let modulus = Modulus::new(q);
+            let boundaries = [0, 1, 2, q / 2, q - 2, q - 1];
+
+            for &operand in &boundaries {
+                let prepared = ShoupMultiplier::new(modulus, operand);
+
+                for &value in &boundaries {
+                    let expected = ((value as u128 * operand as u128) % q as u128) as u64;
+
+                    assert_eq!(
+                        prepared.mul(value, modulus),
+                        expected,
+                        "boundary mismatch q={q} a={value} b={operand}"
+                    );
+                }
+            }
+
+            let mut state = 0x9e3779b97f4a7c15_u64;
+
+            for _ in 0..10_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let operand = state % q;
+
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = state % q;
+
+                let prepared = ShoupMultiplier::new(modulus, operand);
+                let expected = ((value as u128 * operand as u128) % q as u128) as u64;
+
+                assert_eq!(
+                    prepared.mul(value, modulus),
+                    expected,
+                    "random mismatch q={q} a={value} b={operand}"
+                );
+            }
+
+            println!("R25_8_N3B_SHOUP_MODULUS={q} STATUS=PASS");
         }
     }
 }

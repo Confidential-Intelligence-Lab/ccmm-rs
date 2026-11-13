@@ -36,6 +36,27 @@ impl Polynomial {
         }
     }
 
+    /// Constructs a polynomial from canonical coefficients.
+    ///
+    /// Every coefficient must already lie in [0, q).
+    /// No modular reduction or replacement vector allocation is performed.
+    pub(crate) fn from_canonical(modulus: Modulus, coefficients: Vec<u64>) -> Self {
+        assert!(
+            !coefficients.is_empty(),
+            "polynomial must contain at least one coefficient"
+        );
+        assert!(
+            coefficients
+                .iter()
+                .all(|&coefficient| coefficient < modulus.value()),
+            "polynomial coefficients must be canonical"
+        );
+        Self {
+            modulus,
+            coefficients,
+        }
+    }
+
     /// Constructs the zero polynomial of ring degree `degree`.
     ///
     /// # Panics
@@ -79,7 +100,7 @@ impl Polynomial {
             .coefficients
             .iter()
             .zip(&rhs.coefficients)
-            .map(|(&lhs, &rhs)| self.modulus.add(lhs, rhs))
+            .map(|(&lhs, &rhs)| self.modulus.add_canonical(lhs, rhs))
             .collect();
 
         Self {
@@ -96,7 +117,7 @@ impl Polynomial {
             .coefficients
             .iter()
             .zip(&rhs.coefficients)
-            .map(|(&lhs, &rhs)| self.modulus.sub(lhs, rhs))
+            .map(|(&lhs, &rhs)| self.modulus.sub_canonical(lhs, rhs))
             .collect();
 
         Self {

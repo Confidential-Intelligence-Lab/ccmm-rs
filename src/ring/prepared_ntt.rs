@@ -1,5 +1,5 @@
 use super::{Modulus, NttPlan, Polynomial};
-use crate::ring::modulus::PreparedModulus;
+use crate::ring::modulus::{PreparedModulus, ShoupMultiplier};
 
 /// Prepared radix-2 execution schedule for a canonical `NttPlan`.
 ///
@@ -23,6 +23,11 @@ pub struct PreparedNttPlan {
     inverse_twists: Vec<u64>,
     forward_stage_twiddles: Vec<Vec<u64>>,
     inverse_stage_twiddles: Vec<Vec<u64>>,
+    forward_shoup_twiddles: Option<Vec<Vec<ShoupMultiplier>>>,
+    inverse_shoup_twiddles: Option<Vec<Vec<ShoupMultiplier>>>,
+    forward_shoup_twists: Option<Vec<ShoupMultiplier>>,
+    inverse_shoup_normalization: Option<Vec<ShoupMultiplier>>,
+    bit_reverse_swaps: Vec<(usize, usize)>,
 }
 
 impl PreparedNttPlan {
@@ -41,6 +46,52 @@ impl PreparedNttPlan {
         let forward_stage_twiddles = stage_twiddles(modulus, degree, omega);
         let inverse_stage_twiddles = stage_twiddles(modulus, degree, omega_inverse);
 
+        let (
+            forward_shoup_twiddles,
+            inverse_shoup_twiddles,
+            forward_shoup_twists,
+            inverse_shoup_normalization,
+        ) = if modulus.value() < (1_u64 << 63) {
+            let prepare_shoup = |stages: &[Vec<u64>]| {
+                stages
+                    .iter()
+                    .map(|stage| {
+                        stage
+                            .iter()
+                            .map(|&w| ShoupMultiplier::new(modulus, w))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let forward_shoup_twiddles = prepare_shoup(&forward_stage_twiddles);
+            let inverse_shoup_twiddles = prepare_shoup(&inverse_stage_twiddles);
+
+            let forward_shoup_twists = forward_twists
+                .iter()
+                .map(|&twist| ShoupMultiplier::new(modulus, twist))
+                .collect();
+
+            let inverse_shoup_normalization = inverse_twists
+                .iter()
+                .map(|&untwist| {
+                    let factor = modulus.mul(plan.degree_inverse(), untwist);
+                    ShoupMultiplier::new(modulus, factor)
+                })
+                .collect();
+
+            (
+                Some(forward_shoup_twiddles),
+                Some(inverse_shoup_twiddles),
+                Some(forward_shoup_twists),
+                Some(inverse_shoup_normalization),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        let bit_reverse_swaps = prepare_bit_reverse_swaps(degree);
+
         Self {
             modulus,
             prepared_modulus: PreparedModulus::new(modulus),
@@ -50,6 +101,11 @@ impl PreparedNttPlan {
             inverse_twists,
             forward_stage_twiddles,
             inverse_stage_twiddles,
+            forward_shoup_twiddles,
+            inverse_shoup_twiddles,
+            forward_shoup_twists,
+            inverse_shoup_normalization,
+            bit_reverse_swaps,
         }
     }
 
@@ -77,11 +133,21 @@ impl PreparedNttPlan {
             "forward_owned_prepared_mul requires canonical residues"
         );
 
-        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
-            *value = self.prepared_modulus.mul_canonical(*value, twist);
-        }
+        if let (Some(twists), Some(twiddles)) =
+            (&self.forward_shoup_twists, &self.forward_shoup_twiddles)
+        {
+            for (value, &twist) in values.iter_mut().zip(twists) {
+                *value = twist.mul(*value, self.modulus);
+            }
 
-        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
+            cyclic_ntt_shoup(&mut values, self.modulus, twiddles, &self.bit_reverse_swaps);
+        } else {
+            for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
+                *value = self.modulus.mul(*value, twist);
+            }
+
+            cyclic_ntt_prepared(&mut values, self.modulus, &self.forward_stage_twiddles);
+        }
 
         values
     }
@@ -97,12 +163,21 @@ impl PreparedNttPlan {
             "forward_owned requires canonical residues"
         );
 
-        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
-            *value = self.prepared_modulus.mul_canonical(*value, twist);
-        }
+        if let (Some(twists), Some(twiddles)) =
+            (&self.forward_shoup_twists, &self.forward_shoup_twiddles)
+        {
+            for (value, &twist) in values.iter_mut().zip(twists) {
+                *value = twist.mul(*value, self.modulus);
+            }
 
-        // R36_5F5_PRODUCTION_FORWARD_PROMOTION
-        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
+            cyclic_ntt_shoup(&mut values, self.modulus, twiddles, &self.bit_reverse_swaps);
+        } else {
+            for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
+                *value = self.modulus.mul(*value, twist);
+            }
+
+            cyclic_ntt_prepared(&mut values, self.modulus, &self.forward_stage_twiddles);
+        }
 
         values
     }
@@ -121,11 +196,21 @@ impl PreparedNttPlan {
 
         let mut values = polynomial.coefficients().to_vec();
 
-        for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
-            *value = self.prepared_modulus.mul_canonical(*value, twist);
-        }
+        if let (Some(twists), Some(twiddles)) =
+            (&self.forward_shoup_twists, &self.forward_shoup_twiddles)
+        {
+            for (value, &twist) in values.iter_mut().zip(twists) {
+                *value = twist.mul(*value, self.modulus);
+            }
 
-        cyclic_ntt_prepared_mul(&mut values, self.modulus, &self.forward_stage_twiddles);
+            cyclic_ntt_shoup(&mut values, self.modulus, twiddles, &self.bit_reverse_swaps);
+        } else {
+            for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
+                *value = self.modulus.mul(*value, twist);
+            }
+
+            cyclic_ntt_prepared(&mut values, self.modulus, &self.forward_stage_twiddles);
+        }
 
         values
     }
@@ -164,7 +249,11 @@ impl PreparedNttPlan {
         // Negacyclic forward twist.
         for values in &mut batch {
             for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
-                *value = self.prepared_modulus.mul_canonical(*value, twist);
+                *value = if self.modulus.value() >= (1_u64 << 63) {
+                    self.modulus.mul(*value, twist)
+                } else {
+                    self.prepared_modulus.mul_canonical(*value, twist)
+                };
             }
         }
 
@@ -196,9 +285,12 @@ impl PreparedNttPlan {
                     for (offset, &twiddle) in twiddles.iter().enumerate() {
                         let even = values[start + offset];
 
-                        let odd = self
-                            .prepared_modulus
-                            .mul_canonical(values[start + offset + half], twiddle);
+                        let odd = if self.modulus.value() >= (1_u64 << 63) {
+                            self.modulus.mul(values[start + offset + half], twiddle)
+                        } else {
+                            self.prepared_modulus
+                                .mul_canonical(values[start + offset + half], twiddle)
+                        };
 
                         values[start + offset] = self.modulus.add_canonical(even, odd);
 
@@ -230,21 +322,34 @@ impl PreparedNttPlan {
 
         let mut coefficients = values.to_vec();
 
-        cyclic_ntt_prepared_mul(
-            &mut coefficients,
-            self.modulus,
-            &self.inverse_stage_twiddles,
-        );
+        if let (Some(twiddles), Some(normalization)) = (
+            &self.inverse_shoup_twiddles,
+            &self.inverse_shoup_normalization,
+        ) {
+            cyclic_ntt_shoup(
+                &mut coefficients,
+                self.modulus,
+                twiddles,
+                &self.bit_reverse_swaps,
+            );
 
-        for (coefficient, &untwist) in coefficients.iter_mut().zip(&self.inverse_twists) {
-            *coefficient = self
-                .prepared_modulus
-                .mul_canonical(*coefficient, self.degree_inverse);
+            for (coefficient, &factor) in coefficients.iter_mut().zip(normalization) {
+                *coefficient = factor.mul(*coefficient, self.modulus);
+            }
+        } else {
+            cyclic_ntt_prepared(
+                &mut coefficients,
+                self.modulus,
+                &self.inverse_stage_twiddles,
+            );
 
-            *coefficient = self.prepared_modulus.mul_canonical(*coefficient, untwist);
+            for (coefficient, &untwist) in coefficients.iter_mut().zip(&self.inverse_twists) {
+                *coefficient = self.modulus.mul(*coefficient, self.degree_inverse);
+                *coefficient = self.modulus.mul(*coefficient, untwist);
+            }
         }
 
-        Polynomial::new(self.modulus, coefficients)
+        Polynomial::from_canonical(self.modulus, coefficients)
     }
 
     pub fn inverse(&self, values: &[u64]) -> Polynomial {
@@ -263,13 +368,18 @@ impl PreparedNttPlan {
         );
 
         for (coefficient, &untwist) in coefficients.iter_mut().zip(&self.inverse_twists) {
-            *coefficient = self
-                .prepared_modulus
-                .mul_canonical(*coefficient, self.degree_inverse);
-            *coefficient = self.prepared_modulus.mul_canonical(*coefficient, untwist);
+            if self.modulus.value() >= (1_u64 << 63) {
+                *coefficient = self.modulus.mul(*coefficient, self.degree_inverse);
+                *coefficient = self.modulus.mul(*coefficient, untwist);
+            } else {
+                *coefficient = self
+                    .prepared_modulus
+                    .mul_canonical(*coefficient, self.degree_inverse);
+                *coefficient = self.prepared_modulus.mul_canonical(*coefficient, untwist);
+            }
         }
 
-        Polynomial::new(self.modulus, coefficients)
+        Polynomial::from_canonical(self.modulus, coefficients)
     }
 }
 
@@ -348,6 +458,7 @@ fn cyclic_ntt_prepared(values: &mut [u64], modulus: Modulus, stage_twiddles: &[V
 }
 
 // R36_5F2_PREPARED_BUTTERFLY
+#[cfg(test)]
 fn cyclic_ntt_prepared_mul(values: &mut [u64], modulus: Modulus, stage_twiddles: &[Vec<u64>]) {
     assert!(
         !values.is_empty() && values.len().is_power_of_two(),
@@ -389,6 +500,120 @@ fn cyclic_ntt_prepared_mul(values: &mut [u64], modulus: Modulus, stage_twiddles:
     }
 }
 
+#[inline(always)]
+fn specialized_add(a: u64, b: u64, q: u64) -> u64 {
+    debug_assert!(q >= 2 && q < (1_u64 << 63));
+    debug_assert!(a < q && b < q);
+
+    let sum = a + b;
+    if sum >= q {
+        sum - q
+    } else {
+        sum
+    }
+}
+
+fn cyclic_ntt_shoup(
+    values: &mut [u64],
+    modulus: Modulus,
+    stage_twiddles: &[Vec<ShoupMultiplier>],
+    bit_reverse_swaps: &[(usize, usize)],
+) {
+    assert!(!values.is_empty() && values.len().is_power_of_two());
+    assert_eq!(stage_twiddles.len(), values.len().trailing_zeros() as usize);
+
+    for &(i, j) in bit_reverse_swaps {
+        values.swap(i, j);
+    }
+
+    let q = modulus.value();
+    assert!(q < (1_u64 << 63));
+
+    let mut len = 2_usize;
+
+    for twiddles in stage_twiddles {
+        let half = len / 2;
+        assert_eq!(twiddles.len(), half);
+
+        for block in values.chunks_exact_mut(len) {
+            let (lower, upper) = block.split_at_mut(half);
+
+            let mut lower_groups = lower.chunks_exact_mut(4);
+            let mut upper_groups = upper.chunks_exact_mut(4);
+            let mut twiddle_groups = twiddles.chunks_exact(4);
+
+            for ((a, b), w) in lower_groups
+                .by_ref()
+                .zip(upper_groups.by_ref())
+                .zip(twiddle_groups.by_ref())
+            {
+                let u0 = a[0];
+                let u1 = a[1];
+                let u2 = a[2];
+                let u3 = a[3];
+
+                let v0 = w[0].mul(b[0], modulus);
+                let v1 = w[1].mul(b[1], modulus);
+                let v2 = w[2].mul(b[2], modulus);
+                let v3 = w[3].mul(b[3], modulus);
+
+                a[0] = specialized_add(u0, v0, q);
+                b[0] = modulus.sub_canonical(u0, v0);
+
+                a[1] = specialized_add(u1, v1, q);
+                b[1] = modulus.sub_canonical(u1, v1);
+
+                a[2] = specialized_add(u2, v2, q);
+                b[2] = modulus.sub_canonical(u2, v2);
+
+                a[3] = specialized_add(u3, v3, q);
+                b[3] = modulus.sub_canonical(u3, v3);
+            }
+
+            let lower_rem = lower_groups.into_remainder();
+            let upper_rem = upper_groups.into_remainder();
+            let twiddle_rem = twiddle_groups.remainder();
+
+            for ((a, b), &w) in lower_rem
+                .iter_mut()
+                .zip(upper_rem.iter_mut())
+                .zip(twiddle_rem.iter())
+            {
+                let u = *a;
+                let v = w.mul(*b, modulus);
+                *a = specialized_add(u, v, q);
+                *b = modulus.sub_canonical(u, v);
+            }
+        }
+
+        len *= 2;
+    }
+}
+
+fn prepare_bit_reverse_swaps(n: usize) -> Vec<(usize, usize)> {
+    assert!(n > 0 && n.is_power_of_two());
+
+    let mut swaps = Vec::new();
+    let mut j = 0_usize;
+
+    for i in 1..n {
+        let mut bit = n >> 1;
+
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+
+        j ^= bit;
+
+        if i < j {
+            swaps.push((i, j));
+        }
+    }
+
+    swaps
+}
+
 fn bit_reverse_permute(values: &mut [u64]) {
     let n = values.len();
     let mut j = 0_usize;
@@ -409,9 +634,81 @@ fn bit_reverse_permute(values: &mut [u64]) {
     }
 }
 
+// R25_8_N3H3F_FOUR_BUTTERFLY_EXPERIMENT
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r25_8_n3f3_large_modulus_fallback() {
+        use crate::ring::ntt_parameter_sets::{CANONICAL_NTT_DEGREE, NTT64_MODULUS, NTT64_PSI};
+
+        let modulus = Modulus::new(NTT64_MODULUS);
+        let degree = CANONICAL_NTT_DEGREE;
+        let plan = NttPlan::new(modulus, degree, NTT64_PSI);
+        let prepared = PreparedNttPlan::new(&plan);
+
+        assert!(modulus.value() >= (1_u64 << 63));
+        assert!(prepared.forward_shoup_twiddles.is_none());
+        assert!(prepared.inverse_shoup_twiddles.is_none());
+
+        let coefficients: Vec<u64> = (0..degree)
+            .map(|i| {
+                let x = i as u64;
+                match i % 5 {
+                    0 => 0,
+                    1 => 1,
+                    2 => modulus.value() - 1,
+                    3 => modulus.value() - 1 - x,
+                    _ => x.wrapping_mul(37).wrapping_add(19) % modulus.value(),
+                }
+            })
+            .collect();
+
+        let polynomial = Polynomial::from_canonical(modulus, coefficients);
+
+        let expected = {
+            let mut values = polynomial.coefficients().to_vec();
+
+            for (value, &twist) in values.iter_mut().zip(&prepared.forward_twists) {
+                *value = modulus.mul(*value, twist);
+            }
+
+            cyclic_ntt_prepared(&mut values, modulus, &prepared.forward_stage_twiddles);
+
+            values
+        };
+
+        assert_eq!(prepared.forward(&polynomial), expected);
+        assert_eq!(
+            prepared.forward_owned(polynomial.coefficients().to_vec()),
+            expected
+        );
+        assert_eq!(
+            prepared.forward_owned_prepared_mul(polynomial.coefficients().to_vec()),
+            expected
+        );
+
+        let recovered = prepared.inverse_prepared_mul(&expected);
+        assert_eq!(recovered, polynomial);
+
+        let reference_recovered = prepared.inverse(&expected);
+        assert_eq!(reference_recovered, polynomial);
+
+        let batch = vec![polynomial.clone(), polynomial.clone()];
+        let batched = prepared.forward_batch(&batch);
+
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0], expected);
+        assert_eq!(batched[1], expected);
+
+        println!(
+            "R25_8_N3F3_LARGE_MODULUS_STATUS=PASS degree={} modulus={}",
+            degree,
+            modulus.value()
+        );
+    }
 
     // R36_5F2_BUTTERFLY_EQUIVALENCE
     #[test]
