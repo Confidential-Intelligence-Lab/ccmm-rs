@@ -13,6 +13,7 @@ mod hybrid_ciphertext;
 mod hybrid_multiply;
 mod key_accounting;
 mod parameters;
+mod prepared_multiplication_context;
 pub use parameters::{CkksErrorDistribution, CkksSecretDistribution};
 pub mod hybrid_rns_galois_key;
 mod rns_automorphism;
@@ -45,6 +46,7 @@ pub use galois_key::{
 };
 pub use hybrid_ciphertext::HybridCkksCiphertext;
 pub use hybrid_multiply::{multiply_transition_relinearize_hybrid_ckks, HybridCkksMultiplyConfig};
+pub use prepared_multiplication_context::PreparedRnsCkksMultiplicationContext;
 // R16_7C2B1_PROFILE_EXPORT
 pub use hybrid_rns_galois_key::{
     apply_hybrid_rns_galois_automorphism_prepared_canonical_qp,
@@ -87,6 +89,7 @@ pub use rns_multiply::{
     evaluate_rns_ckks_product_chain, multiply_relinearize_rescale_rns_ckks,
     multiply_relinearize_rescale_rns_ckks_bounded_with_ntt,
     multiply_relinearize_rescale_rns_ckks_with_ntt,
+    multiply_relinearize_rescale_rns_ckks_with_prepared_ntt,
 };
 pub use rns_plain_multiply::{
     multiply_ntt_resident_rlwe_with_prepared_plaintext,
@@ -645,8 +648,11 @@ pub use security_exposure::CkksSecurityExposure;
 pub mod bounded_rns_galois_key;
 
 pub use bounded_rns_galois_key::{
+    apply_bounded_rns_galois_automorphism_with_bitwise_decomposition,
     apply_bounded_rns_galois_automorphism_with_ntt,
     apply_bounded_rns_galois_automorphism_with_prepared_execution,
+    apply_bounded_rns_galois_automorphism_with_prepared_execution_profiled,
+    apply_bounded_rns_galois_automorphism_with_prepared_garner,
     apply_bounded_rns_galois_automorphism_with_prepared_ntt,
     apply_bounded_rns_galois_automorphism_with_prepared_ntt_profiled,
     rotate_left_bounded_rns_ckks_with_ntt, rotate_left_bounded_rns_ckks_with_prepared_execution,

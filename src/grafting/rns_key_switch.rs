@@ -1,4 +1,4 @@
-use rand::{CryptoRng, Rng, RngCore};
+use rand::{CryptoRng, RngCore};
 
 use crate::grafting::RnsGadgetLayout;
 use crate::ring::{
@@ -253,6 +253,40 @@ pub fn encrypt_rns_raw_with_distribution_ntt_rng<R>(
 where
     R: RngCore + CryptoRng,
 {
+    encrypt_rns_raw_with_distribution_ntt_profiled_rng(
+        message,
+        plaintext_modulus,
+        distribution,
+        secret_coefficients,
+        plan,
+        rng,
+        None,
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RnsRlweEncryptionProfile {
+    pub error_sampling_ns: u128,
+    pub secret_projection_ns: u128,
+    pub uniform_sampling_ns: u128,
+    pub error_projection_ns: u128,
+    pub ntt_multiplication_ns: u128,
+    pub ciphertext_assembly_ns: u128,
+    pub total_ns: u128,
+}
+
+pub fn encrypt_rns_raw_with_distribution_ntt_profiled_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    rng: &mut R,
+    mut profile: Option<&mut RnsRlweEncryptionProfile>,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
     assert_eq!(
         secret_coefficients.len(),
         message.degree(),
@@ -279,8 +313,13 @@ where
     );
 
     distribution.validate();
+    let total_start = profile.as_ref().map(|_| std::time::Instant::now());
 
+    let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
     let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+    if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+        p.error_sampling_ns += start.elapsed().as_nanos();
+    }
 
     let limbs = message
         .moduli()
@@ -295,27 +334,376 @@ where
              */
             let params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
 
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
             let secret = project_secret(modulus, secret_coefficients);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.secret_projection_ns += start.elapsed().as_nanos();
+            }
 
             let q = modulus.value();
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
             let a = Polynomial::new(
                 modulus,
-                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+                crate::rlwe::uniform::sample_uniform_residues(message.degree(), q, rng),
+            );
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.uniform_sampling_ns += start.elapsed().as_nanos();
+            }
+
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let error = project_error(modulus, &logical_error);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.error_projection_ns += start.elapsed().as_nanos();
+            }
+
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a_times_s = plan.plan(index).negacyclic_mul(&a, secret.polynomial());
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.ntt_multiplication_ns += start.elapsed().as_nanos();
+            }
+
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let b = message.residue(index).add(&error).sub(&a_times_s);
+
+            let _ = params;
+
+            let ciphertext = RlweCiphertext::new(b, a);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.ciphertext_assembly_ns += start.elapsed().as_nanos();
+            }
+            ciphertext
+        })
+        .collect();
+
+    let result = RnsRlweCiphertext::from_limbs(limbs);
+    if let (Some(start), Some(p)) = (total_start, profile) {
+        p.total_ns += start.elapsed().as_nanos();
+    }
+    result
+}
+
+/// Encrypts an RNS message in coefficient form using reusable prepared NTT plans.
+///
+/// The sampling order and ciphertext representation match the canonical
+/// coefficient-domain RNS RLWE encryption implementation.
+
+pub fn encrypt_rns_raw_with_distribution_prepared_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+    rng: &mut R,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    encrypt_rns_raw_with_distribution_prepared_ntt_profiled_rng(
+        message,
+        plaintext_modulus,
+        distribution,
+        secret_coefficients,
+        plan,
+        prepared_plan,
+        rng,
+        None,
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedCoefficientEncryptionProfile {
+    pub error_sampling_ns: u128,
+    pub secret_projection_ns: u128,
+    pub uniform_sampling_ns: u128,
+    pub error_projection_ns: u128,
+    pub random_forward_ntt_ns: u128,
+    pub secret_forward_ntt_ns: u128,
+    pub pointwise_multiplication_ns: u128,
+    pub inverse_ntt_ns: u128,
+    pub ciphertext_assembly_ns: u128,
+    pub total_ns: u128,
+}
+
+pub fn encrypt_rns_raw_with_distribution_prepared_ntt_profiled_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    secret_coefficients: &[i8],
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+    rng: &mut R,
+    mut profile: Option<&mut PreparedCoefficientEncryptionProfile>,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        secret_coefficients.len(),
+        message.degree(),
+        "secret coefficient count must match RNS message degree"
+    );
+
+    assert_eq!(
+        plan.degree(),
+        message.degree(),
+        "RNS NTT plan degree must match message degree"
+    );
+
+    assert_eq!(
+        plan.moduli(),
+        message.moduli(),
+        "RNS NTT plan basis must match message basis"
+    );
+
+    assert!(
+        secret_coefficients
+            .iter()
+            .all(|&value| matches!(value, -1..=1)),
+        "RNS secret coefficients must be ternary"
+    );
+
+    assert_eq!(prepared_plan.degree(), plan.degree());
+    assert_eq!(prepared_plan.moduli(), plan.moduli());
+
+    distribution.validate();
+    let total_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let error_start = std::time::Instant::now();
+    let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+    if let Some(p) = profile.as_deref_mut() {
+        p.error_sampling_ns += error_start.elapsed().as_nanos();
+    }
+
+    let limbs = message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            /*
+             * RlweParameters remains the correctness-oriented substrate.
+             * noise_bound=0 is intentional here because the security-bearing
+             * error is supplied explicitly below.
+             */
+            let params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let secret = project_secret(modulus, secret_coefficients);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.secret_projection_ns += start.elapsed().as_nanos();
+            }
+
+            let q = modulus.value();
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a = Polynomial::new(
+                modulus,
+                crate::rlwe::uniform::sample_uniform_residues(message.degree(), q, rng),
+            );
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.uniform_sampling_ns += start.elapsed().as_nanos();
+            }
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let error = project_error(modulus, &logical_error);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.error_projection_ns += start.elapsed().as_nanos();
+            }
+            let limb_plan = plan.plan(index);
+            let prepared_limb = prepared_plan.plan(index);
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a_ntt = prepared_limb.forward(&a);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.random_forward_ntt_ns += start.elapsed().as_nanos();
+            }
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let s_ntt = prepared_limb.forward(secret.polynomial());
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.secret_forward_ntt_ns += start.elapsed().as_nanos();
+            }
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let product_ntt = limb_plan.pointwise_mul(&a_ntt, &s_ntt);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.pointwise_multiplication_ns += start.elapsed().as_nanos();
+            }
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let a_times_s = prepared_limb.inverse_prepared_mul(&product_ntt);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.inverse_ntt_ns += start.elapsed().as_nanos();
+            }
+            let phase_start = profile.as_ref().map(|_| std::time::Instant::now());
+            let b = message.residue(index).add(&error).sub(&a_times_s);
+
+            let _ = params;
+
+            let ciphertext = RlweCiphertext::new(b, a);
+            if let (Some(start), Some(p)) = (phase_start, profile.as_deref_mut()) {
+                p.ciphertext_assembly_ns += start.elapsed().as_nanos();
+            }
+            ciphertext
+        })
+        .collect();
+
+    let result = RnsRlweCiphertext::from_limbs(limbs);
+    if let (Some(start), Some(p)) = (total_start, profile) {
+        p.total_ns += start.elapsed().as_nanos();
+    }
+    result
+}
+
+/// Encrypts into coefficient-domain RNS RLWE ciphertexts using a
+/// previously prepared, zeroizing NTT-domain secret.
+///
+/// The caller owns the prepared secret and its lifecycle. The sampling
+/// order matches the uncached prepared-NTT encryption implementation.
+pub fn encrypt_rns_raw_with_distribution_cached_secret_prepared_ntt_rng<R>(
+    message: &RnsPolynomial,
+    plaintext_modulus: u64,
+    distribution: ErrorDistribution,
+    prepared_secret: &crate::grafting::PreparedRnsSecret,
+    plan: &RnsNttPlan,
+    prepared_plan: &PreparedRnsNttPlan,
+    rng: &mut R,
+) -> RnsRlweCiphertext
+where
+    R: RngCore + CryptoRng,
+{
+    assert_eq!(
+        prepared_secret.degree(),
+        message.degree(),
+        "prepared secret degree must match message"
+    );
+    assert_eq!(
+        prepared_secret.moduli(),
+        message.moduli(),
+        "prepared secret basis must match message"
+    );
+    assert_eq!(
+        plan.degree(),
+        message.degree(),
+        "RNS NTT plan degree must match message"
+    );
+    assert_eq!(
+        plan.moduli(),
+        message.moduli(),
+        "RNS NTT plan basis must match message"
+    );
+    assert_eq!(prepared_plan.degree(), plan.degree());
+    assert_eq!(prepared_plan.moduli(), plan.moduli());
+
+    distribution.validate();
+
+    let logical_error = sample_error_coefficients(message.degree(), distribution, rng);
+
+    let limbs = message
+        .moduli()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, modulus)| {
+            let _params = RlweParameters::new(message.degree(), modulus, plaintext_modulus, 0);
+
+            let q = modulus.value();
+
+            let a = Polynomial::new(
+                modulus,
+                crate::rlwe::uniform::sample_uniform_residues(message.degree(), q, rng),
             );
 
             let error = project_error(modulus, &logical_error);
 
-            let a_times_s = plan.plan(index).negacyclic_mul(&a, secret.polynomial());
+            let a_ntt = prepared_plan.plan(index).forward(&a);
+
+            let product_ntt = plan
+                .plan(index)
+                .pointwise_mul(&a_ntt, prepared_secret.limb(index));
+
+            let a_times_s = prepared_plan.plan(index).inverse_prepared_mul(&product_ntt);
 
             let b = message.residue(index).add(&error).sub(&a_times_s);
-
-            let _ = params;
 
             RlweCiphertext::new(b, a)
         })
         .collect();
 
     RnsRlweCiphertext::from_limbs(limbs)
+}
+
+#[cfg(test)]
+mod n4_e11s5c_tests {
+    use super::*;
+    use crate::grafting::PreparedRnsSecret;
+    use crate::ring::{PreparedRnsNttPlan, RnsNttPlan};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn n4_e11s5c_cached_secret_exact_equivalence() {
+        let degree = 16_384;
+
+        let profile = crate::ckks::research_profile_16384();
+        let basis = profile.modulus_basis();
+        let moduli = basis.moduli().to_vec();
+
+        assert_eq!(moduli.len(), 9);
+
+        let plan = RnsNttPlan::new(moduli.clone(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
+
+        let secret = (0..degree)
+            .map(|index| match index % 3 {
+                0 => -1_i8,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+
+        let cached = PreparedRnsSecret::new(&secret, &plan, &prepared_plan);
+
+        let message = RnsPolynomial::from_coefficients(moduli.clone(), &vec![0_u128; degree]);
+
+        for seed in [0xE110_0001_u64, 0xE110_0002, 0xE110_0003] {
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed);
+            let mut cached_rng = ChaCha20Rng::seed_from_u64(seed);
+
+            let reference = encrypt_rns_raw_with_distribution_prepared_ntt_rng(
+                &message,
+                2,
+                ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                &secret,
+                &plan,
+                &prepared_plan,
+                &mut reference_rng,
+            );
+
+            let candidate = encrypt_rns_raw_with_distribution_cached_secret_prepared_ntt_rng(
+                &message,
+                2,
+                ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+                &cached,
+                &plan,
+                &prepared_plan,
+                &mut cached_rng,
+            );
+
+            assert_eq!(
+                reference, candidate,
+                "cached ciphertext differs for seed {seed}"
+            );
+
+            assert_eq!(
+                reference_rng.next_u64(),
+                cached_rng.next_u64(),
+                "RNG continuation differs for seed {seed}"
+            );
+
+            println!(
+                "N4_E11S5C_SEED={} DEGREE={} LIMBS={} STATUS=PASS",
+                seed,
+                degree,
+                moduli.len(),
+            );
+        }
+
+        println!("N4_E11S5C_EXACT_EQUIVALENCE=PASS");
+    }
 }
 
 /// Encrypts an RNS message directly into prepared NTT-domain RLWE limbs.
@@ -362,7 +750,7 @@ where
 
             let a = Polynomial::new(
                 modulus,
-                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+                crate::rlwe::uniform::sample_uniform_residues(message.degree(), q, rng),
             );
 
             let error = project_error(modulus, &logical_error);
@@ -467,7 +855,7 @@ where
             let start = profile.as_ref().map(|_| std::time::Instant::now());
             let a = Polynomial::new(
                 modulus,
-                (0..message.degree()).map(|_| rng.gen_range(0..q)).collect(),
+                crate::rlwe::uniform::sample_uniform_residues(message.degree(), q, rng),
             );
             if let (Some(start), Some(p)) = (start, profile.as_deref_mut()) {
                 p.uniform_sampling_ns += start.elapsed().as_nanos();
@@ -1329,6 +1717,65 @@ pub fn rns_tensor_with_ntt(
     )
 }
 
+/// Multiplies two RNS RLWE ciphertexts using prepared per-limb NTT plans.
+///
+/// Each input polynomial is transformed once per limb. The three quadratic
+/// components are assembled in the NTT domain before inverse transformation.
+pub fn rns_tensor_with_prepared_ntt(
+    lhs: &RnsRlweCiphertext,
+    rhs: &RnsRlweCiphertext,
+    plan: &PreparedRnsNttPlan,
+) -> RnsQuadraticCiphertext {
+    assert_eq!(lhs.basis(), rhs.basis(), "RNS ciphertext bases must match");
+    assert_eq!(
+        lhs.degree(),
+        rhs.degree(),
+        "RNS ciphertext degrees must match"
+    );
+    assert_eq!(
+        plan.moduli(),
+        lhs.basis().moduli(),
+        "prepared RNS NTT plan basis must match ciphertext basis"
+    );
+    assert_eq!(
+        plan.degree(),
+        lhs.degree(),
+        "prepared RNS NTT plan degree must match ciphertext degree"
+    );
+
+    let mut c0 = Vec::with_capacity(lhs.basis().len());
+    let mut c1 = Vec::with_capacity(lhs.basis().len());
+    let mut c2 = Vec::with_capacity(lhs.basis().len());
+
+    for limb_index in 0..lhs.basis().len() {
+        let limb_plan = plan.plan(limb_index);
+        let lhs_limb = lhs.limb(limb_index);
+        let rhs_limb = rhs.limb(limb_index);
+
+        let b0 = NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(lhs_limb.b()));
+        let a0 = NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(lhs_limb.a()));
+        let b1 = NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(rhs_limb.b()));
+        let a1 = NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(rhs_limb.a()));
+
+        let c0_ntt = b0.pointwise_mul(&b1);
+
+        let mut c1_ntt = b0.pointwise_mul(&a1);
+        c1_ntt.pointwise_mul_add_assign(&a0, &b1);
+
+        let c2_ntt = a0.pointwise_mul(&a1);
+
+        c0.push(limb_plan.inverse(c0_ntt.values()));
+        c1.push(limb_plan.inverse(c1_ntt.values()));
+        c2.push(limb_plan.inverse(c2_ntt.values()));
+    }
+
+    RnsQuadraticCiphertext::from_rns_polynomials(
+        RnsPolynomial::from_residues(c0),
+        RnsPolynomial::from_residues(c1),
+        RnsPolynomial::from_residues(c2),
+    )
+}
+
 /// Relinearizes a degree-2 RNS ciphertext using CRT gadget blocks.
 pub fn rns_relinearize(
     product: &RnsQuadraticCiphertext,
@@ -1668,6 +2115,27 @@ pub fn rns_relinearize_with_prepared_dynamic_ntt(
     prepared_key: &PreparedRnsMultiplicationKey,
     plan: &PreparedRnsNttPlan,
 ) -> RnsRlweCiphertext {
+    relinearize_prepared_dynamic_kernel::<false>(product, prepared_key, plan).0
+}
+
+/// Profiles prepared dynamic-NTT relinearization by execution phase.
+///
+/// Arithmetic is shared with the production implementation.
+/// Phase timings are observational and not security evidence.
+/// The profile excludes prepared-key and NTT-plan construction.
+pub fn rns_relinearize_with_prepared_dynamic_ntt_profiled(
+    product: &RnsQuadraticCiphertext,
+    prepared_key: &PreparedRnsMultiplicationKey,
+    plan: &PreparedRnsNttPlan,
+) -> (RnsRlweCiphertext, RnsPreparedKeySwitchProfile) {
+    relinearize_prepared_dynamic_kernel::<true>(product, prepared_key, plan)
+}
+
+fn relinearize_prepared_dynamic_kernel<const PROFILE: bool>(
+    product: &RnsQuadraticCiphertext,
+    prepared_key: &PreparedRnsMultiplicationKey,
+    plan: &PreparedRnsNttPlan,
+) -> (RnsRlweCiphertext, RnsPreparedKeySwitchProfile) {
     let layout = prepared_key.layout();
 
     assert_eq!(
@@ -1675,63 +2143,70 @@ pub fn rns_relinearize_with_prepared_dynamic_ntt(
         layout.full_basis(),
         "quadratic ciphertext basis must match prepared multiplication key"
     );
-
     assert_eq!(
         product.c1().basis(),
         layout.full_basis(),
         "quadratic ciphertext basis must match prepared multiplication key"
     );
-
     assert_eq!(
         product.c2().basis(),
         layout.full_basis(),
         "quadratic ciphertext basis must match prepared multiplication key"
     );
-
     assert_eq!(
         plan.moduli(),
         layout.full_basis().moduli(),
         "prepared RNS NTT plan basis must match prepared multiplication-key basis"
     );
-
     assert_eq!(
         plan.degree(),
         product.c0().degree(),
         "prepared RNS NTT plan degree must match quadratic ciphertext degree"
     );
-
     assert_eq!(
         prepared_key.degree(),
         product.c0().degree(),
         "prepared RNS multiplication-key degree must match ciphertext degree"
     );
-
     assert_eq!(
         prepared_key.entries().len(),
         layout.block_count(),
         "prepared RNS multiplication-key entry count must match gadget block count"
     );
 
-    let decomposition = layout.decompose(product.c2());
+    let mut profile = RnsPreparedKeySwitchProfile::default();
+
+    let decompose_start = PROFILE.then(std::time::Instant::now);
+    let decomposition = layout.decompose_block_local(product.c2());
+    if let Some(start) = decompose_start {
+        profile.decompose_seconds = start.elapsed().as_secs_f64();
+    }
 
     let mut output_limbs = Vec::with_capacity(layout.full_basis().len());
 
     for limb_index in 0..layout.full_basis().len() {
         let modulus = layout.full_basis().modulus(limb_index);
-
         let limb_plan = plan.plan(limb_index);
+
+        let base_start = PROFILE.then(std::time::Instant::now);
 
         let mut b_ntt = NttPolynomial::from_prepared_values(
             limb_plan,
             limb_plan.forward(product.c0().residue(limb_index)),
         );
-
         let mut a_ntt = NttPolynomial::from_prepared_values(
             limb_plan,
             limb_plan.forward(product.c1().residue(limb_index)),
         );
 
+        if let Some(start) = base_start {
+            profile.base_forward_seconds += start.elapsed().as_secs_f64();
+            profile.base_forward_count += 2;
+        }
+
         for block_index in 0..layout.block_count() {
+            let prepare_start = PROFILE.then(std::time::Instant::now);
+
             let digit = Polynomial::new(
                 modulus,
                 decomposition
@@ -1741,23 +2216,46 @@ pub fn rns_relinearize_with_prepared_dynamic_ntt(
                     .collect(),
             );
 
+            if let Some(start) = prepare_start {
+                profile.digit_prepare_seconds += start.elapsed().as_secs_f64();
+            }
+
+            let forward_start = PROFILE.then(std::time::Instant::now);
+
             let digit_ntt =
                 NttPolynomial::from_prepared_values(limb_plan, limb_plan.forward(&digit));
 
+            if let Some(start) = forward_start {
+                profile.digit_forward_seconds += start.elapsed().as_secs_f64();
+                profile.digit_forward_count += 1;
+            }
+
             let (key_b_ntt, key_a_ntt) = prepared_key.entry(block_index).limb(limb_index);
 
-            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
+            let mac_start = PROFILE.then(std::time::Instant::now);
 
+            b_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_b_ntt);
             a_ntt.pointwise_mul_add_assign_prevalidated(&digit_ntt, key_a_ntt);
+
+            if let Some(start) = mac_start {
+                profile.mac_seconds += start.elapsed().as_secs_f64();
+            }
         }
 
-        output_limbs.push(RlweCiphertext::new(
-            limb_plan.inverse(b_ntt.values()),
-            limb_plan.inverse(a_ntt.values()),
-        ));
+        let inverse_start = PROFILE.then(std::time::Instant::now);
+
+        let b = limb_plan.inverse(b_ntt.values());
+        let a = limb_plan.inverse(a_ntt.values());
+
+        if let Some(start) = inverse_start {
+            profile.inverse_seconds += start.elapsed().as_secs_f64();
+            profile.inverse_count += 2;
+        }
+
+        output_limbs.push(RlweCiphertext::new(b, a));
     }
 
-    RnsRlweCiphertext::from_limbs(output_limbs)
+    (RnsRlweCiphertext::from_limbs(output_limbs), profile)
 }
 
 /// Switches an RNS RLWE ciphertext from the source secret encoded by
@@ -2662,6 +3160,110 @@ mod tests {
     }
 
     #[test]
+    fn conventional_rns_encryption_profiling_preserves_exact_output() {
+        use rand::RngCore;
+
+        let degree = 8;
+        let basis = basis();
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
+
+        let message = RnsPolynomial::from_coefficients(
+            basis.moduli().to_vec(),
+            &[0_u128, 1, 2, 3, 4, 5, 6, 7],
+        );
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        let mut reference_rng = ChaCha20Rng::seed_from_u64(0xE11_0001);
+
+        let mut profiled_rng = ChaCha20Rng::seed_from_u64(0xE11_0001);
+
+        let reference = encrypt_rns_raw_with_distribution_ntt_rng(
+            &message,
+            2,
+            distribution,
+            &secret,
+            &plan,
+            &mut reference_rng,
+        );
+
+        let mut profile = RnsRlweEncryptionProfile::default();
+
+        let measured = encrypt_rns_raw_with_distribution_ntt_profiled_rng(
+            &message,
+            2,
+            distribution,
+            &secret,
+            &plan,
+            &mut profiled_rng,
+            Some(&mut profile),
+        );
+
+        assert_eq!(
+            reference, measured,
+            "profiling changed the exact RNS ciphertext"
+        );
+
+        assert_eq!(
+            reference_rng.next_u64(),
+            profiled_rng.next_u64(),
+            "profiling changed RNG consumption"
+        );
+
+        let component_sum = [
+            profile.error_sampling_ns,
+            profile.secret_projection_ns,
+            profile.uniform_sampling_ns,
+            profile.error_projection_ns,
+            profile.ntt_multiplication_ns,
+            profile.ciphertext_assembly_ns,
+        ]
+        .iter()
+        .copied()
+        .sum::<u128>();
+
+        assert!(
+            profile.total_ns > 0,
+            "total profiling duration was not recorded"
+        );
+
+        assert!(
+            profile.error_sampling_ns > 0,
+            "Gaussian sampling duration was not recorded"
+        );
+
+        assert!(
+            profile.uniform_sampling_ns > 0,
+            "uniform sampling duration was not recorded"
+        );
+
+        assert!(
+            profile.ntt_multiplication_ns > 0,
+            "NTT multiplication duration was not recorded"
+        );
+
+        assert!(
+            component_sum <= profile.total_ns,
+            "component durations exceed total encryption duration"
+        );
+
+        println!(
+            "N4_E11G_EXACT_CIPHERTEXT=PASS              RNG_CONSUMPTION=PASS              TIMING_ACCOUNTING=PASS              TOTAL_NS={} COMPONENT_SUM_NS={} RESIDUAL_NS={}",
+            profile.total_ns,
+            component_sum,
+            profile.total_ns - component_sum,
+        );
+    }
+
+    #[test]
     fn shared_gaussian_rns_error_projects_identically_across_limbs() {
         let degree = 8;
         let basis = basis();
@@ -2915,6 +3517,7 @@ mod tests {
         let basis = basis();
         let degree = 8;
         let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared_plan = PreparedRnsNttPlan::new(&plan);
 
         let secret = [-1, 0, 1, 1, 0, -1, 1, 0];
 
@@ -2938,6 +3541,7 @@ mod tests {
                 encrypt_rns_raw_with_ntt_rng(&rhs_message, 2, 1, &secret, &plan, &mut rhs_rng);
 
             let optimized = rns_tensor_with_ntt(&lhs, &rhs, &plan);
+            let prepared = rns_tensor_with_prepared_ntt(&lhs, &rhs, &prepared_plan);
 
             let mut c0 = Vec::new();
             let mut c1 = Vec::new();
@@ -2960,6 +3564,14 @@ mod tests {
             assert_eq!(
                 optimized, reference,
                 "NTT RNS tensor diverged for seed {seed}"
+            );
+            assert_eq!(
+                prepared, reference,
+                "prepared RNS tensor diverged for seed {seed}"
+            );
+            assert_eq!(
+                prepared, optimized,
+                "prepared and ordinary NTT tensors diverged for seed {seed}"
             );
         }
     }
@@ -4024,5 +4636,78 @@ mod r3_evaluation_key_noise_diagnostics {
         }
 
         println!("R3_1A_LAYOUT_SWEEP_STATUS=PASS");
+    }
+}
+
+#[cfg(test)]
+mod n4_e11o3_tests {
+    use super::*;
+    use crate::ckks::research_profile_16384;
+    use rand::RngCore;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn n4_e11o3_prepared_encryption_exact_equivalence() {
+        let profile = research_profile_16384();
+        let basis = profile.modulus_basis();
+        let degree = 16384;
+
+        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+        let prepared = PreparedRnsNttPlan::new(&plan);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
+
+        let message =
+            RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &vec![0_u128; degree]);
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        for seed in [0xE110_0001_u64, 0xE110_0002, 0xE110_0003] {
+            let mut reference_rng = ChaCha20Rng::seed_from_u64(seed);
+            let mut prepared_rng = ChaCha20Rng::seed_from_u64(seed);
+
+            let reference = encrypt_rns_raw_with_distribution_ntt_rng(
+                &message,
+                2,
+                distribution,
+                &secret,
+                &plan,
+                &mut reference_rng,
+            );
+
+            let optimized = encrypt_rns_raw_with_distribution_prepared_ntt_rng(
+                &message,
+                2,
+                distribution,
+                &secret,
+                &plan,
+                &prepared,
+                &mut prepared_rng,
+            );
+
+            assert_eq!(reference, optimized, "ciphertext mismatch for seed {seed}");
+
+            assert_eq!(
+                reference_rng.next_u64(),
+                prepared_rng.next_u64(),
+                "RNG continuation mismatch for seed {seed}"
+            );
+
+            println!(
+                "N4_E11O3_SEED={} DEGREE={} LIMBS={} STATUS=PASS",
+                seed,
+                degree,
+                basis.moduli().len()
+            );
+        }
+
+        println!("N4_E11O3_EXACT_EQUIVALENCE=PASS");
     }
 }

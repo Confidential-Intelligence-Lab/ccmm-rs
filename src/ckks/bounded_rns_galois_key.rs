@@ -622,6 +622,244 @@ pub fn apply_bounded_rns_galois_automorphism_with_prepared_execution(
     RnsRlweCiphertext::from_limbs(output_limbs)
 }
 
+/// Applies a prepared bounded Galois key using prepared Garner CRT.
+///
+/// The Garner context is reusable across rotations sharing an RNS basis.
+/// Evaluation-key and NTT arithmetic remain unchanged.
+pub fn apply_bounded_rns_galois_automorphism_with_prepared_garner(
+    ciphertext: &RnsRlweCiphertext,
+    key: &PreparedBoundedRnsGaloisKey,
+    plan: &RnsNttPlan,
+    prepared_plan: &crate::ring::PreparedRnsNttPlan,
+    garner: &crate::ring::PreparedGarner,
+) -> RnsRlweCiphertext {
+    assert_eq!(ciphertext.basis(), key.layout.full_basis());
+    assert_eq!(plan.moduli(), ciphertext.basis().moduli());
+    assert_eq!(plan.degree(), ciphertext.degree());
+    assert_eq!(key.degree, ciphertext.degree());
+    assert_eq!(prepared_plan.moduli(), plan.moduli());
+    assert_eq!(prepared_plan.degree(), plan.degree());
+
+    let transformed = apply_rns_automorphism(ciphertext, key.exponent);
+
+    let transformed_a = RnsPolynomial::from_residues(
+        transformed
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let canonical = garner.reconstruct(&transformed_a);
+    let decomposition = key.layout.decompose_canonical(&canonical);
+    let mut output_limbs = Vec::with_capacity(ciphertext.basis().len());
+
+    for limb_index in 0..ciphertext.basis().len() {
+        let modulus = ciphertext.basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+        let prepared_limb_plan = prepared_plan.plan(limb_index);
+
+        let mut b_ntt = crate::ring::NttPolynomial::from_prepared_values(
+            prepared_limb_plan,
+            prepared_limb_plan.forward(transformed.limb(limb_index).b()),
+        );
+
+        let mut a_ntt = crate::ring::NttPolynomial::zero(limb_plan);
+
+        for digit_index in 0..key.layout.digit_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(digit_index)
+                    .iter()
+                    .map(|&value| signed_mod(value, modulus.value()))
+                    .collect(),
+            );
+
+            let digit_ntt = crate::ring::NttPolynomial::from_prepared_values(
+                prepared_limb_plan,
+                prepared_limb_plan.forward(&digit),
+            );
+
+            let (key_b_ntt, key_a_ntt) = &key.entries[digit_index][limb_index];
+
+            b_ntt.pointwise_mul_add_assign(&digit_ntt, key_b_ntt);
+            a_ntt.pointwise_mul_add_assign(&digit_ntt, key_a_ntt);
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            prepared_limb_plan.inverse(b_ntt.values()),
+            prepared_limb_plan.inverse(a_ntt.values()),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// Applies a prepared bounded Galois key with bitwise decomposition.
+///
+/// Experimental R4 path preserving the R3 key-switch arithmetic.
+pub fn apply_bounded_rns_galois_automorphism_with_bitwise_decomposition(
+    ciphertext: &RnsRlweCiphertext,
+    key: &PreparedBoundedRnsGaloisKey,
+    plan: &RnsNttPlan,
+    prepared_plan: &crate::ring::PreparedRnsNttPlan,
+    garner: &crate::ring::PreparedGarner,
+) -> RnsRlweCiphertext {
+    assert_eq!(ciphertext.basis(), key.layout.full_basis());
+    assert_eq!(plan.moduli(), ciphertext.basis().moduli());
+    assert_eq!(plan.degree(), ciphertext.degree());
+    assert_eq!(key.degree, ciphertext.degree());
+    assert_eq!(prepared_plan.moduli(), plan.moduli());
+    assert_eq!(prepared_plan.degree(), plan.degree());
+
+    let transformed = apply_rns_automorphism(ciphertext, key.exponent);
+
+    let transformed_a = RnsPolynomial::from_residues(
+        transformed
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let canonical = garner.reconstruct(&transformed_a);
+    let decomposition = key.layout.decompose_canonical_bitwise(&canonical);
+    let mut output_limbs = Vec::with_capacity(ciphertext.basis().len());
+
+    for limb_index in 0..ciphertext.basis().len() {
+        let modulus = ciphertext.basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+        let prepared_limb_plan = prepared_plan.plan(limb_index);
+
+        let mut b_ntt = crate::ring::NttPolynomial::from_prepared_values(
+            prepared_limb_plan,
+            prepared_limb_plan.forward(transformed.limb(limb_index).b()),
+        );
+
+        let mut a_ntt = crate::ring::NttPolynomial::zero(limb_plan);
+
+        for digit_index in 0..key.layout.digit_count() {
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(digit_index)
+                    .iter()
+                    .map(|&value| signed_mod(value, modulus.value()))
+                    .collect(),
+            );
+
+            let digit_ntt = crate::ring::NttPolynomial::from_prepared_values(
+                prepared_limb_plan,
+                prepared_limb_plan.forward(&digit),
+            );
+
+            let (key_b_ntt, key_a_ntt) = &key.entries[digit_index][limb_index];
+
+            b_ntt.pointwise_mul_add_assign(&digit_ntt, key_b_ntt);
+            a_ntt.pointwise_mul_add_assign(&digit_ntt, key_a_ntt);
+        }
+
+        output_limbs.push(RlweCiphertext::new(
+            prepared_limb_plan.inverse(b_ntt.values()),
+            prepared_limb_plan.inverse(a_ntt.values()),
+        ));
+    }
+
+    RnsRlweCiphertext::from_limbs(output_limbs)
+}
+
+/// Phase-profiled variant of prepared bounded Galois execution.
+///
+/// Retains the arithmetic of the unprofiled prepared-execution path.
+/// Timings exclude evaluation-key and NTT-plan preparation.
+pub fn apply_bounded_rns_galois_automorphism_with_prepared_execution_profiled(
+    ciphertext: &RnsRlweCiphertext,
+    key: &PreparedBoundedRnsGaloisKey,
+    plan: &RnsNttPlan,
+    prepared_plan: &crate::ring::PreparedRnsNttPlan,
+) -> (RnsRlweCiphertext, BoundedGaloisRotationProfile) {
+    assert_eq!(ciphertext.basis(), key.layout.full_basis());
+    assert_eq!(plan.moduli(), ciphertext.basis().moduli());
+    assert_eq!(plan.degree(), ciphertext.degree());
+    assert_eq!(key.degree, ciphertext.degree());
+    assert_eq!(prepared_plan.moduli(), plan.moduli());
+    assert_eq!(prepared_plan.degree(), plan.degree());
+
+    let mut profile = BoundedGaloisRotationProfile::default();
+
+    let start = std::time::Instant::now();
+    let transformed = apply_rns_automorphism(ciphertext, key.exponent);
+    profile.automorphism_seconds = start.elapsed().as_secs_f64();
+
+    let transformed_a = RnsPolynomial::from_residues(
+        transformed
+            .limbs()
+            .iter()
+            .map(|limb| limb.a().clone())
+            .collect(),
+    );
+
+    let start = std::time::Instant::now();
+    let decomposition = key.layout.decompose(&transformed_a);
+    profile.decomposition_seconds = start.elapsed().as_secs_f64();
+    let mut output_limbs = Vec::with_capacity(ciphertext.basis().len());
+
+    for limb_index in 0..ciphertext.basis().len() {
+        let modulus = ciphertext.basis().modulus(limb_index);
+        let limb_plan = plan.plan(limb_index);
+        let prepared_limb_plan = prepared_plan.plan(limb_index);
+
+        let start = std::time::Instant::now();
+        let mut b_ntt = crate::ring::NttPolynomial::from_prepared_values(
+            prepared_limb_plan,
+            prepared_limb_plan.forward(transformed.limb(limb_index).b()),
+        );
+
+        let mut a_ntt = crate::ring::NttPolynomial::zero(limb_plan);
+
+        profile.base_forward_seconds += start.elapsed().as_secs_f64();
+
+        for digit_index in 0..key.layout.digit_count() {
+            let start = std::time::Instant::now();
+            let digit = Polynomial::new(
+                modulus,
+                decomposition
+                    .digit(digit_index)
+                    .iter()
+                    .map(|&value| signed_mod(value, modulus.value()))
+                    .collect(),
+            );
+
+            profile.digit_prepare_seconds += start.elapsed().as_secs_f64();
+
+            let start = std::time::Instant::now();
+            let digit_ntt = crate::ring::NttPolynomial::from_prepared_values(
+                prepared_limb_plan,
+                prepared_limb_plan.forward(&digit),
+            );
+
+            profile.digit_forward_seconds += start.elapsed().as_secs_f64();
+
+            let (key_b_ntt, key_a_ntt) = &key.entries[digit_index][limb_index];
+
+            let start = std::time::Instant::now();
+            b_ntt.pointwise_mul_add_assign(&digit_ntt, key_b_ntt);
+            a_ntt.pointwise_mul_add_assign(&digit_ntt, key_a_ntt);
+            profile.mac_seconds += start.elapsed().as_secs_f64();
+        }
+
+        let start = std::time::Instant::now();
+        output_limbs.push(RlweCiphertext::new(
+            prepared_limb_plan.inverse(b_ntt.values()),
+            prepared_limb_plan.inverse(a_ntt.values()),
+        ));
+        profile.inverse_seconds += start.elapsed().as_secs_f64();
+    }
+
+    (RnsRlweCiphertext::from_limbs(output_limbs), profile)
+}
+
 /// Rotates CKKS slots using a prepared bounded Gaussian Galois key.
 pub fn rotate_left_bounded_rns_ckks_with_prepared_ntt(
     ciphertext: &RnsCkksCiphertext,

@@ -48,9 +48,10 @@ where
                 (0..degree).map(|_| rng.gen_range(-bound..=bound)).collect()
             }
         }
-        ErrorDistribution::DiscreteGaussian { sigma } => (0..degree)
-            .map(|_| sample_discrete_gaussian(sigma, rng))
-            .collect(),
+        ErrorDistribution::DiscreteGaussian { sigma } => {
+            let table = DiscreteGaussianTable::new(sigma);
+            (0..degree).map(|_| table.sample(rng)).collect()
+        }
     }
 }
 
@@ -62,6 +63,52 @@ where
 ///
 /// The tail is truncated only after its omitted probability mass is
 /// negligible relative to 64-bit sampling precision.
+
+struct DiscreteGaussianTable {
+    weights: Vec<(i64, f64)>,
+    total: f64,
+    tail: i64,
+}
+
+impl DiscreteGaussianTable {
+    fn new(sigma: f64) -> Self {
+        let tail = (16.0 * sigma).ceil() as i64;
+        let mut weights = Vec::with_capacity((2 * tail + 1) as usize);
+        let mut total = 0.0_f64;
+
+        for x in -tail..=tail {
+            let xf = x as f64;
+            let weight = (-(xf * xf) / (2.0 * sigma * sigma)).exp();
+            weights.push((x, weight));
+            total += weight;
+        }
+
+        Self {
+            weights,
+            total,
+            tail,
+        }
+    }
+
+    fn sample<R>(&self, rng: &mut R) -> i64
+    where
+        R: RngCore + CryptoRng,
+    {
+        let target = uniform_open_unit(rng) * self.total;
+        let mut cumulative = 0.0_f64;
+
+        for &(x, weight) in &self.weights {
+            cumulative += weight;
+            if target < cumulative {
+                return x;
+            }
+        }
+
+        self.tail
+    }
+}
+
+#[cfg(test)]
 fn sample_discrete_gaussian<R>(sigma: f64, rng: &mut R) -> i64
 where
     R: RngCore + CryptoRng,
@@ -195,5 +242,50 @@ mod tests {
         let projected = project_error(modulus, &values);
 
         assert_eq!(projected.coefficients(), &[12_282, 12_288, 0, 1, 7]);
+    }
+}
+
+#[cfg(test)]
+mod n4_e11q3b_tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn n4_e11q3b_gaussian_table_matches_reference() {
+        const DEGREE: usize = 16384;
+
+        for sigma in [1.0, 3.19, 4.0, 6.0] {
+            for seed in [0xE110_5001_u64, 0xE110_5002, 0xE110_5003] {
+                let mut reference_rng = ChaCha20Rng::seed_from_u64(seed);
+
+                let mut optimized_rng = ChaCha20Rng::seed_from_u64(seed);
+
+                let reference: Vec<i64> = (0..DEGREE)
+                    .map(|_| sample_discrete_gaussian(sigma, &mut reference_rng))
+                    .collect();
+
+                let optimized = sample_error_coefficients(
+                    DEGREE,
+                    ErrorDistribution::DiscreteGaussian { sigma },
+                    &mut optimized_rng,
+                );
+
+                assert_eq!(
+                    reference, optimized,
+                    "sample mismatch: sigma={sigma}, seed={seed}"
+                );
+
+                assert_eq!(
+                    reference_rng.next_u64(),
+                    optimized_rng.next_u64(),
+                    "RNG mismatch: sigma={sigma}, seed={seed}"
+                );
+
+                println!("N4_E11Q3B_SIGMA={} SEED={} STATUS=PASS", sigma, seed);
+            }
+        }
+
+        println!("N4_E11Q3B_EQUIVALENCE=PASS");
     }
 }

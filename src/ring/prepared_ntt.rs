@@ -152,7 +152,24 @@ impl PreparedNttPlan {
         values
     }
 
+    /// Applies the prepared forward NTT to an owned coefficient vector.
     pub fn forward_owned(&self, mut values: Vec<u64>) -> Vec<u64> {
+        self.forward_owned_in_place(&mut values);
+        values
+    }
+
+    /// Applies the prepared forward NTT to a zeroizing owned buffer.
+    ///
+    /// The returned values remain sensitive secret material.
+    pub fn forward_zeroizing_owned(
+        &self,
+        mut values: zeroize::Zeroizing<Vec<u64>>,
+    ) -> zeroize::Zeroizing<Vec<u64>> {
+        self.forward_owned_in_place(&mut values);
+        values
+    }
+
+    fn forward_owned_in_place(&self, values: &mut [u64]) {
         assert_eq!(
             values.len(),
             self.degree,
@@ -170,16 +187,14 @@ impl PreparedNttPlan {
                 *value = twist.mul(*value, self.modulus);
             }
 
-            cyclic_ntt_shoup(&mut values, self.modulus, twiddles, &self.bit_reverse_swaps);
+            cyclic_ntt_shoup(values, self.modulus, twiddles, &self.bit_reverse_swaps);
         } else {
             for (value, &twist) in values.iter_mut().zip(&self.forward_twists) {
                 *value = self.modulus.mul(*value, twist);
             }
 
-            cyclic_ntt_prepared(&mut values, self.modulus, &self.forward_stage_twiddles);
+            cyclic_ntt_prepared(values, self.modulus, &self.forward_stage_twiddles);
         }
-
-        values
     }
 
     pub fn forward(&self, polynomial: &Polynomial) -> Vec<u64> {

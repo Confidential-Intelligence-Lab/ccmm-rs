@@ -1,3 +1,5 @@
+#[path = "../fft2_r1_npy.rs"]
+mod fft2_r1_npy;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_16384, research_profile_32768, research_profile_65536,
@@ -1740,7 +1742,11 @@ fn main() {
     println!("IMAGE_FFT_INPUT={}", input_path.display());
     println!("IMAGE_FFT_OUTPUT_DIR={}", output_dir.display());
 
-    let logical_image = load_grayscale_square(&input_path, dimension);
+    let logical_image = if input_path.extension().and_then(|x| x.to_str()) == Some("npy") {
+        fft2_r1_npy::read_f64_square(&input_path, dimension)
+    } else {
+        load_grayscale_square(&input_path, dimension)
+    };
 
     let clear_global_reference = fft2_pp(image_shape, FftDirection::Forward, &logical_image);
 
@@ -2721,6 +2727,11 @@ fn main() {
      * bit-reversed row/column ordering as the monolithic packed FFT2.
      */
     let decoded_global = packed_physical_to_logical(&global_physical, image_shape);
+    if let Some(path) = env::var_os("FFT_NUMPY_OUTPUT") {
+        fft2_r1_npy::write_complex128_square(&PathBuf::from(path), dimension, &decoded_global);
+        println!("FFT_R1_NUMPY_OUTPUT_STATUS=PASS");
+    }
+
 
     let timing_decrypt_decode_ms = phase_done(
         decrypt_phase,

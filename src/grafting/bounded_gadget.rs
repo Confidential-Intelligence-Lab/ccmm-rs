@@ -116,6 +116,55 @@ impl BoundedGadgetLayout {
             digits,
         }
     }
+
+    // R4_BITWISE_BALANCED_DECOMPOSITION
+    /// Experimental power-of-two balanced-digit decomposition.
+    ///
+    /// Preserves the reference centered-digit convention.
+    pub fn decompose_canonical_bitwise(&self, canonical: &[BigUint]) -> BoundedGadgetDecomposition {
+        let modulus = composite_modulus_big(&self.full_basis);
+        let degree = canonical.len();
+
+        assert!(degree > 0, "canonical decomposition requires coefficients");
+
+        let shift = self.base_log as usize;
+        let base = self.base as i128;
+        let half = base / 2;
+        let mask = BigInt::from(self.base - 1);
+
+        let mut digits = vec![vec![0_i128; degree]; self.digit_count];
+
+        for (coefficient_index, coefficient) in canonical.iter().enumerate() {
+            let mut value = centered_representative_big(coefficient, &modulus);
+
+            for digit_row in digits.iter_mut().take(self.digit_count) {
+                let residue = (&value & &mask)
+                    .to_i128()
+                    .expect("masked balanced digit must fit i128");
+
+                let digit = if residue >= half {
+                    residue - base
+                } else {
+                    residue
+                };
+
+                digit_row[coefficient_index] = digit;
+
+                value -= BigInt::from(digit);
+                value >>= shift;
+            }
+
+            assert!(
+                value.is_zero(),
+                "bitwise bounded gadget digit count is insufficient"
+            );
+        }
+
+        BoundedGadgetDecomposition {
+            layout: self.clone(),
+            digits,
+        }
+    }
 }
 
 // R36_4B_PREPARED_CANONICAL_SOURCE
@@ -1027,5 +1076,79 @@ mod r39_9g_benchmark {
         }
 
         println!("R39_9G_EXACT_DIGIT_EQUIVALENCE=PASS");
+    }
+}
+
+// N4_ROT_12C_DIFFERENTIAL_TEST
+#[cfg(test)]
+mod n4_rot_12c_tests {
+    use super::*;
+    use num_bigint::BigUint;
+    use num_traits::{One, Zero};
+
+    #[test]
+    fn bitwise_matches_reference_across_bases_and_boundaries() {
+        let basis = ModulusBasis::new(vec![
+            crate::ring::Modulus::new(97),
+            crate::ring::Modulus::new(193),
+            crate::ring::Modulus::new(257),
+        ]);
+
+        let modulus = composite_modulus_big(&basis);
+        let half_modulus = &modulus >> 1usize;
+
+        for base_log in [4_u32, 8, 16, 32, 63] {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+            let base = BigUint::one() << base_log;
+            let half_base = &base >> 1usize;
+
+            let mut values = vec![
+                BigUint::zero(),
+                BigUint::one(),
+                &modulus - BigUint::one(),
+                half_modulus.clone(),
+                &half_modulus + BigUint::one(),
+            ];
+
+            for boundary in [
+                half_base.clone(),
+                &half_base + BigUint::one(),
+                &base - BigUint::one(),
+                base.clone(),
+                &base + BigUint::one(),
+            ] {
+                if boundary < modulus {
+                    values.push(boundary.clone());
+
+                    if !boundary.is_zero() {
+                        values.push(&modulus - &boundary);
+                    }
+                }
+            }
+
+            // Deterministic coverage across the canonical interval.
+            for index in 0..512_u64 {
+                let candidate = (BigUint::from(index) * BigUint::from(7919_u64)) % &modulus;
+                values.push(candidate);
+            }
+
+            let reference = layout.decompose_canonical(&values);
+            let candidate = layout.decompose_canonical_bitwise(&values);
+
+            assert_eq!(
+                reference, candidate,
+                "bitwise decomposition mismatch for base_log={base_log}"
+            );
+
+            println!(
+                "N4_ROT_12C_CASE BASE_LOG={} COEFFICIENTS={} \
+                 DIGITS={} EXACT_EQUALITY=PASS",
+                base_log,
+                values.len(),
+                layout.digit_count()
+            );
+        }
+
+        println!("N4_ROT_12C_STATUS=PASS");
     }
 }

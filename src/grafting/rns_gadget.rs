@@ -134,6 +134,99 @@ impl RnsGadgetLayout {
             % q
     }
 
+    /// Decomposes each gadget block using only its constituent RNS limbs.
+    ///
+    /// This avoids reconstructing the full composite modulus when a
+    /// gadget block covers only a subset of the RNS basis.
+    ///
+    /// The resulting digits are identical to those returned by `decompose`.
+    pub fn decompose_block_local(&self, polynomial: &RnsPolynomial) -> RnsGadgetDecomposition {
+        assert_eq!(
+            polynomial.basis(),
+            &self.full_basis,
+            "polynomial basis must match RNS gadget layout"
+        );
+
+        let degree = polynomial.degree();
+        let mut digits = Vec::with_capacity(self.blocks.len());
+
+        for block in &self.blocks {
+            let start = block.start();
+            let end = block.end();
+
+            if end - start == 1 {
+                digits.push(
+                    polynomial
+                        .residue(start)
+                        .coefficients()
+                        .iter()
+                        .map(|&value| u128::from(value))
+                        .collect(),
+                );
+                continue;
+            }
+
+            let mut prefix_products = Vec::with_capacity(end - start);
+            let mut inverses = Vec::with_capacity(end - start);
+
+            let mut prefix = u128::from(self.full_basis.modulus(start).value());
+
+            for limb_index in (start + 1)..end {
+                let modulus = u128::from(self.full_basis.modulus(limb_index).value());
+
+                prefix_products.push(prefix);
+                inverses.push(inverse_mod_u128(prefix % modulus, modulus));
+
+                prefix = prefix
+                    .checked_mul(modulus)
+                    .expect("gadget block composite modulus exceeds u128");
+            }
+
+            let mut block_digits = Vec::with_capacity(degree);
+
+            for coefficient_index in 0..degree {
+                let mut value =
+                    u128::from(polynomial.residue(start).coefficients()[coefficient_index]);
+
+                for (offset, limb_index) in ((start + 1)..end).enumerate() {
+                    let modulus = u128::from(self.full_basis.modulus(limb_index).value());
+
+                    let residue = u128::from(
+                        polynomial.residue(limb_index).coefficients()[coefficient_index],
+                    );
+
+                    let value_mod = value % modulus;
+
+                    let difference = (residue + modulus - value_mod) % modulus;
+
+                    let limb_modulus = self.full_basis.modulus(limb_index);
+
+                    let correction = u128::from(limb_modulus.mul_canonical(
+                        u64::try_from(difference).expect("CRT difference exceeds u64"),
+                        u64::try_from(inverses[offset]).expect("CRT inverse exceeds u64"),
+                    ));
+
+                    let increment = prefix_products[offset]
+                        .checked_mul(correction)
+                        .expect("CRT reconstruction multiplication overflow");
+
+                    value = value
+                        .checked_add(increment)
+                        .expect("CRT reconstruction addition overflow");
+                }
+
+                block_digits.push(value);
+            }
+
+            digits.push(block_digits);
+        }
+
+        RnsGadgetDecomposition {
+            layout: self.clone(),
+            digits,
+        }
+    }
+
     /// Decomposes one RNS polynomial into canonical block residues.
     pub fn decompose(&self, polynomial: &RnsPolynomial) -> RnsGadgetDecomposition {
         assert_eq!(
@@ -401,6 +494,83 @@ mod tests {
         for index in 0..2 {
             assert_eq!(decomposition.lift_digit(index).basis(), &basis);
         }
+    }
+
+    #[test]
+    fn n4_e8f_research_4096_block_local_matches_reference() {
+        let basis = crate::ckks::research_profile_4096().modulus_basis();
+        let q = basis.composite_modulus();
+
+        let layout = RnsGadgetLayout::new(basis.clone(), vec![1, 2]);
+
+        let boundary = [0_u128, 1, 2, q / 2 - 1, q / 2, q / 2 + 1, q - 2, q - 1];
+
+        for seed in 0_u128..32 {
+            let coefficients: Vec<u128> = (0..4096_usize)
+                .map(|index| {
+                    if index < boundary.len() {
+                        boundary[index]
+                    } else {
+                        let index = index as u128;
+                        (97 * seed + 31 * index + 7 * index * index + 11) % q
+                    }
+                })
+                .collect();
+
+            let polynomial =
+                RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+            let reference = layout.decompose(&polynomial);
+            let candidate = layout.decompose_block_local(&polynomial);
+
+            assert_eq!(
+                candidate, reference,
+                "research-4096 decomposition mismatch: seed={seed}"
+            );
+        }
+
+        println!(
+            "N4_E8F_EXACT_EQUIVALENCE=PASS \
+             PROFILE=research-4096 SEEDS=32 DEGREE=4096"
+        );
+    }
+
+    #[test]
+    fn n4_e8d_block_local_decomposition_matches_reference() {
+        let basis = basis();
+        let q = basis.composite_modulus();
+
+        let layouts = [
+            vec![4],
+            vec![1, 3],
+            vec![2, 2],
+            vec![1, 2, 1],
+            vec![1, 1, 1, 1],
+        ];
+
+        for seed in 0_u128..32 {
+            let coefficients: Vec<u128> = (0..32_u128)
+                .map(|index| (97 * seed + 31 * index + 7 * index * index + 11) % q)
+                .collect();
+
+            let polynomial =
+                RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+            for block_sizes in &layouts {
+                let layout = RnsGadgetLayout::new(basis.clone(), block_sizes.clone());
+
+                let reference = layout.decompose(&polynomial);
+                let candidate = layout.decompose_block_local(&polynomial);
+
+                assert_eq!(
+                    candidate, reference,
+                    "block-local decomposition mismatch: seed={seed}, \
+                     layout={block_sizes:?}"
+                );
+            }
+        }
+
+        println!("N4_E8D_EXACT_EQUIVALENCE=PASS SEEDS=32 LAYOUTS=5");
     }
 
     #[test]

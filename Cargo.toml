@@ -17,6 +17,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Pin flate2 while png 0.18.x still directly depends on miniz_oxide 0.8.
 # Newer flate2 releases use miniz_oxide 0.9, producing a duplicate graph.
 flate2 = "=1.1.0"
+zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 approx = "0.5"

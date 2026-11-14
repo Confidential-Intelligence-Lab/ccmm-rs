@@ -1,3 +1,6 @@
+#[path = "../fft2_r1_npy.rs"]
+mod fft2_r1_npy;
+use std::path::PathBuf;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
@@ -481,7 +484,16 @@ fn main() {
      * Clear oracle + packed clear state.
      * ---------------------------------------------------------------
      */
-    let image = deterministic_image();
+    let numerical_input = std::env::var_os("FFT2_R1_1K_INPUT").map(PathBuf::from);
+    let numerical_output = std::env::var_os("FFT2_R1_1K_OUTPUT").map(PathBuf::from);
+    assert!(numerical_input.is_some() == numerical_output.is_some(),
+        "FFT2_R1_1K_INPUT and FFT2_R1_1K_OUTPUT must both be set or both absent");
+    let image = if let Some(ref path) = numerical_input {
+        println!("FFT2_R1_1K_INPUT={}", path.display());
+        fft2_r1_npy::read_f64_square(path, IMAGE_DIM)
+    } else {
+        deterministic_image()
+    };
 
     let oracle_start = Instant::now();
 
@@ -1173,6 +1185,10 @@ fn main() {
     let physical = reconstruct_physical_image(&decoded);
 
     let actual = packed_physical_to_logical(&physical, image_shape);
+    if let Some(ref path) = numerical_output {
+        fft2_r1_npy::write_complex128_square(path, IMAGE_DIM, &actual);
+        println!("FFT2_R1_1K_NUMPY_OUTPUT_STATUS=PASS");
+    }
 
     let (rel_l2, max_abs) = error_metrics(&actual, &oracle);
 

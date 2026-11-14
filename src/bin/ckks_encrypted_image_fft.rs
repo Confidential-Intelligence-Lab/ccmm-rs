@@ -1,3 +1,5 @@
+#[path = "../fft2_r1_npy.rs"]
+mod fft2_r1_npy;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_16384, research_profile_32768, research_profile_65536, rotation_exponent_left,
@@ -357,16 +359,20 @@ fn main() {
         .flush()
         .expect("FFT parameterization output must flush");
 
-    let output_dir = PathBuf::from(format!(
+    let output_dir = env::var_os("FFT_OUTPUT_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!(
         "results/image_filter/encrypted_frequency_filter/image_fft_{dimension}x{dimension}"
-    ));
+    )));
 
     fs::create_dir_all(&output_dir).expect("failed to create encrypted image FFT result directory");
 
     println!("IMAGE_FFT_INPUT={}", input_path.display());
     println!("IMAGE_FFT_OUTPUT_DIR={}", output_dir.display());
 
-    let logical_input = load_grayscale_square(&input_path, dimension);
+    let logical_input = if input_path.extension().and_then(|x| x.to_str()) == Some("npy") {
+        fft2_r1_npy::read_f64_square(&input_path, dimension)
+    } else {
+        load_grayscale_square(&input_path, dimension)
+    };
 
     let input_image_name = format!("01_input_{dimension}x{dimension}.png");
     save_spatial_image(&output_dir.join(&input_image_name), &logical_input, shape);
@@ -574,6 +580,11 @@ fn main() {
     let decoded_physical = decrypt_slots(&encrypted_spectrum, &secret, &embedding);
 
     let decoded_logical = packed_physical_to_logical(&decoded_physical, shape);
+    if let Some(path) = env::var_os("FFT_NUMPY_OUTPUT") {
+        fft2_r1_npy::write_complex128_square(&PathBuf::from(path), dimension, &decoded_logical);
+        println!("FFT_R1_NUMPY_OUTPUT_STATUS=PASS");
+    }
+
 
     let timing_decrypt_decode_ms = phase_done(
         decrypt_phase,
