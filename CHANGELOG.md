@@ -2,6 +2,13 @@
 
 ## Unreleased — R3.5 closeout / FHE-rs direction
 
+### Hierarchical CKKS FFT integration
+
+- Added full 8192 x 8192 hierarchical FFT2 and spectrum-export executables.
+- Added reusable packed row-stage preparation and a cache-context binding safeguard.
+- Extended the depth-aware RNS-CKKS prime pool for 26 transform stages and guard limbs.
+- Added row-cache equivalence and context-rejection regression coverage.
+- Distinguished integrated stage-13 evidence from earlier complete 26-stage runs.
 ### Added
 
 - eBLAS PP/CP/PC/CC model and Level 1/2/3 operations;

@@ -305,6 +305,9 @@ R3.3c does not require:
 - claiming a parameter set is security-bearing merely because its arithmetic is correct;
 - optimizing the 128-bit backend before a correct differential reference exists.
 
+## Hierarchical FFT modulus-chain extension
+
+The 8K FFT research configuration supports 26 FFT stages and two guard limbs, using 28 initial RNS limbs. This physical residue width must be distinguished from logical CKKS levels and from auxiliary key-switching material. The prime pool is defined in `src/ckks/parameters.rs`. A modulus-bit total or successful numerical FFT run does not by itself establish a cryptographic security level.
 ## 14. Architectural invariant
 
 The central invariant for the generalized implementation is:

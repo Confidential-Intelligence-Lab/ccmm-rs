@@ -76,6 +76,25 @@ The wrapper verifies the 4096 x 4096 image's SHA-256 against the frozen R21 base
 
 The R31.5 execution validated 512 ciphertexts and 16 packed macrotiles for the complete 4096 x 4096 input. The research profile must be labeled `SECURITY_BEARING=false`. The frozen result confirms complete execution and the same reported relative L2 and maximum absolute error as the previous R21 baseline, but does not attribute speedup to a single microoptimization.
 
+## Hierarchical 8192 x 8192 execution
+
+The 8K execution model comprises 64 macrotiles (an 8 x 8 grid of 1024 x 1024 blocks), 32 ciphertexts per macrotile, and 2048 ciphertexts total. The separable radix-2 DIF FFT2 uses 13 row stages and 13 column stages, a degree-65536 CKKS ring, and 32768 complex slots per ciphertext. The depth-aware research profile uses 28 initial RNS limbs (26 execution levels and two guard limbs).
+
+| Executable | Purpose |
+|---|---|
+| `ckks_sar8k_full_fft` | 8K execution, structural preflight, and reference preflight |
+| `ckks_sar8k_full_fft_export` | 8K execution with spectrum export |
+| `ckks_packed_row_cache_validation` | Prepared-row cache validation |
+
+Build and run a non-encrypted structural preflight:
+
+```bash
+cargo run --locked --release --bin ckks_sar8k_full_fft -- preflight
+```
+
+The primary executor also supports `reference-preflight` with an existing checkpoint TSV and NumPy FFT2 reference file. That operation checks cleartext reference consistency, not encrypted execution. The `full-stage26` mode is resource-intensive and requires input data and sufficient host memory; consult the executable's argument handling before use.
+
+**Evidence boundary:** The consolidated source has passed an encrypted 13-stage row-transform regression on 256 ciphertexts (relative L2 error approximately 3.43e-11). Complete 26-stage executions on three 8K inputs were validated on an earlier source configuration. Do not present those older runs as end-to-end validation of the integrated commit. Numerical correctness is not a cryptographic-security assessment.
 ## Techniques exercised or studied
 
 - **Packing and decomposition:** tiles/macrotiles and CKKS slot layout; the full 4K image is not one monolithic ciphertext.

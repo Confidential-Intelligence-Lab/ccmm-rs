@@ -391,6 +391,11 @@ results/eblas_fft_evidence/r31_5_frozen/
 These locations contain historical and optimized runs with different configurations. Their contents must be checked before selecting a publication table row; the paths themselves do not certify that all metrics are complete or directly comparable. Preserve frozen evidence and its original security markers without rewriting it retroactively.
 <!-- FHE_RS_V3_SECURITY_EXTENSION_END -->
 
+## Hierarchical 8K parameter-selection boundary
+
+The hierarchical 8192 x 8192 executor uses a degree-65536 RNS-CKKS research configuration and 28 initial RNS limbs. Parameter assessment should be performed with reference to the [Homomorphic Encryption Standard](https://homomorphicencryption.org/standard/) and its applicable security guidance. A citation to that standard does not independently qualify this particular profile.
+
+Any future security-bearing claim requires documented secret/error distributions, evaluation-key construction and exposure, auxiliary moduli, full modulus chain and an explicit estimator-based assessment. The current numerical FFT evidence establishes neither a 128-bit security level nor production security certification.
 ## What Is Not Claimed
 
 The current artifact does **not** claim:

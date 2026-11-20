@@ -101,6 +101,9 @@ New linear-algebra applications should call eBLAS rather than CPMM/CCMM
 implementation functions directly unless the experiment explicitly studies a
 backend.
 
+## Reusable packed FFT row preparation
+
+`PackedRowPreparationContext` retains prepared local packed-row stages for reuse across compatible macrotiles. Its binding checks the identity of the evaluation-key set, modulus chain, and CKKS embedding supplied by the evaluator. This prevents accidental cross-context reuse in the validated execution lifecycle; it is not a cryptographic key fingerprint. The `ckks_packed_row_cache_validation` executable verifies cached and uncached execution equivalence. Distinguish preparation cost from repeated evaluation cost when benchmarking.
 ## Current non-goals
 
 - bootstrapping is not implemented;

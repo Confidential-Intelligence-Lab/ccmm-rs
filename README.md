@@ -34,7 +34,7 @@ Install a compatible Rust toolchain and clone the repository. To reproduce the v
 ```bash
 git clone https://github.com/Confidential-Intelligence-Lab/ccmm-rs.git
 cd ccmm-rs
-git switch feat/r15-frequency-domain-filtering
+git switch integration/hierarchical-ckks-fft
 cargo build --locked --release
 cargo test --locked --lib
 ```
@@ -202,6 +202,18 @@ Numerical agreement with a cleartext FFT oracle is not a cryptographic security 
 
 Foundational research includes Gentry's fully homomorphic encryption work, Cheon–Kim–Kim–Song's CKKS construction, and subsequent full-RNS CKKS methods. [Microsoft SEAL](https://github.com/microsoft/SEAL), [OpenFHE](https://github.com/openfheorg/openfhe-development), and [HElib](https://github.com/homenc/HElib) are external ecosystem references. Their mention does not imply source-code reuse, API compatibility, or benchmark parity. For verified citations and unresolved attribution items, consult the bibliography rather than relying on inferred paper titles.
 
+## Hierarchical 8K encrypted FFT2
+
+The integrated 8192 x 8192 FFT2 path uses 64 macrotiles of 1024 x 1024 samples, with 32 packed CKKS ciphertexts per macrotile (2048 total). It implements 13 row stages followed by 13 column stages, with prepared local-row resources and context-bound reuse.
+
+The execution programs are `ckks_sar8k_full_fft` (FFT execution and verification), `ckks_sar8k_full_fft_export` (full-output export), and `ckks_packed_row_cache_validation` (cache equivalence).
+
+```bash
+cargo run --locked --release --bin ckks_sar8k_full_fft -- preflight
+cargo run --locked --release --bin ckks_sar8k_full_fft_export -- preflight
+```
+
+These preflights check structural and execution-plan requirements, not encrypted numerical correctness. On the consolidated source, encrypted stages 1–13 have been tested. Earlier complete 26-stage 8K executions succeeded on three input scenes, but the consolidated source has not been rerun through all 26 stages. See [FFT experiments](docs/FFT_EXPERIMENTS_V3.md), [Reproducibility](docs/REPRODUCIBILITY.md), and [Security and parameters](docs/SECURITY_AND_PARAMETERS.md).
 ## Development and security
 
 ```bash
