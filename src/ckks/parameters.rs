@@ -385,15 +385,16 @@ pub fn research_profile_32768_for_levels(
     )
 }
 
-/// Validated 55-bit NTT-prime pool for polynomial degree 65536.
+/// 55-bit NTT-prime pool for polynomial degree 65536.
 ///
 /// The first eighteen limbs form the frozen 990-bit research profile used
 /// by the validated 256x256 exact encrypted FFT2 experiment.  Longer
 /// prefixes support depth-aware FFT research configurations while keeping
 /// the ring degree fixed at 65536.
 ///
-/// The complete 26-limb pool has an aggregate 1430-bit RNS modulus budget.
-const RESEARCH_65536_MODULUS_POOL: [u64; 26] = [
+/// The first 26 limbs preserve the validated 1430-bit prefix.
+/// The final two limbs extend experimental depth support to 28 limbs.
+const RESEARCH_65536_MODULUS_POOL: [u64; 28] = [
     0x7fffffffba0001,
     0x7fffffffaa0001,
     0x7fffffff7e0001,
@@ -420,6 +421,8 @@ const RESEARCH_65536_MODULUS_POOL: [u64; 26] = [
     0x7ffffffcda0001,
     0x7ffffffccc0001,
     0x7ffffffcc20001,
+    0x7ffffffc800001,
+    0x7ffffffc080001,
 ];
 
 /// Large-N research profile for polynomial degree 65536.
@@ -448,7 +451,8 @@ pub fn research_profile_65536() -> CkksParameterProfile {
 /// after the final level so the computation does not terminate in the
 /// empirically unstable one-limb regime.
 ///
-/// The current validated pool supports at most 26 limbs.
+/// The original 26-limb prefix remains unchanged.
+/// Extended 28-limb configurations require independent validation.
 pub fn research_profile_65536_for_levels(
     required_levels: usize,
     terminal_guard_limbs: usize,
@@ -459,7 +463,7 @@ pub fn research_profile_65536_for_levels(
 
     assert!(
         limb_count <= RESEARCH_65536_MODULUS_POOL.len(),
-        "65536 research profile requires {limb_count} limbs but the validated pool provides only {}",
+        "65536 research profile requires {limb_count} limbs but the available pool provides only {}",
         RESEARCH_65536_MODULUS_POOL.len()
     );
 
@@ -476,6 +480,25 @@ pub fn research_profile_65536_for_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_65536_28_limb_profile() {
+        let profile = research_profile_65536_for_levels(26, 2);
+        assert_eq!(profile.degree(), 65_536);
+        assert_eq!(profile.total_modulus_bits(), 1540);
+
+        let basis = profile.modulus_basis();
+        assert_eq!(basis.moduli().len(), 28);
+        assert_eq!(basis.moduli()[26], Modulus::new(0x7ffffffc800001));
+        assert_eq!(basis.moduli()[27], Modulus::new(0x7ffffffc080001));
+
+        let chain = profile.modulus_chain();
+        assert_eq!(chain.top().len(), 28);
+        assert_eq!(chain.level(26).len(), 2);
+
+        let plan = profile.rns_ntt_plan();
+        assert_eq!(plan.moduli(), basis.moduli());
+    }
 
     #[test]
     fn correctness_profile_metadata_is_exact() {

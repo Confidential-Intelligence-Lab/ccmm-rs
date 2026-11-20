@@ -150,6 +150,70 @@ pub fn multiply_relinearize_rescale_rns_ckks_with_ntt(
     rescale_rns_ckks_to_next(&product, chain)
 }
 
+/// Multiplies two RNS CKKS ciphertexts using prepared NTT arithmetic.
+///
+/// The tensor product uses the prepared RNS NTT plan. Relinearization
+/// uses a precomputed multiplication key and prepared dynamic NTT
+/// accumulation. The CKKS state transition and rescale remain identical
+/// to the existing NTT-backed multiplication path.
+///
+/// Plan and multiplication-key preparation are performed by the caller.
+pub fn multiply_relinearize_rescale_rns_ckks_with_prepared_ntt(
+    lhs: &RnsCkksCiphertext,
+    rhs: &RnsCkksCiphertext,
+    prepared_key: &crate::grafting::PreparedRnsMultiplicationKey,
+    chain: &ModulusChain,
+    plan: &crate::ring::PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    lhs.assert_matches_chain(chain);
+    rhs.assert_matches_chain(chain);
+
+    assert_eq!(
+        lhs.level(),
+        rhs.level(),
+        "RNS CKKS multiplication requires matching levels"
+    );
+    assert_eq!(
+        lhs.basis(),
+        rhs.basis(),
+        "RNS CKKS multiplication requires matching bases"
+    );
+    assert_eq!(
+        prepared_key.layout().full_basis(),
+        lhs.basis(),
+        "prepared RNS multiplication key basis must match active CKKS level"
+    );
+    assert!(
+        chain.has_next_level(lhs.level()),
+        "RNS CKKS multiply-rescale requires a next chain level"
+    );
+    assert_eq!(
+        lhs.rlwe().degree(),
+        rhs.rlwe().degree(),
+        "RNS CKKS ciphertext degrees must match"
+    );
+    assert_eq!(
+        plan.degree(),
+        lhs.rlwe().degree(),
+        "prepared RNS NTT plan degree must match CKKS ciphertext degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        lhs.basis().moduli(),
+        "prepared RNS NTT plan basis must match active CKKS level"
+    );
+
+    let quadratic = crate::grafting::rns_tensor_with_prepared_ntt(lhs.rlwe(), rhs.rlwe(), plan);
+
+    let relinearized =
+        crate::grafting::rns_relinearize_with_prepared_dynamic_ntt(&quadratic, prepared_key, plan);
+
+    let product_state = lhs.state().after_multiply(rhs.state(), chain);
+    let product = RnsCkksCiphertext::new(relinearized, product_state, chain);
+
+    rescale_rns_ckks_to_next(&product, chain)
+}
+
 /// Evaluates a leveled product chain over RNS CKKS ciphertexts.
 ///
 /// `lhs` and `rhs` are multiplied at the initial level using
@@ -1122,6 +1186,31 @@ mod tests {
                 "NTT CKKS multiply/rescale diverged for seed {seed}"
             );
 
+            let prepared_plan = crate::ring::PreparedRnsNttPlan::new(&plan);
+            let prepared_key = crate::grafting::PreparedRnsMultiplicationKey::new(&key, &plan);
+
+            let prepared = multiply_relinearize_rescale_rns_ckks_with_prepared_ntt(
+                &lhs,
+                &rhs,
+                &prepared_key,
+                &chain,
+                &prepared_plan,
+            );
+
+            assert_eq!(
+                prepared, reference,
+                "prepared CKKS multiplication diverged from reference for seed {seed}"
+            );
+
+            assert_eq!(
+                prepared, optimized,
+                "prepared CKKS multiplication diverged from NTT for seed {seed}"
+            );
+
+            assert_eq!(prepared.level(), optimized.level());
+            assert_eq!(prepared.basis(), optimized.basis());
+            assert_eq!(prepared.scale(), optimized.scale());
+
             assert_eq!(optimized.level(), 1);
             assert_eq!(optimized.basis(), chain.level(1));
 
@@ -1133,6 +1222,7 @@ mod tests {
 
             assert_eq!(optimized.scale(), expected_scale);
         }
+        println!("N4_E4F_EXACT_EQUIVALENCE=PASS SEEDS=32");
     }
 
     #[test]

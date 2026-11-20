@@ -5,8 +5,9 @@ use ccmm_rs::ckks::{
     RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
 };
 use ccmm_rs::eblas::fft::{
-    execute_packed_1k_fft_columns_cp, execute_packed_1k_fft_rows_cp, fft2_pp,
-    packed_fft_dif_butterfly_cp_prepared, Fft2Shape, FftDirection,
+    execute_packed_1k_fft_columns_cp, execute_packed_1k_fft_rows_cp,
+    execute_packed_1k_fft_rows_cp_cached, fft2_pp, packed_fft_dif_butterfly_cp_prepared, Fft2Shape,
+    FftDirection, PackedRowPreparationContext,
 };
 use ccmm_rs::eblas::PreparedComplexSlotsCp;
 use ccmm_rs::grafting::{
@@ -1005,29 +1006,100 @@ fn main() {
     /*
      * Levels 2..11: one reusable 1K row phase per macrotile.
      */
+    let use_shared_rows = std::env::var("R23_SHARED_ROW_PREPARATION").as_deref() == Ok("1");
+    let mut shared_rows = PackedRowPreparationContext::new();
+    let r23_equivalence = std::env::var("R23_2_TWO_MACRO_EQUIVALENCE").as_deref() == Ok("1");
+
+    if r23_equivalence {
+        assert!(use_shared_rows, "R23.2 requires shared preparation");
+        assert!(
+            std::env::var("FHE_PACKED_1K_NTT_RESIDENT").as_deref() == Ok("1"),
+            "R23.2 requires NTT-resident execution"
+        );
+        assert!(
+            std::env::var("R22_4_FULL_ROW_EQUIVALENCE").as_deref() != Ok("1"),
+            "R23.2 and R22.4 equivalence modes are mutually exclusive"
+        );
+    }
     for (macro_index, macrotile) in macrotiles.iter_mut().enumerate().take(MACRO_COUNT) {
         let input = macrotile.take().expect("4K row-phase macrotile missing");
 
         let start = Instant::now();
 
-        let equivalence_input = if std::env::var("R22_4_FULL_ROW_EQUIVALENCE").as_deref() == Ok("1")
-            && macro_index == 0
-        {
+        let r22_equivalence =
+            std::env::var("R22_4_FULL_ROW_EQUIVALENCE").as_deref() == Ok("1") && macro_index == 0;
+
+        let equivalence_input = if r22_equivalence || (r23_equivalence && macro_index == 1) {
             Some(input.clone())
         } else {
             None
         };
 
-        let output = execute_packed_1k_fft_rows_cp(
-            input,
-            &evaluator,
-            &embedding,
-            &chain,
-            inter_ct_parallelism,
-            local_parallelism,
-        );
+        let output = if use_shared_rows {
+            execute_packed_1k_fft_rows_cp_cached(
+                input,
+                &evaluator,
+                &embedding,
+                &chain,
+                inter_ct_parallelism,
+                local_parallelism,
+                &mut shared_rows,
+            )
+        } else {
+            execute_packed_1k_fft_rows_cp(
+                input,
+                &evaluator,
+                &embedding,
+                &chain,
+                inter_ct_parallelism,
+                local_parallelism,
+            )
+        };
 
         if let Some(reference_input) = equivalence_input {
+            if r23_equivalence && macro_index == 1 {
+                let cached_ms = start.elapsed().as_millis();
+                let reference_start = Instant::now();
+
+                let reference = execute_packed_1k_fft_rows_cp(
+                    reference_input,
+                    &evaluator,
+                    &embedding,
+                    &chain,
+                    inter_ct_parallelism,
+                    local_parallelism,
+                );
+
+                let uncached_ms = reference_start.elapsed().as_millis();
+
+                assert_eq!(output.len(), CT_PER_MACRO);
+                assert_eq!(reference.len(), CT_PER_MACRO);
+
+                for (index, (cached, uncached)) in output.iter().zip(reference.iter()).enumerate() {
+                    assert_eq!(
+                        cached.rlwe(),
+                        uncached.rlwe(),
+                        "R23.2 RLWE mismatch ciphertext={index}"
+                    );
+                    assert_eq!(
+                        cached.state(),
+                        uncached.state(),
+                        "R23.2 CKKS state mismatch ciphertext={index}"
+                    );
+                }
+
+                println!("R23_2_CIPHERTEXTS_VERIFIED={CT_PER_MACRO}");
+                println!("R23_2_CACHED_MS={cached_ms}");
+                println!("R23_2_UNCACHED_MS={uncached_ms}");
+                println!(
+                    "R23_2_SPEEDUP={:.6}",
+                    uncached_ms as f64 / cached_ms.max(1) as f64
+                );
+                println!("R23_2_EXACT_RLWE_STATUS=PASS");
+                println!("R22_3_STATUS=PASS");
+                io::stdout().flush().unwrap();
+                return;
+            }
             let primary_resident =
                 std::env::var("FHE_PACKED_1K_NTT_RESIDENT").as_deref() == Ok("1");
 
@@ -1087,7 +1159,10 @@ fn main() {
         *macrotile = Some(output);
         io::stdout().flush().unwrap();
 
-        if macro_index == 0 && std::env::var("R22_BENCH_FIRST_MACRO_ROW").as_deref() == Ok("1") {
+        if macro_index == 0
+            && !r23_equivalence
+            && std::env::var("R22_BENCH_FIRST_MACRO_ROW").as_deref() == Ok("1")
+        {
             println!("R22_3_ROW_MS={}", start.elapsed().as_millis());
             println!(
                 "R22_3_RESIDENT={}",
@@ -1097,6 +1172,11 @@ fn main() {
             return;
         }
     }
+
+    // Row-stage preparation is no longer needed by column processing.
+    drop(shared_rows);
+    println!("R24_1_ROW_CACHE_RELEASED=1");
+    io::stdout().flush().unwrap();
 
     /*
      * Levels 12..13: two 4K macro-column stages.

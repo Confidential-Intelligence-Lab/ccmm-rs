@@ -762,6 +762,9 @@ pub fn execute_packed_fft1_dif_stage_cp(
         "packed DIF FFT1 stage rotation must be smaller than logical length"
     );
 
+    let profile = std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1");
+    let profile_start = std::time::Instant::now();
+
     let mut direct = vec![Complex64::new(0.0, 0.0); slot_count];
     let mut left = vec![Complex64::new(0.0, 0.0); slot_count];
     let mut right = vec![Complex64::new(0.0, 0.0); slot_count];
@@ -770,15 +773,45 @@ pub fn execute_packed_fft1_dif_stage_cp(
     left[..logical_length].copy_from_slice(diagonals.rotate_left());
     right[..logical_length].copy_from_slice(diagonals.rotate_right());
 
+    let diagonal_ms = profile_start.elapsed().as_secs_f64() * 1000.0;
+
+    let t = std::time::Instant::now();
     let rotated_left = evaluator.rotate_left(input, rotation);
+    let rotate_left_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let rotated_right = evaluator.rotate_right(input, rotation);
+    let rotate_right_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    let t = std::time::Instant::now();
     let direct_term = multiply_complex_slots_cp(input, &direct, embedding, chain, plan);
+    let multiply_direct_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let left_term = multiply_complex_slots_cp(&rotated_left, &left, embedding, chain, plan);
+    let multiply_left_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = std::time::Instant::now();
     let right_term = multiply_complex_slots_cp(&rotated_right, &right, embedding, chain, plan);
+    let multiply_right_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    let t = std::time::Instant::now();
     let partial = evaluator.add(&direct_term, &left_term);
-    evaluator.add(&partial, &right_term)
+    let result = evaluator.add(&partial, &right_term);
+    let addition_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    if profile {
+        println!(
+            "FHE_FFT1_STAGE_PROFILE=ROTATION={} DIAGONAL_MS={:.3} ROTATE_LEFT_MS={:.3} ROTATE_RIGHT_MS={:.3} MULTIPLY_DIRECT_MS={:.3} MULTIPLY_LEFT_MS={:.3} MULTIPLY_RIGHT_MS={:.3} ADD_MS={:.3}",
+            rotation,
+            diagonal_ms,
+            rotate_left_ms,
+            rotate_right_ms,
+            multiply_direct_ms,
+            multiply_left_ms,
+            multiply_right_ms,
+            addition_ms
+        );
+    }
+
+    result
 }
 
 /// Executes a complete packed radix-2 DIF FFT1 over encrypted CKKS slots.
@@ -822,8 +855,22 @@ pub fn execute_packed_fft1_dif_cp(
     let mut span = logical_length;
 
     while span >= 2 {
+        let profile = std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1");
+
+        let t = std::time::Instant::now();
         let diagonals = PackedFft1DifStageDiagonals::new(logical_length, span, direction);
+        let diagonal_build_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
+        let plan_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        if profile {
+            println!(
+                "FHE_FFT1_PLAN_PROFILE=SPAN={} DIAGONAL_BUILD_MS={:.3} PLAN_MS={:.3}",
+                span, diagonal_build_ms, plan_ms
+            );
+        }
 
         value = execute_packed_fft1_dif_stage_cp(
             &value, &diagonals, evaluator, embedding, chain, &plan,
@@ -839,7 +886,14 @@ pub fn execute_packed_fft1_dif_cp(
 
         normalization[..logical_length].fill(Complex64::new(factor, 0.0));
 
+        let t = std::time::Instant::now();
         value = multiply_complex_slots_cp(&value, &normalization, embedding, chain, &plan);
+        if std::env::var("FHE_FFT1_PROFILE").ok().as_deref() == Some("1") {
+            println!(
+                "FHE_FFT1_NORMALIZATION_PROFILE=MULTIPLY_MS={:.3}",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     value
@@ -1269,13 +1323,190 @@ pub fn packed_fft_dif_butterfly_cp_prepared(
 ///
 /// Public row twiddles and local-stage diagonals are prepared once per stage
 /// and reused across all ciphertext operations at that stage.
+/// Prepared operands shared only within one UHD row phase and evaluator/key context.
+/// Construct a new context when changing the evaluator, embedding, or modulus chain.
+#[derive(Default)]
+pub struct PackedRowPreparationContext<'a> {
+    local_stages: Vec<Option<PreparedLocalRowStage>>,
+    binding: Option<(
+        &'a crate::ckks::RnsCkksEvaluationKeys,
+        &'a ModulusChain,
+        &'a CkksCanonicalEmbedding,
+    )>,
+}
+
+struct PreparedLocalRowStage {
+    state: crate::ckks::CkksChainState,
+    span: usize,
+    stage_plan: RnsNttPlan,
+    prepared_plan: PreparedRnsNttPlan,
+    prepared_left: PreparedRnsGaloisKey,
+    prepared_right: PreparedRnsGaloisKey,
+    prepared_fft_stage: PreparedRepeatedPackedFft2DifStage,
+}
+
+impl<'a> PackedRowPreparationContext<'a> {
+    pub fn new() -> Self {
+        Self {
+            local_stages: (0..6).map(|_| None).collect(),
+            binding: None,
+        }
+    }
+
+    fn bind(
+        &mut self,
+        evaluator: &RnsCkksEvaluator<'a>,
+        embedding: &'a CkksCanonicalEmbedding,
+        chain: &'a ModulusChain,
+    ) {
+        assert!(
+            std::ptr::eq(evaluator.chain(), chain),
+            "row-cache evaluator and supplied modulus chain differ"
+        );
+
+        match self.binding {
+            Some((keys, bound_chain, bound_embedding)) => {
+                assert!(
+                    std::ptr::eq(keys, evaluator.keys())
+                        && std::ptr::eq(bound_chain, chain)
+                        && std::ptr::eq(bound_embedding, embedding),
+                    "row-cache cryptographic context mismatch"
+                );
+            }
+            None => {
+                assert!(
+                    self.local_stages.iter().all(Option::is_none),
+                    "unbound row cache contains prepared stages"
+                );
+                self.binding = Some((evaluator.keys(), chain, embedding));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_cache_binding_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "row-cache cryptographic context mismatch")]
+    fn rejects_different_evaluation_keys() {
+        let profile = crate::ckks::research_profile_65536_for_levels(24, 2);
+        let chain = profile.modulus_chain();
+        let embedding = CkksCanonicalEmbedding::new(profile.degree());
+
+        let keys_a = crate::ckks::RnsCkksEvaluationKeys::new();
+        let keys_b = crate::ckks::RnsCkksEvaluationKeys::new();
+
+        let evaluator_a = RnsCkksEvaluator::new(&chain, &keys_a);
+        let evaluator_b = RnsCkksEvaluator::new(&chain, &keys_b);
+
+        let mut cache = PackedRowPreparationContext::new();
+
+        cache.bind(&evaluator_a, &embedding, &chain);
+        cache.bind(&evaluator_b, &embedding, &chain);
+    }
+}
+
 pub fn execute_packed_1k_fft_rows_cp(
+    values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+) -> Vec<RnsCkksCiphertext> {
+    execute_packed_1k_fft_rows_cp_inner(
+        values,
+        evaluator,
+        embedding,
+        chain,
+        inter_ct_parallelism,
+        local_outer_parallelism,
+        None,
+    )
+}
+
+fn prepare_local_row_stage(
+    input: &RnsCkksCiphertext,
+    span: usize,
+    tile_shape: Fft2Shape,
+    tiles_per_ciphertext: usize,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+) -> PreparedLocalRowStage {
+    let diagonals = PackedFft2DifStageDiagonals::new(
+        tile_shape,
+        PackedFft2Axis::Rows,
+        span,
+        FftDirection::Forward,
+    );
+    let rotation = diagonals.rotation();
+    let degree = embedding.degree();
+    let left_exponent = rotation_exponent_left(degree, rotation);
+    let right_exponent = rotation_exponent_right(degree, rotation);
+    let stage_plan = RnsNttPlan::new(chain.level(input.level()).moduli().to_vec(), degree);
+    let state = input.state().clone();
+    let prepared_left = PreparedRnsGaloisKey::new(
+        evaluator.keys().galois_for(&state, left_exponent),
+        &stage_plan,
+    );
+    let prepared_right = PreparedRnsGaloisKey::new(
+        evaluator.keys().galois_for(&state, right_exponent),
+        &stage_plan,
+    );
+    let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+    let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+        input,
+        &diagonals,
+        tiles_per_ciphertext,
+        embedding,
+        chain,
+        &stage_plan,
+    );
+    PreparedLocalRowStage {
+        state,
+        span,
+        stage_plan,
+        prepared_plan,
+        prepared_left,
+        prepared_right,
+        prepared_fft_stage,
+    }
+}
+
+/// Reuses local-stage preparation across compatible macrotiles in one row phase.
+pub fn execute_packed_1k_fft_rows_cp_cached<'a>(
+    values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'a>,
+    embedding: &'a CkksCanonicalEmbedding,
+    chain: &'a ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+    context: &mut PackedRowPreparationContext<'a>,
+) -> Vec<RnsCkksCiphertext> {
+    context.bind(evaluator, embedding, chain);
+
+    execute_packed_1k_fft_rows_cp_inner(
+        values,
+        evaluator,
+        embedding,
+        chain,
+        inter_ct_parallelism,
+        local_outer_parallelism,
+        Some(context),
+    )
+}
+
+fn execute_packed_1k_fft_rows_cp_inner(
     mut values: Vec<RnsCkksCiphertext>,
     evaluator: &RnsCkksEvaluator<'_>,
     embedding: &CkksCanonicalEmbedding,
     chain: &ModulusChain,
     inter_ct_parallelism: usize,
     local_outer_parallelism: usize,
+    mut context: Option<&mut PackedRowPreparationContext>,
 ) -> Vec<RnsCkksCiphertext> {
     const TILE_DIM: usize = 64;
     const TILE_ELEMENTS: usize = TILE_DIM * TILE_DIM;
@@ -1291,6 +1522,10 @@ pub fn execute_packed_1k_fft_rows_cp(
     );
     assert!(inter_ct_parallelism > 0);
     assert!(local_outer_parallelism > 0);
+
+    let profile_rows = std::env::var("FHE_R23_PROFILE_ROWS").ok().as_deref() == Some("1");
+    let mut total_prepare_ms = 0.0_f64;
+    let mut total_execute_ms = 0.0_f64;
 
     let use_ntt_resident =
         std::env::var("FHE_PACKED_1K_NTT_RESIDENT").is_ok_and(|value| value == "1");
@@ -1327,6 +1562,8 @@ pub fn execute_packed_1k_fft_rows_cp(
     let mut span_tiles = TILES_PER_AXIS;
 
     while span_tiles >= 2 {
+        let stage_start = std::time::Instant::now();
+        let stage_span = span_tiles;
         let level = values[0].level();
         let half_tiles = span_tiles / 2;
         let global_span = span_tiles * TILE_DIM;
@@ -1384,6 +1621,9 @@ pub fn execute_packed_1k_fft_rows_cp(
             }
         }
 
+        let prepare_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        let execution_start = std::time::Instant::now();
+
         for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
             let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
 
@@ -1433,6 +1673,16 @@ pub fn execute_packed_1k_fft_rows_cp(
             .map(|value| value.expect("packed 1K global-row output missing"))
             .collect();
 
+        let execute_ms = execution_start.elapsed().as_secs_f64() * 1000.0;
+        if profile_rows {
+            total_prepare_ms += prepare_ms;
+            total_execute_ms += execute_ms;
+            println!(
+                "R23_ROW_STAGE kind=global level={} span={} prepare_ms={:.3} execute_ms={:.3}",
+                level, stage_span, prepare_ms, execute_ms
+            );
+        }
+
         span_tiles /= 2;
     }
 
@@ -1448,46 +1698,59 @@ pub fn execute_packed_1k_fft_rows_cp(
     let mut span = TILE_DIM;
 
     while span >= 2 {
+        let stage_start = std::time::Instant::now();
+        let stage_span = span;
         let level = values[0].level();
 
-        let diagonals = PackedFft2DifStageDiagonals::new(
-            tile_shape,
-            PackedFft2Axis::Rows,
-            span,
-            FftDirection::Forward,
-        );
-
-        let rotation = diagonals.rotation();
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
-
-        let state = values[0].state();
-
-        let prepared_left = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, left_exponent),
-            &stage_plan,
-        );
-
-        let prepared_right = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, right_exponent),
-            &stage_plan,
-        );
-
-        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
-
-        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-            &values[0],
-            &diagonals,
-            TILES_PER_CIPHERTEXT,
-            embedding,
-            chain,
-            &stage_plan,
-        );
+        let slot = (TILE_DIM / span).trailing_zeros() as usize;
+        let owned_stage;
+        let stage: &PreparedLocalRowStage = if let Some(shared) = context.as_deref_mut() {
+            if shared.local_stages.is_empty() {
+                shared.local_stages = (0..6).map(|_| None).collect();
+            }
+            let entry = &mut shared.local_stages[slot];
+            if entry.is_none() {
+                *entry = Some(prepare_local_row_stage(
+                    &values[0],
+                    span,
+                    tile_shape,
+                    TILES_PER_CIPHERTEXT,
+                    evaluator,
+                    embedding,
+                    chain,
+                ));
+                if profile_rows {
+                    println!("R23_CACHE kind=local span={} status=MISS", span);
+                }
+            } else if profile_rows {
+                println!("R23_CACHE kind=local span={} status=HIT", span);
+            }
+            let prepared = entry.as_ref().expect("local stage preparation missing");
+            assert_eq!(prepared.span, span, "cached local stage span mismatch");
+            assert_eq!(
+                &prepared.state,
+                values[0].state(),
+                "cached CKKS state mismatch"
+            );
+            prepared
+        } else {
+            owned_stage = prepare_local_row_stage(
+                &values[0],
+                span,
+                tile_shape,
+                TILES_PER_CIPHERTEXT,
+                evaluator,
+                embedding,
+                chain,
+            );
+            &owned_stage
+        };
 
         let stage_input = values;
         let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+        let prepare_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        let execution_start = std::time::Instant::now();
 
         for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
             let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
@@ -1504,12 +1767,12 @@ pub fn execute_packed_1k_fft_rows_cp(
                         };
                         execute_stage(
                             input,
-                            &prepared_fft_stage,
+                            &stage.prepared_fft_stage,
                             evaluator,
-                            (&prepared_left, &prepared_right),
+                            (&stage.prepared_left, &stage.prepared_right),
                             chain,
-                            &stage_plan,
-                            &prepared_plan,
+                            &stage.stage_plan,
+                            &stage.prepared_plan,
                         )
                     }));
                 }
@@ -1524,6 +1787,16 @@ pub fn execute_packed_1k_fft_rows_cp(
         }
 
         values = stage_output;
+        let execute_ms = execution_start.elapsed().as_secs_f64() * 1000.0;
+        if profile_rows {
+            total_prepare_ms += prepare_ms;
+            total_execute_ms += execute_ms;
+            println!(
+                "R23_ROW_STAGE kind=local level={} span={} prepare_ms={:.3} execute_ms={:.3}",
+                level, stage_span, prepare_ms, execute_ms
+            );
+        }
+
         span /= 2;
     }
 
@@ -1532,6 +1805,13 @@ pub fn execute_packed_1k_fft_rows_cp(
         start_level + 10,
         "packed 1K row phase must consume exactly ten CKKS levels"
     );
+
+    if profile_rows {
+        println!(
+            "R23_ROW_TOTAL prepare_ms={:.3} execute_ms={:.3}",
+            total_prepare_ms, total_execute_ms
+        );
+    }
 
     values
 }
@@ -3818,6 +4098,43 @@ pub fn execute_packed_fft2_dif_stage_cp(
     chain: &ModulusChain,
     plan: &RnsNttPlan,
 ) -> RnsCkksCiphertext {
+    execute_packed_fft2_dif_stage_cp_with_rotation(
+        input,
+        diagonals,
+        evaluator,
+        embedding,
+        chain,
+        plan,
+        &|ciphertext, steps, left| {
+            let exponent = if left {
+                crate::ckks::rotation_exponent_left(ciphertext.rlwe().degree(), steps)
+            } else {
+                crate::ckks::rotation_exponent_right(ciphertext.rlwe().degree(), steps)
+            };
+
+            let key = evaluator.keys().galois_for(ciphertext.state(), exponent);
+
+            if left {
+                crate::ckks::rotate_left_rns_ckks_with_ntt(ciphertext, steps, key, chain, plan)
+            } else {
+                crate::ckks::rotate_right_rns_ckks_with_ntt(ciphertext, steps, key, chain, plan)
+            }
+        },
+    )
+}
+
+pub fn execute_packed_fft2_dif_stage_cp_with_rotation<F>(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+    rotate: &F,
+) -> RnsCkksCiphertext
+where
+    F: Fn(&RnsCkksCiphertext, usize, bool) -> RnsCkksCiphertext + Sync,
+{
     input.assert_matches_chain(chain);
 
     let logical_length = diagonals.shape().elements();
@@ -3858,25 +4175,15 @@ pub fn execute_packed_fft2_dif_stage_cp(
     left[..logical_length].copy_from_slice(diagonals.rotate_left());
     right[..logical_length].copy_from_slice(diagonals.rotate_right());
 
-    let left_exponent = crate::ckks::rotation_exponent_left(input.rlwe().degree(), rotation);
-    let right_exponent = crate::ckks::rotation_exponent_right(input.rlwe().degree(), rotation);
-
-    let left_key = evaluator.keys().galois_for(input.state(), left_exponent);
-    let right_key = evaluator.keys().galois_for(input.state(), right_exponent);
-
     /*
      * The two Galois rotations are independent computations over the same
      * stage input. Execute them concurrently while preserving the exact
      * rotation semantics and level state.
      */
     let (rotated_left, rotated_right) = std::thread::scope(|scope| {
-        let left_handle = scope.spawn(|| {
-            crate::ckks::rotate_left_rns_ckks_with_ntt(input, rotation, left_key, chain, plan)
-        });
+        let left_handle = scope.spawn(|| rotate(input, rotation, true));
 
-        let right_handle = scope.spawn(|| {
-            crate::ckks::rotate_right_rns_ckks_with_ntt(input, rotation, right_key, chain, plan)
-        });
+        let right_handle = scope.spawn(|| rotate(input, rotation, false));
 
         (
             left_handle
@@ -3948,6 +4255,47 @@ pub fn execute_packed_fft2_dif_cp(
     embedding: &CkksCanonicalEmbedding,
     chain: &ModulusChain,
 ) -> RnsCkksCiphertext {
+    execute_packed_fft2_dif_cp_with_rotation(
+        shape,
+        direction,
+        input,
+        evaluator,
+        embedding,
+        chain,
+        &|ciphertext, steps, left| {
+            let exponent = if left {
+                crate::ckks::rotation_exponent_left(ciphertext.rlwe().degree(), steps)
+            } else {
+                crate::ckks::rotation_exponent_right(ciphertext.rlwe().degree(), steps)
+            };
+
+            let key = evaluator.keys().galois_for(ciphertext.state(), exponent);
+            let plan = RnsNttPlan::new(
+                ciphertext.basis().moduli().to_vec(),
+                ciphertext.rlwe().degree(),
+            );
+
+            if left {
+                crate::ckks::rotate_left_rns_ckks_with_ntt(ciphertext, steps, key, chain, &plan)
+            } else {
+                crate::ckks::rotate_right_rns_ckks_with_ntt(ciphertext, steps, key, chain, &plan)
+            }
+        },
+    )
+}
+
+pub fn execute_packed_fft2_dif_cp_with_rotation<F>(
+    shape: Fft2Shape,
+    direction: FftDirection,
+    input: &RnsCkksCiphertext,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    rotate: &F,
+) -> RnsCkksCiphertext
+where
+    F: Fn(&RnsCkksCiphertext, usize, bool) -> RnsCkksCiphertext + Sync,
+{
     input.assert_matches_chain(chain);
 
     assert!(
@@ -3969,8 +4317,8 @@ pub fn execute_packed_fft2_dif_cp(
 
         let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
 
-        value = execute_packed_fft2_dif_stage_cp(
-            &value, &diagonals, evaluator, embedding, chain, &plan,
+        value = execute_packed_fft2_dif_stage_cp_with_rotation(
+            &value, &diagonals, evaluator, embedding, chain, &plan, rotate,
         );
 
         span /= 2;
@@ -3983,8 +4331,8 @@ pub fn execute_packed_fft2_dif_cp(
 
         let plan = RnsNttPlan::new(value.basis().moduli().to_vec(), value.rlwe().degree());
 
-        value = execute_packed_fft2_dif_stage_cp(
-            &value, &diagonals, evaluator, embedding, chain, &plan,
+        value = execute_packed_fft2_dif_stage_cp_with_rotation(
+            &value, &diagonals, evaluator, embedding, chain, &plan, rotate,
         );
 
         span /= 2;

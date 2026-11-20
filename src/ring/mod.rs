@@ -46,6 +46,9 @@ mod basis_differential;
 pub mod auxiliary_modulus;
 pub use auxiliary_modulus::{auxiliary_mod_down_reference, auxiliary_mod_down_rns_candidate};
 
+pub mod prepared_garner;
+pub use prepared_garner::PreparedGarner;
+
 pub mod wide_crt;
 
 pub use wide_crt::{

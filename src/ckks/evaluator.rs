@@ -119,6 +119,55 @@ impl<'a> RnsCkksEvaluator<'a> {
         multiply_with_evaluation_keys(lhs, rhs, self.keys, self.chain)
     }
 
+    /// Multiplies, relinearizes, and rescales using prepared NTT arithmetic.
+    ///
+    /// The prepared context must contain resources for the active CKKS level.
+    pub fn multiply_prepared(
+        &self,
+        lhs: &RnsCkksCiphertext,
+        rhs: &RnsCkksCiphertext,
+        context: &super::PreparedRnsCkksMultiplicationContext,
+    ) -> RnsCkksCiphertext {
+        lhs.assert_matches_chain(self.chain);
+        rhs.assert_matches_chain(self.chain);
+
+        assert_eq!(
+            lhs.level(),
+            rhs.level(),
+            "prepared CKKS multiplication requires matching levels"
+        );
+        assert_eq!(
+            lhs.basis(),
+            rhs.basis(),
+            "prepared CKKS multiplication requires matching bases"
+        );
+
+        assert!(
+            context.matches_source(self.chain, self.keys),
+            "prepared CKKS context must use evaluator chain and keys"
+        );
+
+        let canonical_key = self.keys.multiplication_for(lhs.state());
+
+        let prepared = context
+            .level(lhs.level())
+            .expect("prepared multiplication resources missing for active CKKS level");
+
+        assert_eq!(
+            prepared.multiplication_key().layout(),
+            canonical_key.layout(),
+            "prepared multiplication key layout must match canonical key layout"
+        );
+
+        crate::ckks::multiply_relinearize_rescale_rns_ckks_with_prepared_ntt(
+            lhs,
+            rhs,
+            prepared.multiplication_key(),
+            self.chain,
+            prepared.plan(),
+        )
+    }
+
     /// Multiplies, relinearizes, and rescales using the NTT-backed
     /// RNS CKKS multiplication path while selecting the evaluation key
     /// from the operands' active chain level.
@@ -600,5 +649,151 @@ mod tests {
         let conjugated = evaluator.conjugate(&rotated);
 
         assert_eq!(conjugated.level(), 1);
+    }
+
+    #[test]
+    fn evaluator_prepared_multiply_matches_existing_paths() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let lhs = zero_ciphertext(&chain, 0, 256.0);
+        let rhs = zero_ciphertext(&chain, 0, 512.0);
+
+        let degree = lhs.rlwe().degree();
+        let plan = RnsNttPlan::new(chain.level(0).moduli().to_vec(), degree);
+
+        let mut context = crate::ckks::PreparedRnsCkksMultiplicationContext::new(&chain, &keys);
+
+        context.prepare_level(0, degree);
+
+        let canonical = evaluator.multiply(&lhs, &rhs);
+        let ntt = evaluator.multiply_with_ntt(&lhs, &rhs, &plan);
+        let prepared = evaluator.multiply_prepared(&lhs, &rhs, &context);
+
+        assert_eq!(canonical.rlwe(), ntt.rlwe());
+        assert_eq!(ntt.rlwe(), prepared.rlwe());
+
+        assert_eq!(canonical.state(), ntt.state());
+        assert_eq!(ntt.state(), prepared.state());
+
+        assert_eq!(prepared.level(), 1);
+        assert_eq!(prepared.basis(), chain.level(1));
+        assert_eq!(
+            prepared.scale(),
+            256.0 * 512.0 / chain.dropped_modulus(0).unwrap().value() as f64
+        );
+    }
+
+    #[test]
+    fn evaluator_prepared_nonzero_multilevel_exact_equivalence() {
+        use crate::grafting::encrypt_rns_raw_with_ntt_rng;
+        use crate::ring::RnsPolynomial;
+
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+        let degree = secret().len();
+
+        let mut context = crate::ckks::PreparedRnsCkksMultiplicationContext::new(&chain, &keys);
+
+        context.prepare_level(0, degree);
+        context.prepare_level(1, degree);
+
+        assert_eq!(context.level_count(), 2);
+
+        for level in 0..=1 {
+            let basis = chain.level(level);
+            let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
+
+            let lhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[1_u128, 2, 3, 4, 5, 6, 7, 8],
+            );
+
+            let rhs_message = RnsPolynomial::from_coefficients(
+                basis.moduli().to_vec(),
+                &[8_u128, 7, 6, 5, 4, 3, 2, 1],
+            );
+
+            for seed in 0_u64..16 {
+                let mut lhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xE120 ^ level as u64);
+                let mut rhs_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xE130 ^ level as u64);
+
+                let lhs_rlwe = encrypt_rns_raw_with_ntt_rng(
+                    &lhs_message,
+                    2,
+                    0,
+                    &secret(),
+                    &plan,
+                    &mut lhs_rng,
+                );
+
+                let rhs_rlwe = encrypt_rns_raw_with_ntt_rng(
+                    &rhs_message,
+                    2,
+                    0,
+                    &secret(),
+                    &plan,
+                    &mut rhs_rng,
+                );
+
+                let lhs = RnsCkksCiphertext::new(
+                    lhs_rlwe,
+                    CkksChainState::new(&chain, level, 256.0),
+                    &chain,
+                );
+
+                let rhs = RnsCkksCiphertext::new(
+                    rhs_rlwe,
+                    CkksChainState::new(&chain, level, 512.0),
+                    &chain,
+                );
+
+                let canonical = evaluator.multiply(&lhs, &rhs);
+                let ntt = evaluator.multiply_with_ntt(&lhs, &rhs, &plan);
+                let prepared = evaluator.multiply_prepared(&lhs, &rhs, &context);
+
+                assert_eq!(
+                    prepared, canonical,
+                    "prepared/canonical mismatch: level={level}, seed={seed}"
+                );
+
+                assert_eq!(
+                    prepared, ntt,
+                    "prepared/NTT mismatch: level={level}, seed={seed}"
+                );
+
+                assert_eq!(prepared.level(), level + 1);
+                assert_eq!(prepared.basis(), chain.level(level + 1));
+
+                let expected_scale =
+                    256.0 * 512.0 / chain.dropped_modulus(level).unwrap().value() as f64;
+
+                assert_eq!(prepared.scale(), expected_scale);
+            }
+        }
+
+        println!("N4_E12_4C7_EXACT_EQUIVALENCE=PASS LEVELS=2 SEEDS_PER_LEVEL=16");
+    }
+
+    #[test]
+    #[should_panic(expected = "prepared CKKS context must use evaluator chain and keys")]
+    fn evaluator_prepared_rejects_different_key_source() {
+        let chain = chain();
+        let keys = evaluation_keys(&chain);
+        let other_keys = keys.clone();
+
+        let evaluator = RnsCkksEvaluator::new(&chain, &keys);
+
+        let mut context =
+            crate::ckks::PreparedRnsCkksMultiplicationContext::new(&chain, &other_keys);
+
+        context.prepare_level(0, secret().len());
+
+        let lhs = zero_ciphertext(&chain, 0, 256.0);
+        let rhs = zero_ciphertext(&chain, 0, 512.0);
+
+        let _ = evaluator.multiply_prepared(&lhs, &rhs, &context);
     }
 }

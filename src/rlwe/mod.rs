@@ -10,6 +10,7 @@ pub mod plaintext;
 pub mod quadratic;
 pub mod scheme;
 pub mod secret_key;
+pub(crate) mod uniform;
 
 pub use ciphertext::RlweCiphertext;
 pub use error::{project_error, sample_error_coefficients, ErrorDistribution};

@@ -457,6 +457,22 @@ security/r2.9b/
 
 for the security and noise-model boundary.
 
+## Hierarchical 8K validation and provenance
+
+From the repository root, compile and run the bounded regression checks:
+
+```bash
+cargo check --locked --all-targets
+cargo test --locked --lib eblas::fft::
+cargo build --locked --release --bin ckks_sar8k_full_fft
+cargo build --locked --release --bin ckks_sar8k_full_fft_export
+cargo build --locked --release --bin ckks_packed_row_cache_validation
+cargo run --locked --release --bin ckks_sar8k_full_fft -- preflight
+```
+
+The optional command `ckks_sar8k_full_fft reference-preflight <checkpoint.tsv> <fft2_reference_8192.npy>` requires existing checkpoint and NumPy reference files; these inputs are not guaranteed in a fresh clone. Do not run a full encrypted FFT solely to validate installation.
+
+Record source commit, host and Rust version, input hashes, CKKS profile, worker counts, execution flags, exit status, numerical error, wall time, and peak RSS. The consolidated source passed encrypted row stages 1–13; the earlier complete 26-stage three-scene evidence belongs to a different source configuration and must be labeled accordingly. Preserve frozen evidence without overwriting it.
 ## 16. Frozen Evidence
 
 The principal frozen Roadmap-2 evidence is organized as:

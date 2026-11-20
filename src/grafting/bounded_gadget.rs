@@ -116,6 +116,55 @@ impl BoundedGadgetLayout {
             digits,
         }
     }
+
+    // R4_BITWISE_BALANCED_DECOMPOSITION
+    /// Experimental power-of-two balanced-digit decomposition.
+    ///
+    /// Preserves the reference centered-digit convention.
+    pub fn decompose_canonical_bitwise(&self, canonical: &[BigUint]) -> BoundedGadgetDecomposition {
+        let modulus = composite_modulus_big(&self.full_basis);
+        let degree = canonical.len();
+
+        assert!(degree > 0, "canonical decomposition requires coefficients");
+
+        let shift = self.base_log as usize;
+        let base = self.base as i128;
+        let half = base / 2;
+        let mask = BigInt::from(self.base - 1);
+
+        let mut digits = vec![vec![0_i128; degree]; self.digit_count];
+
+        for (coefficient_index, coefficient) in canonical.iter().enumerate() {
+            let mut value = centered_representative_big(coefficient, &modulus);
+
+            for digit_row in digits.iter_mut().take(self.digit_count) {
+                let residue = (&value & &mask)
+                    .to_i128()
+                    .expect("masked balanced digit must fit i128");
+
+                let digit = if residue >= half {
+                    residue - base
+                } else {
+                    residue
+                };
+
+                digit_row[coefficient_index] = digit;
+
+                value -= BigInt::from(digit);
+                value >>= shift;
+            }
+
+            assert!(
+                value.is_zero(),
+                "bitwise bounded gadget digit count is insufficient"
+            );
+        }
+
+        BoundedGadgetDecomposition {
+            layout: self.clone(),
+            digits,
+        }
+    }
 }
 
 // R36_4B_PREPARED_CANONICAL_SOURCE
@@ -215,6 +264,51 @@ impl BoundedGadgetDecomposition {
 
     pub fn digit(&self, index: usize) -> &[i128] {
         &self.digits[index]
+    }
+
+    // R39_9E_HOISTED_GADGET_AUTOMORPHISM
+    /// Apply a negacyclic automorphism to already decomposed balanced digits.
+    ///
+    /// Experimental: preserves the canonical balanced-digit convention.
+    pub fn automorphism_hoisted(&self, exponent: usize) -> Self {
+        let degree = self.digits[0].len();
+        assert!(degree >= 2 && degree.is_power_of_two());
+
+        let two_n = 2 * degree;
+        let exponent = exponent % two_n;
+        assert_eq!(exponent % 2, 1);
+
+        let base = self.layout.base as i128;
+        let half = base / 2;
+        let mut digits = vec![vec![0_i128; degree]; self.digits.len()];
+
+        for source_index in 0..degree {
+            let mapped = (source_index * exponent) % two_n;
+            let target = mapped % degree;
+            let negate = mapped >= degree;
+
+            if !negate {
+                for (digit_index, row) in self.digits.iter().enumerate() {
+                    digits[digit_index][target] = row[source_index];
+                }
+                continue;
+            }
+
+            let mut carry = 0_i128;
+            for (digit_index, row) in self.digits.iter().enumerate() {
+                let value = -row[source_index] + carry;
+                let normalized = (value + half).rem_euclid(base) - half;
+                digits[digit_index][target] = normalized;
+                carry = (value - normalized) / base;
+            }
+
+            assert_eq!(carry, 0, "hoisted digit negation exceeded gadget capacity");
+        }
+
+        Self {
+            layout: self.layout.clone(),
+            digits,
+        }
     }
 
     pub fn reconstruct_centered_coefficients_big(&self) -> Vec<BigInt> {
@@ -328,6 +422,69 @@ mod tests {
             Modulus::new(40_961),
             Modulus::new(65_537),
         ])
+    }
+
+    #[test]
+    fn r39_9e_hoisted_digits_match_canonical_automorphisms() {
+        let basis = basis();
+        let modulus = composite_modulus_big(&basis);
+        let half = &modulus >> 1_usize;
+
+        let coefficients = vec![
+            BigUint::from(0_u8),
+            BigUint::from(1_u8),
+            BigUint::from(128_u16),
+            BigUint::from(255_u16),
+            &half - BigUint::from(1_u8),
+            half.clone(),
+            &modulus - BigUint::from(128_u16),
+            &modulus - BigUint::from(1_u8),
+        ];
+
+        let residues =
+            crate::ring::rns_from_big_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        let prepared = PreparedCanonicalGaloisSource::new(&residues);
+
+        for base_log in [4_u32, 8, 16, 32] {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+            let original = layout.decompose_canonical(&coefficients);
+
+            for exponent in (1..16).step_by(2) {
+                let expected = prepared.decompose_automorphism(&layout, exponent);
+                let actual = original.automorphism_hoisted(exponent);
+
+                assert_eq!(
+                    actual, expected,
+                    "hoisted mismatch: base_log={base_log}, exponent={exponent}"
+                );
+            }
+        }
+
+        println!("R39_9E_EXACT_DIGIT_EQUIVALENCE=PASS");
+    }
+
+    #[test]
+    fn r39_9e_hoisted_negation_handles_balanced_ties() {
+        let basis = basis();
+        let layout = BoundedGadgetLayout::new(basis.clone(), 4);
+
+        let coefficients = vec![0_u128, 1, 7, 8, 9, 15, 16, 128];
+
+        let polynomial = RnsPolynomial::from_coefficients(basis.moduli().to_vec(), &coefficients);
+
+        let prepared = PreparedCanonicalGaloisSource::new(&polynomial);
+        let original = layout.decompose(&polynomial);
+
+        for exponent in (1..16).step_by(2) {
+            assert_eq!(
+                original.automorphism_hoisted(exponent),
+                prepared.decompose_automorphism(&layout, exponent),
+                "balanced tie mismatch at exponent {exponent}"
+            );
+        }
+
+        println!("R39_9E_BALANCED_TIE_STATUS=PASS");
     }
 
     #[test]
@@ -824,5 +981,174 @@ mod r36_5c2_benchmark {
         }
 
         println!("R36_5C2_EXACT_DECOMPOSITION_STATUS=PASS");
+    }
+}
+
+// R39_9G_HOISTED_DECOMPOSITION_BENCHMARK
+#[cfg(test)]
+mod r39_9g_benchmark {
+    use super::*;
+    use crate::ckks::research_profile_65536_for_levels;
+    use crate::ring::{ModulusChain, Polynomial};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "production-scale performance characterization"]
+    fn r39_9g_hoisted_decomposition_benchmark() {
+        let degree = 65_536usize;
+        let profile = research_profile_65536_for_levels(13, 3);
+        let chain = ModulusChain::from_top_basis(profile.modulus_chain().top().clone());
+
+        let q = chain.level(3).clone();
+        assert_eq!(q.moduli().len(), 13);
+
+        let layout = BoundedGadgetLayout::new(q.clone(), 32);
+
+        let polynomial = RnsPolynomial::from_residues(
+            q.moduli()
+                .iter()
+                .map(|&modulus| {
+                    Polynomial::new(
+                        modulus,
+                        (0..degree)
+                            .map(|i| (i as u64 * 37 + 11) % modulus.value())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+
+        let exponents: Vec<usize> = (0..32).map(|i| 2 * i + 3).collect();
+
+        let started = Instant::now();
+        let canonical_source = PreparedCanonicalGaloisSource::new(&polynomial);
+        let canonical_preparation = started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        let original_decomposition = layout.decompose(&polynomial);
+        let hoisted_preparation = started.elapsed().as_secs_f64();
+
+        let mut canonical_total = 0.0_f64;
+        let mut hoisted_total = 0.0_f64;
+
+        for (index, &exponent) in exponents.iter().enumerate() {
+            let started = Instant::now();
+            let canonical = canonical_source.decompose_automorphism(&layout, exponent);
+            canonical_total += started.elapsed().as_secs_f64();
+
+            let started = Instant::now();
+            let hoisted = original_decomposition.automorphism_hoisted(exponent);
+            hoisted_total += started.elapsed().as_secs_f64();
+
+            assert_eq!(
+                canonical, hoisted,
+                "R39.9g exact digit mismatch at exponent {exponent}"
+            );
+
+            let rotations = index + 1;
+
+            if [1, 2, 4, 8, 16, 32].contains(&rotations) {
+                let canonical_amortized = canonical_preparation + canonical_total;
+
+                let hoisted_amortized = hoisted_preparation + hoisted_total;
+
+                println!(
+                    "R39_9G_RESULT degree={} q_limbs={} base_log=32 \
+                     rotations={} canonical_preparation_seconds={:.6} \
+                     hoisted_preparation_seconds={:.6} \
+                     canonical_rotation_seconds={:.6} \
+                     hoisted_rotation_seconds={:.6} \
+                     canonical_amortized_seconds={:.6} \
+                     hoisted_amortized_seconds={:.6} \
+                     amortized_speedup={:.6}",
+                    degree,
+                    q.moduli().len(),
+                    rotations,
+                    canonical_preparation,
+                    hoisted_preparation,
+                    canonical_total,
+                    hoisted_total,
+                    canonical_amortized,
+                    hoisted_amortized,
+                    canonical_amortized / hoisted_amortized,
+                );
+            }
+        }
+
+        println!("R39_9G_EXACT_DIGIT_EQUIVALENCE=PASS");
+    }
+}
+
+// N4_ROT_12C_DIFFERENTIAL_TEST
+#[cfg(test)]
+mod n4_rot_12c_tests {
+    use super::*;
+    use num_bigint::BigUint;
+    use num_traits::{One, Zero};
+
+    #[test]
+    fn bitwise_matches_reference_across_bases_and_boundaries() {
+        let basis = ModulusBasis::new(vec![
+            crate::ring::Modulus::new(97),
+            crate::ring::Modulus::new(193),
+            crate::ring::Modulus::new(257),
+        ]);
+
+        let modulus = composite_modulus_big(&basis);
+        let half_modulus = &modulus >> 1usize;
+
+        for base_log in [4_u32, 8, 16, 32, 63] {
+            let layout = BoundedGadgetLayout::new(basis.clone(), base_log);
+            let base = BigUint::one() << base_log;
+            let half_base = &base >> 1usize;
+
+            let mut values = vec![
+                BigUint::zero(),
+                BigUint::one(),
+                &modulus - BigUint::one(),
+                half_modulus.clone(),
+                &half_modulus + BigUint::one(),
+            ];
+
+            for boundary in [
+                half_base.clone(),
+                &half_base + BigUint::one(),
+                &base - BigUint::one(),
+                base.clone(),
+                &base + BigUint::one(),
+            ] {
+                if boundary < modulus {
+                    values.push(boundary.clone());
+
+                    if !boundary.is_zero() {
+                        values.push(&modulus - &boundary);
+                    }
+                }
+            }
+
+            // Deterministic coverage across the canonical interval.
+            for index in 0..512_u64 {
+                let candidate = (BigUint::from(index) * BigUint::from(7919_u64)) % &modulus;
+                values.push(candidate);
+            }
+
+            let reference = layout.decompose_canonical(&values);
+            let candidate = layout.decompose_canonical_bitwise(&values);
+
+            assert_eq!(
+                reference, candidate,
+                "bitwise decomposition mismatch for base_log={base_log}"
+            );
+
+            println!(
+                "N4_ROT_12C_CASE BASE_LOG={} COEFFICIENTS={} \
+                 DIGITS={} EXACT_EQUALITY=PASS",
+                base_log,
+                values.len(),
+                layout.digit_count()
+            );
+        }
+
+        println!("N4_ROT_12C_STATUS=PASS");
     }
 }
