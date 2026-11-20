@@ -59,7 +59,7 @@ pub fn write_complex128_square(path: &Path, n: usize, values: &[Complex64]) {
     let dict = format!("{{'descr': '<c16', 'fortran_order': False, 'shape': ({n}, {n}), }}");
     let mut header = dict.into_bytes();
     let pad = (16 - ((10 + header.len() + 1) % 16)) % 16;
-    header.extend(std::iter::repeat(b' ').take(pad));
+    header.extend(std::iter::repeat_n(b' ', pad));
     header.push(b'\n');
     assert!(header.len() <= u16::MAX as usize);
     let mut out = Vec::with_capacity(10 + header.len() + values.len() * 16);

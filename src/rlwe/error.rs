@@ -63,7 +63,6 @@ where
 ///
 /// The tail is truncated only after its omitted probability mass is
 /// negligible relative to 64-bit sampling precision.
-
 struct DiscreteGaussianTable {
     weights: Vec<(i64, f64)>,
     total: f64,

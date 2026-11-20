@@ -517,7 +517,7 @@ fn cyclic_ntt_prepared_mul(values: &mut [u64], modulus: Modulus, stage_twiddles:
 
 #[inline(always)]
 fn specialized_add(a: u64, b: u64, q: u64) -> u64 {
-    debug_assert!(q >= 2 && q < (1_u64 << 63));
+    debug_assert!((2..(1_u64 << 63)).contains(&q));
     debug_assert!(a < q && b < q);
 
     let sum = a + b;

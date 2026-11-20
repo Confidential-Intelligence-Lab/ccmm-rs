@@ -386,7 +386,6 @@ where
 ///
 /// The sampling order and ciphertext representation match the canonical
 /// coefficient-domain RNS RLWE encryption implementation.
-
 pub fn encrypt_rns_raw_with_distribution_prepared_ntt_rng<R>(
     message: &RnsPolynomial,
     plaintext_modulus: u64,
@@ -425,6 +424,7 @@ pub struct PreparedCoefficientEncryptionProfile {
     pub total_ns: u128,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_rns_raw_with_distribution_prepared_ntt_profiled_rng<R>(
     message: &RnsPolynomial,
     plaintext_modulus: u64,

@@ -1,3 +1,13 @@
+// These execution drivers preserve index-based hierarchical FFT
+// scheduling and explicit evaluator lifecycle boundaries.
+// Structural lint cleanup is deferred to a separately validated refactor.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::drop_non_drop
+)]
+
 //! Isolated 8K SAR 26-stage FFT2 integration (research correctness experiment).
 //! DATE 2027 SAR 8K: retained-state two-row and stage-14 validation.
 //!

@@ -97,7 +97,7 @@ pub struct ShoupMultiplier {
 impl ShoupMultiplier {
     pub fn new(modulus: Modulus, operand: u64) -> Self {
         let q = modulus.value();
-        assert!(q >= 2 && q < (1_u64 << 63));
+        assert!((2..(1_u64 << 63)).contains(&q));
         assert!(operand < q);
 
         let quotient = ((u128::from(operand) << 64) / u128::from(q)) as u64;
@@ -107,7 +107,7 @@ impl ShoupMultiplier {
     #[inline]
     pub fn mul(self, value: u64, modulus: Modulus) -> u64 {
         let q = modulus.value();
-        debug_assert!(q >= 2 && q < (1_u64 << 63));
+        debug_assert!((2..(1_u64 << 63)).contains(&q));
         debug_assert!(value < q);
 
         let estimated = ((u128::from(value) * u128::from(self.quotient)) >> 64) as u64;
