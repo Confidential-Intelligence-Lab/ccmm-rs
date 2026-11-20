@@ -2732,7 +2732,6 @@ fn main() {
         println!("FFT_R1_NUMPY_OUTPUT_STATUS=PASS");
     }
 
-
     let timing_decrypt_decode_ms = phase_done(
         decrypt_phase,
         total_phases,

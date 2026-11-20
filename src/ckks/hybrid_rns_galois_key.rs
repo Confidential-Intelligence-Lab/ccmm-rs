@@ -993,6 +993,160 @@ mod r35_9e_exact_key_equivalence {
         println!("R36_4C_EXACT_RLWE_EQUIVALENCE_STATUS=PASS");
     }
 
+    #[test]
+    fn r36_4c_gaussian_prepared_rotation_equivalence() {
+        use crate::ring::{Modulus, ModulusBasis, PreparedRnsNttPlan};
+
+        const N: usize = 16;
+
+        let secret: [i8; N] = [1, 0, -1, 1, 0, -1, 1, 0, -1, 0, 1, 0, 1, -1, 0, 1];
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        for q_count in [2_usize, 3] {
+            let q = ModulusBasis::new(
+                [12_289_u64, 40_961, 65_537]
+                    .into_iter()
+                    .take(q_count)
+                    .map(Modulus::new)
+                    .collect(),
+            );
+
+            let p = ModulusBasis::new(vec![Modulus::new(114_689), Modulus::new(786_433)]);
+
+            let mut qp_moduli = q.moduli().to_vec();
+            qp_moduli.extend_from_slice(p.moduli());
+
+            let qp_plan = RnsNttPlan::new(qp_moduli, N);
+            let prepared_qp = PreparedRnsNttPlan::new(&qp_plan);
+
+            let message = RnsPolynomial::from_residues(
+                q.moduli()
+                    .iter()
+                    .map(|&modulus| {
+                        Polynomial::new(
+                            modulus,
+                            (0..N)
+                                .map(|i| (i as u64 * 37 + 11) % modulus.value())
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            );
+
+            let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
+
+            let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x364c_1000 + q_count as u64);
+
+            let encrypted_ntt = encrypt_rns_raw_prepared_with_distribution_ntt_rng(
+                &message,
+                2,
+                distribution,
+                &secret,
+                &q_plan,
+                &mut encryption_rng,
+            );
+
+            let ciphertext = RnsRlweCiphertext::from_limbs(
+                encrypted_ntt
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (b_ntt, a_ntt))| {
+                        RlweCiphertext::new(
+                            b_ntt.to_polynomial(q_plan.plan(index)),
+                            a_ntt.to_polynomial(q_plan.plan(index)),
+                        )
+                    })
+                    .collect(),
+            );
+
+            let original_a = RnsPolynomial::from_residues(
+                ciphertext
+                    .limbs()
+                    .iter()
+                    .map(|limb| limb.a().clone())
+                    .collect(),
+            );
+
+            let canonical_source = PreparedCanonicalGaloisSource::new(&original_a);
+
+            for exponent in [3_usize, 5, 7, 11, 15] {
+                let mut key_rng = ChaCha20Rng::seed_from_u64(
+                    0x364c_2000 + q_count as u64 * 100 + exponent as u64,
+                );
+
+                let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedGadgetLayout::new(q.clone(), 8),
+                    p.clone(),
+                    &secret,
+                    exponent,
+                    distribution,
+                    2,
+                    &qp_plan,
+                    &mut key_rng,
+                );
+
+                let legacy = apply_hybrid_rns_galois_automorphism_prepared_qp(
+                    &ciphertext,
+                    &key,
+                    &qp_plan,
+                    &prepared_qp,
+                );
+
+                let optimized = apply_hybrid_rns_galois_automorphism_prepared_canonical_qp(
+                    &ciphertext,
+                    &key,
+                    &qp_plan,
+                    &prepared_qp,
+                    &canonical_source,
+                );
+
+                assert_eq!(
+                    legacy, optimized,
+                    "R36.4C RLWE mismatch: q_count={q_count}, exponent={exponent}"
+                );
+
+                // Independent decryption oracle: applying the automorphism
+                // also transforms the secret under which the ciphertext decrypts.
+                let transformed = crate::ckks::apply_rns_automorphism(&ciphertext, exponent);
+                let transformed_secret = super::transformed_ternary_secret(&secret, exponent);
+
+                let expected = crate::grafting::decrypt_rns_raw(&transformed, &transformed_secret);
+                let actual = crate::grafting::decrypt_rns_raw(&optimized, &secret);
+                let observed_error = actual.sub(&expected);
+
+                let max_limb_error = (0..q.len())
+                    .flat_map(|limb_index| {
+                        let modulus = q.modulus(limb_index).value();
+                        observed_error
+                            .residue(limb_index)
+                            .coefficients()
+                            .iter()
+                            .map(move |&value| value.min(modulus - value))
+                    })
+                    .max()
+                    .unwrap_or(0);
+
+                assert!(
+                    max_limb_error <= 2,
+                    "Gaussian hybrid-QP residue error exceeded regression bound:                      q_count={q_count}, exponent={exponent}, error={max_limb_error}"
+                );
+
+                println!(
+                    "R36_4C_GAUSSIAN_DECRYPT q_count={} exponent={} max_limb_error={}",
+                    q_count, exponent, max_limb_error
+                );
+
+                println!(
+                    "R36_4C_CASE=PASS q_count={} exponent={} degree={}",
+                    q_count, exponent, N,
+                );
+            }
+        }
+
+        println!("R36_4C_GAUSSIAN_RLWE_EQUIVALENCE_STATUS=PASS");
+    }
+
     // R36_5D2_PRODUCTION_ROTATION_AB_BENCHMARK
     #[test]
     #[ignore = "opt-in UHD-scale single-key rotation benchmark"]

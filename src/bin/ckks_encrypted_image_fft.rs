@@ -2,17 +2,21 @@
 mod fft2_r1_npy;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    research_profile_16384, research_profile_32768, research_profile_65536, rotation_exponent_left,
-    rotation_exponent_right, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
-    RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_16384, research_profile_32768, research_profile_65536,
+    research_profile_65536_for_levels, rotate_left_hybrid_rns_ckks_with_prepared_ntt,
+    rotate_right_hybrid_rns_ckks_with_prepared_ntt, rotation_exponent_left,
+    rotation_exponent_right, CkksCanonicalEmbedding, CkksChainState, PreparedHybridRnsGaloisKey,
+    RnsCkksCiphertext, RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys,
 };
-use ccmm_rs::eblas::fft::{execute_packed_fft2_dif_cp, fft2_pp, Fft2Shape, FftDirection};
+use ccmm_rs::eblas::fft::{
+    execute_packed_fft2_dif_cp_with_rotation, fft2_pp, Fft2Shape, FftDirection,
+};
 use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
-    RnsKeygenConfig,
+    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
 };
 use ccmm_rs::ring::{
-    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, RnsNttPlan,
+    centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, Modulus,
+    ModulusBasis, RnsNttPlan,
 };
 use ccmm_rs::rlwe::ErrorDistribution;
 use image::{GrayImage, ImageBuffer, Luma};
@@ -20,6 +24,7 @@ use num_complex::Complex64;
 use num_traits::ToPrimitive;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -41,10 +46,6 @@ fn phase_done(index: usize, total: usize, name: &str, start: Instant) -> u128 {
     let elapsed_ms = start.elapsed().as_millis();
     println!("[{index}/{total}] {name} ... DONE elapsed_ms={elapsed_ms}");
     elapsed_ms
-}
-
-fn block_sizes(limb_count: usize) -> Vec<usize> {
-    vec![1; limb_count]
 }
 
 fn bit_reverse(index: usize, length: usize) -> usize {
@@ -340,7 +341,8 @@ fn main() {
     println!("FFT_TOTAL_MODULUS_BITS={}", profile.total_modulus_bits());
     println!("FFT_INITIAL_SCALE={scale:.12e}");
     println!("FFT_ENCRYPTION_SIGMA={SIGMA:.6}");
-    println!("FFT_GALOIS_KEY_NOISE_BOUND=0");
+    println!("FFT_GALOIS_KEY_ERROR_DISTRIBUTION=DiscreteGaussian");
+    println!("FFT_GALOIS_KEY_SIGMA={SIGMA:.6}");
     println!("FFT_PLAINTEXT_MODULUS=2");
     println!("FFT_GADGET_BLOCK_POLICY=singleton");
     println!("FFT_DIRECTION=forward");
@@ -359,9 +361,13 @@ fn main() {
         .flush()
         .expect("FFT parameterization output must flush");
 
-    let output_dir = env::var_os("FFT_OUTPUT_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!(
-        "results/image_filter/encrypted_frequency_filter/image_fft_{dimension}x{dimension}"
-    )));
+    let output_dir = env::var_os("FFT_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "results/image_filter/encrypted_frequency_filter/image_fft_{dimension}x{dimension}"
+            ))
+        });
 
     fs::create_dir_all(&output_dir).expect("failed to create encrypted image FFT result directory");
 
@@ -440,108 +446,93 @@ fn main() {
 
     assert_eq!(level_rotations.len(), required_levels);
 
-    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
-    let mut timing_galois_ms = vec![0_u128; required_levels];
+    // The auxiliary primes are disjoint from the frozen 18-prime Q profile.
+    let extended = research_profile_65536_for_levels(18, 8);
+    let p_values = &extended.modulus_values()[18..26];
+    let p_count = env::var("FFT_HYBRID_P_LIMBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2);
+    assert!((1..=8).contains(&p_count));
+    let auxiliary_basis = ModulusBasis::new(
+        p_values[..p_count]
+            .iter()
+            .copied()
+            .map(Modulus::new)
+            .collect(),
+    );
+    for p in auxiliary_basis.moduli() {
+        assert_eq!(p.value() % (2 * degree as u64), 1);
+        assert!(!top_basis.moduli().contains(p));
+    }
+    let base_log = env::var("FFT_HYBRID_BASE_LOG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(55);
+    assert!((1..=60).contains(&base_log));
+    // Each digit stores two NTT polynomials for every QP limb (u64 coefficients).
+    let mut predicted_bytes = 0_u128;
+    for &(level, _) in &level_rotations {
+        let q_limbs = chain.level(level).len();
+        let q_bits: u32 = chain
+            .level(level)
+            .moduli()
+            .iter()
+            .map(|m| 64 - m.value().leading_zeros())
+            .sum();
+        let digits = (q_bits as u128).div_ceil(base_log as u128);
+        predicted_bytes += 2 * digits * (q_limbs + p_count) as u128 * degree as u128 * 2 * 8;
+    }
+    let predicted_gib = predicted_bytes as f64 / (1024.0_f64.powi(3));
+    println!("FFT_HYBRID_P_LIMBS={p_count} FFT_HYBRID_BASE_LOG={base_log}");
+    println!("FFT_HYBRID_KEY_PAYLOAD_ESTIMATE_GIB={predicted_gib:.3}");
+    let budget_gib = env::var("FFT_HYBRID_MAX_KEY_GIB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(8.0);
+    assert!(predicted_gib <= budget_gib,
+        "estimated key payload {predicted_gib:.2} GiB exceeds budget {budget_gib:.2} GiB; increase FFT_HYBRID_MAX_KEY_GIB only after checking available RAM");
 
+    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
+    let mut hybrid_keys: BTreeMap<(usize, usize), PreparedHybridRnsGaloisKey> = BTreeMap::new();
+    let mut hybrid_plans: BTreeMap<usize, RnsNttPlan> = BTreeMap::new();
+    let mut timing_galois_ms = vec![0_u128; required_levels];
     for (phase_offset, &(level, rotation)) in level_rotations.iter().enumerate() {
         let phase_index = phase_offset + 2;
-        let phase_name = format!("level-{level} Galois keygen");
+        let phase_name = format!("level-{level} hybrid QP Galois keygen");
         let keygen_start = phase_start(phase_index, total_phases, &phase_name);
-
         let level_basis = chain.level(level).clone();
-        let level_layout =
-            RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
-        let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
-
-        println!(
-            "FFT_GALOIS_LEVEL level={level} rotation={rotation} limbs={} degree={degree}",
-            level_layout.full_basis().len()
-        );
-        io::stdout()
-            .flush()
-            .expect("Galois-level parameterization output must flush");
-
-        let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
-
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        println!(
-            "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... START"
-        );
-        println!(
-            "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... START"
-        );
-        io::stdout()
-            .flush()
-            .expect("Galois-key progress output must flush");
-
-        let ((left_key, left_ms), (right_key, right_ms)) = std::thread::scope(|scope| {
-            let left_handle = scope.spawn(|| {
-                let start = Instant::now();
-                let mut rng =
-                    ChaCha20Rng::seed_from_u64(0x4652_4551_4649_4d00 ^ ((level as u64) << 8));
-
-                let key = RnsGaloisKey::generate_with_ntt_rng(
-                    RnsKeygenConfig {
-                        degree,
-                        plaintext_modulus: 2,
-                        noise_bound: 0,
-                        layout: level_layout.clone(),
-                        plan: &level_plan,
-                    },
-                    &secret,
-                    left_exponent,
-                    &mut rng,
-                );
-
-                (key, start.elapsed().as_millis())
-            });
-
-            let right_handle = scope.spawn(|| {
-                let start = Instant::now();
-                let mut rng = ChaCha20Rng::seed_from_u64(
-                    0x4652_4551_4649_4d00 ^ ((level as u64) << 8) ^ 1_u64,
-                );
-
-                let key = RnsGaloisKey::generate_with_ntt_rng(
-                    RnsKeygenConfig {
-                        degree,
-                        plaintext_modulus: 2,
-                        noise_bound: 0,
-                        layout: level_layout.clone(),
-                        plan: &level_plan,
-                    },
-                    &secret,
-                    right_exponent,
-                    &mut rng,
-                );
-
-                (key, start.elapsed().as_millis())
-            });
-
-            (
-                left_handle
-                    .join()
-                    .expect("left Galois-key generation worker panicked"),
-                right_handle
-                    .join()
-                    .expect("right Galois-key generation worker panicked"),
-            )
-        });
-
-        println!(
-            "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... DONE elapsed_ms={left_ms}"
-        );
-        println!(
-            "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... DONE elapsed_ms={right_ms}"
-        );
-
-        level_keys.insert_galois_key(left_key);
-        level_keys.insert_galois_key(right_key);
-
-        evaluation_keys.insert_level(level_keys);
-
+        let layout = BoundedGadgetLayout::new(level_basis.clone(), base_log);
+        let mut moduli = level_basis.moduli().to_vec();
+        moduli.extend_from_slice(auxiliary_basis.moduli());
+        let qp_plan = RnsNttPlan::new(moduli, degree);
+        for (direction, exponent) in [
+            (0_u64, rotation_exponent_left(degree, rotation)),
+            (1_u64, rotation_exponent_right(degree, rotation)),
+        ] {
+            let mut rng = ChaCha20Rng::seed_from_u64(
+                0x4652_4551_4649_4d00
+                    ^ ((level as u64) << 32)
+                    ^ (rotation as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ direction,
+            );
+            let start = Instant::now();
+            let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                layout.clone(),
+                auxiliary_basis.clone(),
+                &secret,
+                exponent,
+                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                2,
+                &qp_plan,
+                &mut rng,
+            );
+            println!("FFT_HYBRID_KEY level={level} rotation={rotation} direction={direction} exponent={exponent} digits={} elapsed_ms={}",
+                key.digit_count(), start.elapsed().as_millis());
+            assert!(hybrid_keys.insert((level, exponent), key).is_none());
+        }
+        hybrid_plans.insert(level, qp_plan);
+        evaluation_keys.insert_level(RnsCkksLevelKeys::new(level, level_basis));
         timing_galois_ms[phase_offset] =
             phase_done(phase_index, total_phases, &phase_name, keygen_start);
     }
@@ -554,13 +545,31 @@ fn main() {
     let fft_phase = required_levels + 2;
     let forward_fft2_start = phase_start(fft_phase, total_phases, "forward FFT2");
 
-    let encrypted_spectrum = execute_packed_fft2_dif_cp(
+    let encrypted_spectrum = execute_packed_fft2_dif_cp_with_rotation(
         shape,
         FftDirection::Forward,
         &ciphertext,
         &evaluator,
         &embedding,
         &chain,
+        &|ct, steps, left| {
+            let exponent = if left {
+                rotation_exponent_left(degree, steps)
+            } else {
+                rotation_exponent_right(degree, steps)
+            };
+            let key = hybrid_keys
+                .get(&(ct.level(), exponent))
+                .expect("missing level-specific hybrid rotation key");
+            let qp_plan = hybrid_plans
+                .get(&ct.level())
+                .expect("missing level-specific QP NTT plan");
+            if left {
+                rotate_left_hybrid_rns_ckks_with_prepared_ntt(ct, steps, key, &chain, qp_plan)
+            } else {
+                rotate_right_hybrid_rns_ckks_with_prepared_ntt(ct, steps, key, &chain, qp_plan)
+            }
+        },
     );
 
     let timing_forward_fft2_ms =
@@ -584,7 +593,6 @@ fn main() {
         fft2_r1_npy::write_complex128_square(&PathBuf::from(path), dimension, &decoded_logical);
         println!("FFT_R1_NUMPY_OUTPUT_STATUS=PASS");
     }
-
 
     let timing_decrypt_decode_ms = phase_done(
         decrypt_phase,

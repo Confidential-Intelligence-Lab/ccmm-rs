@@ -1,6 +1,5 @@
 #[path = "../fft2_r1_npy.rs"]
 mod fft2_r1_npy;
-use std::path::PathBuf;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
@@ -29,6 +28,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::f64::consts::PI;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const SIGMA: f64 = 3.19;
@@ -486,8 +486,10 @@ fn main() {
      */
     let numerical_input = std::env::var_os("FFT2_R1_1K_INPUT").map(PathBuf::from);
     let numerical_output = std::env::var_os("FFT2_R1_1K_OUTPUT").map(PathBuf::from);
-    assert!(numerical_input.is_some() == numerical_output.is_some(),
-        "FFT2_R1_1K_INPUT and FFT2_R1_1K_OUTPUT must both be set or both absent");
+    assert!(
+        numerical_input.is_some() == numerical_output.is_some(),
+        "FFT2_R1_1K_INPUT and FFT2_R1_1K_OUTPUT must both be set or both absent"
+    );
     let image = if let Some(ref path) = numerical_input {
         println!("FFT2_R1_1K_INPUT={}", path.display());
         fft2_r1_npy::read_f64_square(path, IMAGE_DIM)
