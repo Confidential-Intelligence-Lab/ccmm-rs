@@ -500,7 +500,6 @@ mod tests {
         assert_eq!(plan.moduli(), basis.moduli());
     }
 
-
     #[test]
     fn correctness_profile_metadata_is_exact() {
         let profile = correctness_profile_8();
